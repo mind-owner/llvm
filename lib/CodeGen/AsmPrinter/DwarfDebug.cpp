@@ -199,6 +199,12 @@ const DIType *DbgVariable::getType() const {
 }
 
 ArrayRef<DbgVariable::FrameIndexExpr> DbgVariable::getFrameIndexExprs() const {
+  if (FrameIndexExprs.size() == 1)
+    return FrameIndexExprs;
+
+  assert(all_of(FrameIndexExprs,
+                [](const FrameIndexExpr &A) { return A.Expr->isFragment(); }) &&
+         "multiple FI expressions without DW_OP_LLVM_fragment");
   std::sort(FrameIndexExprs.begin(), FrameIndexExprs.end(),
             [](const FrameIndexExpr &A, const FrameIndexExpr &B) -> bool {
               return A.Expr->getFragmentInfo()->OffsetInBits <
@@ -417,7 +423,14 @@ DwarfDebug::constructDwarfCompileUnit(const DICompileUnit *DIUnit) {
     Asm->OutStreamer->getContext().setMCLineTableCompilationDir(
         NewCU.getUniqueID(), CompilationDir);
 
-  NewCU.addString(Die, dwarf::DW_AT_producer, DIUnit->getProducer());
+  StringRef Producer = DIUnit->getProducer();
+  StringRef Flags = DIUnit->getFlags();
+  if (!Flags.empty()) {
+    std::string ProducerWithFlags = Producer.str() + " " + Flags.str();
+    NewCU.addString(Die, dwarf::DW_AT_producer, ProducerWithFlags);
+  } else
+    NewCU.addString(Die, dwarf::DW_AT_producer, Producer);
+
   NewCU.addUInt(Die, dwarf::DW_AT_language, dwarf::DW_FORM_data2,
                 DIUnit->getSourceLanguage());
   NewCU.addString(Die, dwarf::DW_AT_name, FN);

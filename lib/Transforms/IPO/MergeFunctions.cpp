@@ -436,11 +436,10 @@ void MergeFunctions::replaceDirectCallers(Function *Old, Function *New) {
       auto CallSiteAttrs = CS.getAttributes();
 
       CallSiteAttrs = CallSiteAttrs.addAttributes(
-          Context, AttributeSet::ReturnIndex, NewFuncAttrs.getRetAttributes());
+          Context, AttributeList::ReturnIndex, NewFuncAttrs.getRetAttributes());
 
       for (unsigned argIdx = 0; argIdx < CS.arg_size(); argIdx++) {
-        AttributeSet Attrs = NewFuncAttrs.getParamAttributes(argIdx);
-        if (Attrs.getNumSlots())
+        if (AttributeSetNode *Attrs = NewFuncAttrs.getParamAttributes(argIdx))
           CallSiteAttrs = CallSiteAttrs.addAttributes(Context, argIdx, Attrs);
       }
 

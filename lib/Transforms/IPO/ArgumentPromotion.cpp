@@ -42,6 +42,7 @@
 #include "llvm/Analysis/LazyCallGraph.h"
 #include "llvm/Analysis/Loads.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/IR/AttributeSetNode.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Constants.h"
@@ -102,13 +103,11 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
   // Attribute - Keep track of the parameter attributes for the arguments
   // that we are *not* promoting. For the ones that we do promote, the parameter
   // attributes are lost
-  SmallVector<AttributeSet, 8> AttributesVec;
-  const AttributeSet &PAL = F->getAttributes();
+  SmallVector<AttributeSetNode *, 8> AttributesVec;
+  const AttributeList &PAL = F->getAttributes();
 
   // Add any return attributes.
-  if (PAL.hasAttributes(AttributeSet::ReturnIndex))
-    AttributesVec.push_back(
-        AttributeSet::get(F->getContext(), PAL.getRetAttributes()));
+  AttributesVec.push_back(PAL.getRetAttributes());
 
   // First, determine the new argument list
   unsigned ArgIndex = 1;
@@ -119,16 +118,12 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
       Type *AgTy = cast<PointerType>(I->getType())->getElementType();
       StructType *STy = cast<StructType>(AgTy);
       Params.insert(Params.end(), STy->element_begin(), STy->element_end());
+      AttributesVec.insert(AttributesVec.end(), STy->getNumElements(), nullptr);
       ++NumByValArgsPromoted;
     } else if (!ArgsToPromote.count(&*I)) {
       // Unchanged argument
       Params.push_back(I->getType());
-      AttributeSet attrs = PAL.getParamAttributes(ArgIndex);
-      if (attrs.hasAttributes(ArgIndex)) {
-        AttrBuilder B(attrs, ArgIndex);
-        AttributesVec.push_back(
-            AttributeSet::get(F->getContext(), Params.size(), B));
-      }
+      AttributesVec.push_back(PAL.getParamAttributes(ArgIndex));
     } else if (I->use_empty()) {
       // Dead argument (which are always marked as promotable)
       ++NumArgumentsDead;
@@ -173,6 +168,7 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
         Params.push_back(GetElementPtrInst::getIndexedType(
             cast<PointerType>(I->getType()->getScalarType())->getElementType(),
             ArgIndex.second));
+        AttributesVec.push_back(nullptr);
         assert(Params.back());
       }
 
@@ -184,9 +180,7 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
   }
 
   // Add any function attributes.
-  if (PAL.hasAttributes(AttributeSet::FunctionIndex))
-    AttributesVec.push_back(
-        AttributeSet::get(FTy->getContext(), PAL.getFnAttributes()));
+  AttributesVec.push_back(PAL.getFnAttributes());
 
   Type *RetTy = FTy->getReturnType();
 
@@ -206,7 +200,7 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
 
   // Recompute the parameter attributes list based on the new arguments for
   // the function.
-  NF->setAttributes(AttributeSet::get(F->getContext(), AttributesVec));
+  NF->setAttributes(AttributeList::get(F->getContext(), AttributesVec));
   AttributesVec.clear();
 
   F->getParent()->getFunctionList().insert(F->getIterator(), NF);
@@ -220,12 +214,10 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
     CallSite CS(F->user_back());
     assert(CS.getCalledFunction() == F);
     Instruction *Call = CS.getInstruction();
-    const AttributeSet &CallPAL = CS.getAttributes();
+    const AttributeList &CallPAL = CS.getAttributes();
 
     // Add any return attributes.
-    if (CallPAL.hasAttributes(AttributeSet::ReturnIndex))
-      AttributesVec.push_back(
-          AttributeSet::get(F->getContext(), CallPAL.getRetAttributes()));
+    AttributesVec.push_back(CallPAL.getRetAttributes());
 
     // Loop over the operands, inserting GEP and loads in the caller as
     // appropriate.
@@ -235,12 +227,7 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
          ++I, ++AI, ++ArgIndex)
       if (!ArgsToPromote.count(&*I) && !ByValArgsToTransform.count(&*I)) {
         Args.push_back(*AI); // Unmodified argument
-
-        if (CallPAL.hasAttributes(ArgIndex)) {
-          AttrBuilder B(CallPAL, ArgIndex);
-          AttributesVec.push_back(
-              AttributeSet::get(F->getContext(), Args.size(), B));
-        }
+        AttributesVec.push_back(CallPAL.getAttributes(ArgIndex));
       } else if (ByValArgsToTransform.count(&*I)) {
         // Emit a GEP and load for each element of the struct.
         Type *AgTy = cast<PointerType>(I->getType())->getElementType();
@@ -253,6 +240,7 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
               STy, *AI, Idxs, (*AI)->getName() + "." + Twine(i), Call);
           // TODO: Tell AA about the new values?
           Args.push_back(new LoadInst(Idx, Idx->getName() + ".val", Call));
+          AttributesVec.push_back(nullptr);
         }
       } else if (!I->use_empty()) {
         // Non-dead argument: insert GEPs and loads as appropriate.
@@ -295,23 +283,18 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
           newLoad->setAAMetadata(AAInfo);
 
           Args.push_back(newLoad);
+          AttributesVec.push_back(nullptr);
         }
       }
 
     // Push any varargs arguments on the list.
     for (; AI != CS.arg_end(); ++AI, ++ArgIndex) {
       Args.push_back(*AI);
-      if (CallPAL.hasAttributes(ArgIndex)) {
-        AttrBuilder B(CallPAL, ArgIndex);
-        AttributesVec.push_back(
-            AttributeSet::get(F->getContext(), Args.size(), B));
-      }
+      AttributesVec.push_back(CallPAL.getAttributes(ArgIndex));
     }
 
     // Add any function attributes.
-    if (CallPAL.hasAttributes(AttributeSet::FunctionIndex))
-      AttributesVec.push_back(
-          AttributeSet::get(Call->getContext(), CallPAL.getFnAttributes()));
+    AttributesVec.push_back(CallPAL.getFnAttributes());
 
     SmallVector<OperandBundleDef, 1> OpBundles;
     CS.getOperandBundlesAsDefs(OpBundles);
@@ -322,12 +305,12 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
                                Args, OpBundles, "", Call);
       cast<InvokeInst>(New)->setCallingConv(CS.getCallingConv());
       cast<InvokeInst>(New)->setAttributes(
-          AttributeSet::get(II->getContext(), AttributesVec));
+          AttributeList::get(II->getContext(), AttributesVec));
     } else {
       New = CallInst::Create(NF, Args, OpBundles, "", Call);
       cast<CallInst>(New)->setCallingConv(CS.getCallingConv());
       cast<CallInst>(New)->setAttributes(
-          AttributeSet::get(New->getContext(), AttributesVec));
+          AttributeList::get(New->getContext(), AttributesVec));
       cast<CallInst>(New)->setTailCallKind(
           cast<CallInst>(Call)->getTailCallKind());
     }
@@ -348,6 +331,8 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
     // F.
     Call->eraseFromParent();
   }
+
+  const DataLayout &DL = F->getParent()->getDataLayout();
 
   // Since we have now created the new function, splice the body of the old
   // function right into the new function, leaving the old rotting hulk of the
@@ -376,7 +361,8 @@ doPromotion(Function *F, SmallPtrSetImpl<Argument *> &ArgsToPromote,
 
       // Just add all the struct element types.
       Type *AgTy = cast<PointerType>(I->getType())->getElementType();
-      Value *TheAlloca = new AllocaInst(AgTy, nullptr, "", InsertPt);
+      Value *TheAlloca = new AllocaInst(AgTy, DL.getAllocaAddrSpace(), nullptr,
+                                        "", InsertPt);
       StructType *STy = cast<StructType>(AgTy);
       Value *Idxs[2] = {ConstantInt::get(Type::getInt32Ty(F->getContext()), 0),
                         nullptr};

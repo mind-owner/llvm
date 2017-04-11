@@ -806,7 +806,7 @@ private:
   bool ParseDirectiveMajorMinor(uint32_t &Major, uint32_t &Minor);
   bool ParseDirectiveHSACodeObjectVersion();
   bool ParseDirectiveHSACodeObjectISA();
-  bool ParseDirectiveRuntimeMetadata();
+  bool ParseDirectiveCodeObjectMetadata();
   bool ParseAMDKernelCodeTValue(StringRef ID, amd_kernel_code_t &Header);
   bool ParseDirectiveAMDKernelCodeT();
   bool ParseSectionDirectiveHSAText();
@@ -1023,6 +1023,7 @@ public:
                    const OperandVector &Operands,
                    OptionalImmIndexMap &OptionalIdx);
   void cvtVOP3(MCInst &Inst, const OperandVector &Operands);
+  void cvtVOP3OMod(MCInst &Inst, const OperandVector &Operands);
   void cvtVOP3P(MCInst &Inst, const OperandVector &Operands);
 
   void cvtMIMG(MCInst &Inst, const OperandVector &Operands);
@@ -2259,43 +2260,45 @@ bool AMDGPUAsmParser::ParseDirectiveHSACodeObjectISA() {
   return false;
 }
 
-bool AMDGPUAsmParser::ParseDirectiveRuntimeMetadata() {
-  std::string Metadata;
-  raw_string_ostream MS(Metadata);
+bool AMDGPUAsmParser::ParseDirectiveCodeObjectMetadata() {
+  std::string YamlString;
+  raw_string_ostream YamlStream(YamlString);
 
   getLexer().setSkipSpace(false);
 
   bool FoundEnd = false;
   while (!getLexer().is(AsmToken::Eof)) {
     while (getLexer().is(AsmToken::Space)) {
-      MS << ' ';
+      YamlStream << getLexer().getTok().getString();
       Lex();
     }
 
     if (getLexer().is(AsmToken::Identifier)) {
       StringRef ID = getLexer().getTok().getIdentifier();
-      if (ID == ".end_amdgpu_runtime_metadata") {
+      if (ID == AMDGPU::CodeObject::MetadataAssemblerDirectiveEnd) {
         Lex();
         FoundEnd = true;
         break;
       }
     }
 
-    MS << Parser.parseStringToEndOfStatement()
-       << getContext().getAsmInfo()->getSeparatorString();
+    YamlStream << Parser.parseStringToEndOfStatement()
+               << getContext().getAsmInfo()->getSeparatorString();
 
     Parser.eatToEndOfStatement();
   }
 
   getLexer().setSkipSpace(true);
 
-  if (getLexer().is(AsmToken::Eof) && !FoundEnd)
-    return TokError("expected directive .end_amdgpu_runtime_metadata not found");
+  if (getLexer().is(AsmToken::Eof) && !FoundEnd) {
+    return TokError(
+        "expected directive .end_amdgpu_code_object_metadata not found");
+  }
 
-  MS.flush();
+  YamlStream.flush();
 
-  if (getTargetStreamer().EmitRuntimeMetadata(getFeatureBits(), Metadata))
-    return Error(getParser().getTok().getLoc(), "invalid runtime metadata");
+  if (!getTargetStreamer().EmitCodeObjectMetadata(YamlString))
+    return Error(getParser().getTok().getLoc(), "invalid code object metadata");
 
   return false;
 }
@@ -2407,8 +2410,8 @@ bool AMDGPUAsmParser::ParseDirective(AsmToken DirectiveID) {
   if (IDVal == ".hsa_code_object_isa")
     return ParseDirectiveHSACodeObjectISA();
 
-  if (IDVal == ".amdgpu_runtime_metadata")
-    return ParseDirectiveRuntimeMetadata();
+  if (IDVal == AMDGPU::CodeObject::MetadataAssemblerDirectiveBegin)
+    return ParseDirectiveCodeObjectMetadata();
 
   if (IDVal == ".amd_kernel_code_t")
     return ParseDirectiveAMDKernelCodeT();
@@ -3733,6 +3736,28 @@ void AMDGPUAsmParser::cvtVOP3(MCInst &Inst, const OperandVector &Operands) {
     ++it;
     Inst.insert(it, Inst.getOperand(0)); // src2 = dst
   }
+}
+
+void AMDGPUAsmParser::cvtVOP3OMod(MCInst &Inst, const OperandVector &Operands) {
+  OptionalImmIndexMap OptionalIdx;
+
+  unsigned I = 1;
+  const MCInstrDesc &Desc = MII.get(Inst.getOpcode());
+  for (unsigned J = 0; J < Desc.getNumDefs(); ++J) {
+    ((AMDGPUOperand &)*Operands[I++]).addRegOperands(Inst, 1);
+  }
+
+  for (unsigned E = Operands.size(); I != E; ++I) {
+    AMDGPUOperand &Op = ((AMDGPUOperand &)*Operands[I]);
+    if (Op.isMod()) {
+      OptionalIdx[Op.getImmTy()] = I;
+    } else {
+      Op.addRegOrImmOperands(Inst, 1);
+    }
+  }
+
+  addOptionalImmOperand(Inst, Operands, OptionalIdx, AMDGPUOperand::ImmTyClampSI);
+  addOptionalImmOperand(Inst, Operands, OptionalIdx, AMDGPUOperand::ImmTyOModSI);
 }
 
 void AMDGPUAsmParser::cvtVOP3P(MCInst &Inst, const OperandVector &Operands) {
