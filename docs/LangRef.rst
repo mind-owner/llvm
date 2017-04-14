@@ -5121,6 +5121,17 @@ Examples:
    !0 = !{!"magic ptr"}
    !1 = !{!"other ptr"}
 
+The invariant.group metadata must be dropped when replacing one pointer by
+another based on aliasing information. This is because invariant.group is tied
+to the SSA value of the pointer operand.
+
+.. code-block:: llvm
+  
+  %v = load i8, i8* %x, !invariant.group !0
+  ; if %x mustalias %y then we can replace the above instruction with
+  %v = load i8, i8* %y
+
+
 '``type``' Metadata
 ^^^^^^^^^^^^^^^^^^^
 
@@ -5801,9 +5812,7 @@ This instruction requires several arguments:
 #. '``exception label``': the label reached when a callee returns via
    the :ref:`resume <i_resume>` instruction or other exception handling
    mechanism.
-#. The optional :ref:`function attributes <fnattrs>` list. Only
-   '``noreturn``', '``nounwind``', '``readonly``' and '``readnone``'
-   attributes are valid here.
+#. The optional :ref:`function attributes <fnattrs>` list.
 #. The optional :ref:`operand bundles <opbundles>` list.
 
 Semantics:
@@ -7060,9 +7069,10 @@ Semantics:
 The elements of the two input vectors are numbered from left to right
 across both of the vectors. The shuffle mask operand specifies, for each
 element of the result vector, which element of the two input vectors the
-result element gets. The element selector may be undef (meaning "don't
-care") and the second operand may be undef if performing a shuffle from
-only one vector.
+result element gets. If the shuffle mask is undef, the result vector is
+undef. If any element of the mask operand is undef, that element of the
+result is undef. If the shuffle mask selects an undef element from one
+of the input vectors, the resulting element is undef.
 
 Example:
 """"""""
@@ -8861,9 +8871,7 @@ This instruction requires several arguments:
    be of :ref:`first class <t_firstclass>` type. If the function signature
    indicates the function accepts a variable number of arguments, the
    extra arguments can be specified.
-#. The optional :ref:`function attributes <fnattrs>` list. Only
-   '``noreturn``', '``nounwind``', '``readonly``' , '``readnone``',
-   and '``convergent``' attributes are valid here.
+#. The optional :ref:`function attributes <fnattrs>` list.
 #. The optional :ref:`operand bundles <opbundles>` list.
 
 Semantics:
@@ -10275,21 +10283,20 @@ all types however.
 Overview:
 """""""""
 
-The '``llvm.sqrt``' intrinsics return the sqrt of the specified operand,
+The '``llvm.sqrt``' intrinsics return the square root of the specified value,
 returning the same value as the libm '``sqrt``' functions would, but without
 trapping or setting ``errno``.
 
 Arguments:
 """"""""""
 
-The argument and return value are floating point numbers of the same
-type.
+The argument and return value are floating point numbers of the same type.
 
 Semantics:
 """"""""""
 
-This function returns the sqrt of the specified operand if it is a
-nonnegative floating point number.
+This function returns the square root of the operand if it is a nonnegative
+floating point number.
 
 '``llvm.powi.*``' Intrinsic
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -10355,8 +10362,7 @@ The '``llvm.sin.*``' intrinsics return the sine of the operand.
 Arguments:
 """"""""""
 
-The argument and return value are floating point numbers of the same
-type.
+The argument and return value are floating point numbers of the same type.
 
 Semantics:
 """"""""""
@@ -10391,8 +10397,7 @@ The '``llvm.cos.*``' intrinsics return the cosine of the operand.
 Arguments:
 """"""""""
 
-The argument and return value are floating point numbers of the same
-type.
+The argument and return value are floating point numbers of the same type.
 
 Semantics:
 """"""""""
@@ -10459,13 +10464,13 @@ all types however.
 Overview:
 """""""""
 
-The '``llvm.exp.*``' intrinsics perform the exp function.
+The '``llvm.exp.*``' intrinsics compute the base-e exponential of the specified
+value.
 
 Arguments:
 """"""""""
 
-The argument and return value are floating point numbers of the same
-type.
+The argument and return value are floating point numbers of the same type.
 
 Semantics:
 """"""""""
@@ -10494,13 +10499,13 @@ all types however.
 Overview:
 """""""""
 
-The '``llvm.exp2.*``' intrinsics perform the exp2 function.
+The '``llvm.exp2.*``' intrinsics compute the base-2 exponential of the
+specified value.
 
 Arguments:
 """"""""""
 
-The argument and return value are floating point numbers of the same
-type.
+The argument and return value are floating point numbers of the same type.
 
 Semantics:
 """"""""""
@@ -10529,13 +10534,13 @@ all types however.
 Overview:
 """""""""
 
-The '``llvm.log.*``' intrinsics perform the log function.
+The '``llvm.log.*``' intrinsics compute the base-e logarithm of the specified
+value.
 
 Arguments:
 """"""""""
 
-The argument and return value are floating point numbers of the same
-type.
+The argument and return value are floating point numbers of the same type.
 
 Semantics:
 """"""""""
@@ -10564,13 +10569,13 @@ all types however.
 Overview:
 """""""""
 
-The '``llvm.log10.*``' intrinsics perform the log10 function.
+The '``llvm.log10.*``' intrinsics compute the base-10 logarithm of the
+specified value.
 
 Arguments:
 """"""""""
 
-The argument and return value are floating point numbers of the same
-type.
+The argument and return value are floating point numbers of the same type.
 
 Semantics:
 """"""""""
@@ -10599,13 +10604,13 @@ all types however.
 Overview:
 """""""""
 
-The '``llvm.log2.*``' intrinsics perform the log2 function.
+The '``llvm.log2.*``' intrinsics compute the base-2 logarithm of the specified
+value.
 
 Arguments:
 """"""""""
 
-The argument and return value are floating point numbers of the same
-type.
+The argument and return value are floating point numbers of the same type.
 
 Semantics:
 """"""""""

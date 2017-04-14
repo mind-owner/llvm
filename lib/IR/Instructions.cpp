@@ -466,7 +466,7 @@ static Instruction *createMalloc(Instruction *InsertBefore,
   Value *MallocFunc = MallocF;
   if (!MallocFunc)
     // prototype malloc as "void *malloc(size_t)"
-    MallocFunc = M->getOrInsertFunction("malloc", BPTy, IntPtrTy, nullptr);
+    MallocFunc = M->getOrInsertFunction("malloc", BPTy, IntPtrTy);
   PointerType *AllocPtrType = PointerType::getUnqual(AllocTy);
   CallInst *MCall = nullptr;
   Instruction *Result = nullptr;
@@ -560,7 +560,7 @@ static Instruction *createFree(Value *Source,
   Type *VoidTy = Type::getVoidTy(M->getContext());
   Type *IntPtrTy = Type::getInt8PtrTy(M->getContext());
   // prototype free as "void free(void*)"
-  Value *FreeFunc = M->getOrInsertFunction("free", VoidTy, IntPtrTy, nullptr);
+  Value *FreeFunc = M->getOrInsertFunction("free", VoidTy, IntPtrTy);
   CallInst *Result = nullptr;
   Value *PtrCast = Source;
   if (InsertBefore) {
@@ -3659,16 +3659,16 @@ void SwitchInst::addCase(ConstantInt *OnVal, BasicBlock *Dest) {
   // Initialize some new operands.
   assert(OpNo+1 < ReservedSpace && "Growing didn't work!");
   setNumHungOffUseOperands(OpNo+2);
-  CaseIt Case(this, NewCaseIdx);
+  CaseHandle Case(this, NewCaseIdx);
   Case.setValue(OnVal);
   Case.setSuccessor(Dest);
 }
 
 /// removeCase - This method removes the specified case and its successor
 /// from the switch instruction.
-SwitchInst::CaseIt SwitchInst::removeCase(CaseIt i) {
-  unsigned idx = i.getCaseIndex();
-  
+SwitchInst::CaseIt SwitchInst::removeCase(CaseIt I) {
+  unsigned idx = I->getCaseIndex();
+
   assert(2 + idx*2 < getNumOperands() && "Case index out of range!!!");
 
   unsigned NumOps = getNumOperands();
