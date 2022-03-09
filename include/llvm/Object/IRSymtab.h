@@ -1,9 +1,8 @@
 //===- IRSymtab.h - data definitions for IR symbol tables -------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -25,31 +24,44 @@
 #define LLVM_OBJECT_IRSYMTAB_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/Object/SymbolicFile.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/Error.h"
+#include <cassert>
+#include <cstdint>
+#include <vector>
 
 namespace llvm {
+
+struct BitcodeFileContents;
+class StringTableBuilder;
+
 namespace irsymtab {
+
 namespace storage {
 
 // The data structures in this namespace define the low-level serialization
 // format. Clients that just want to read a symbol table should use the
 // irsymtab::Reader class.
 
-typedef support::ulittle32_t Word;
+using Word = support::ulittle32_t;
 
 /// A reference to a string in the string table.
 struct Str {
-  Word Offset;
+  Word Offset, Size;
+
   StringRef get(StringRef Strtab) const {
-    return Strtab.data() + Offset;
+    return {Strtab.data() + Offset, Size};
   }
 };
 
 /// A reference to a range of objects in the symbol table.
 template <typename T> struct Range {
   Word Offset, Size;
+
   ArrayRef<T> get(StringRef Symtab) const {
     return {reinterpret_cast<const T *>(Symtab.data() + Offset), Size};
   }
@@ -59,6 +71,9 @@ template <typename T> struct Range {
 /// table.
 struct Module {
   Word Begin, End;
+
+  /// The index of the first Uncommon for this Module.
+  Word UncBegin;
 };
 
 /// This is equivalent to an IR comdat.
@@ -82,7 +97,8 @@ struct Symbol {
   Word Flags;
   enum FlagBits {
     FB_visibility, // 2 bits
-    FB_undefined = FB_visibility + 2,
+    FB_has_uncommon = FB_visibility + 2,
+    FB_undefined,
     FB_weak,
     FB_common,
     FB_indirect,
@@ -94,10 +110,6 @@ struct Symbol {
     FB_unnamed_addr,
     FB_executable,
   };
-
-  /// The index into the Uncommon table, or -1 if this symbol does not have an
-  /// Uncommon.
-  Word UncommonIndex;
 };
 
 /// This data structure contains rarely used symbol fields and is optionally
@@ -108,9 +120,25 @@ struct Uncommon {
   /// COFF-specific: the name of the symbol that a weak external resolves to
   /// if not defined.
   Str COFFWeakExternFallbackName;
+
+  /// Specified section name, if any.
+  Str SectionName;
 };
 
+
 struct Header {
+  /// Version number of the symtab format. This number should be incremented
+  /// when the format changes, but it does not need to be incremented if a
+  /// change to LLVM would cause it to create a different symbol table.
+  Word Version;
+  enum { kCurrentVersion = 2 };
+
+  /// The producer's version string (LLVM_VERSION_STRING " " LLVM_REVISION).
+  /// Consumers should rebuild the symbol table from IR if the producer's
+  /// version does not match the consumer's version due to potential differences
+  /// in symbol table format, symbol enumeration order and so on.
+  Str Producer;
+
   Range<Module> Modules;
   Range<Comdat> Comdats;
   Range<Symbol> Symbols;
@@ -120,13 +148,17 @@ struct Header {
 
   /// COFF-specific: linker directives.
   Str COFFLinkerOpts;
+
+  /// Dependent Library Specifiers
+  Range<Str> DependentLibraries;
 };
 
-}
+} // end namespace storage
 
-/// Fills in Symtab and Strtab with a valid symbol and string table for Mods.
+/// Fills in Symtab and StrtabBuilder with a valid symbol and string table for
+/// Mods.
 Error build(ArrayRef<Module *> Mods, SmallVector<char, 0> &Symtab,
-            SmallVector<char, 0> &Strtab);
+            StringTableBuilder &StrtabBuilder, BumpPtrAllocator &Alloc);
 
 /// This represents a symbol that has been read from a storage::Symbol and
 /// possibly a storage::Uncommon.
@@ -139,6 +171,7 @@ struct Symbol {
   // Copied from storage::Uncommon.
   uint32_t CommonSize, CommonAlign;
   StringRef COFFWeakExternFallbackName;
+  StringRef SectionName;
 
   /// Returns the mangled symbol name.
   StringRef getName() const { return Name; }
@@ -152,18 +185,22 @@ struct Symbol {
   int getComdatIndex() const { return ComdatIndex; }
 
   using S = storage::Symbol;
+
   GlobalValue::VisibilityTypes getVisibility() const {
     return GlobalValue::VisibilityTypes((Flags >> S::FB_visibility) & 3);
   }
+
   bool isUndefined() const { return (Flags >> S::FB_undefined) & 1; }
   bool isWeak() const { return (Flags >> S::FB_weak) & 1; }
   bool isCommon() const { return (Flags >> S::FB_common) & 1; }
   bool isIndirect() const { return (Flags >> S::FB_indirect) & 1; }
   bool isUsed() const { return (Flags >> S::FB_used) & 1; }
   bool isTLS() const { return (Flags >> S::FB_tls) & 1; }
+
   bool canBeOmittedFromSymbolTable() const {
     return (Flags >> S::FB_may_omit) & 1;
   }
+
   bool isGlobal() const { return (Flags >> S::FB_global) & 1; }
   bool isFormatSpecific() const { return (Flags >> S::FB_format_specific) & 1; }
   bool isUnnamedAddr() const { return (Flags >> S::FB_unnamed_addr) & 1; }
@@ -173,6 +210,7 @@ struct Symbol {
     assert(isCommon());
     return CommonSize;
   }
+
   uint32_t getCommonAlignment() const {
     assert(isCommon());
     return CommonAlign;
@@ -184,6 +222,8 @@ struct Symbol {
     assert(isWeak() && isIndirect());
     return COFFWeakExternFallbackName;
   }
+
+  StringRef getSectionName() const { return SectionName; }
 };
 
 /// This class can be used to read a Symtab and Strtab produced by
@@ -195,11 +235,14 @@ class Reader {
   ArrayRef<storage::Comdat> Comdats;
   ArrayRef<storage::Symbol> Symbols;
   ArrayRef<storage::Uncommon> Uncommons;
+  ArrayRef<storage::Str> DependentLibraries;
 
   StringRef str(storage::Str S) const { return S.get(Strtab); }
+
   template <typename T> ArrayRef<T> range(storage::Range<T> R) const {
     return R.get(Symtab);
   }
+
   const storage::Header &header() const {
     return *reinterpret_cast<const storage::Header *>(Symtab.data());
   }
@@ -213,14 +256,17 @@ public:
     Comdats = range(header().Comdats);
     Symbols = range(header().Symbols);
     Uncommons = range(header().Uncommons);
+    DependentLibraries = range(header().DependentLibraries);
   }
 
-  typedef iterator_range<object::content_iterator<SymbolRef>> symbol_range;
+  using symbol_range = iterator_range<object::content_iterator<SymbolRef>>;
 
   /// Returns the symbol table for the entire bitcode file.
   /// The symbols enumerated by this method are ephemeral, but they can be
   /// copied into an irsymtab::Symbol object.
   symbol_range symbols() const;
+
+  size_t getNumModules() const { return Modules.size(); }
 
   /// Returns a slice of the symbol table for the I'th module in the file.
   /// The symbols enumerated by this method are ephemeral, but they can be
@@ -243,20 +289,24 @@ public:
 
   /// COFF-specific: returns linker options specified in the input file.
   StringRef getCOFFLinkerOpts() const { return str(header().COFFLinkerOpts); }
+
+  /// Returns dependent library specifiers
+  std::vector<StringRef> getDependentLibraries() const {
+    std::vector<StringRef> Specifiers;
+    Specifiers.reserve(DependentLibraries.size());
+    for (auto S : DependentLibraries) {
+      Specifiers.push_back(str(S));
+    }
+    return Specifiers;
+  }
 };
 
 /// Ephemeral symbols produced by Reader::symbols() and
 /// Reader::module_symbols().
 class Reader::SymbolRef : public Symbol {
   const storage::Symbol *SymI, *SymE;
+  const storage::Uncommon *UncI;
   const Reader *R;
-
-public:
-  SymbolRef(const storage::Symbol *SymI, const storage::Symbol *SymE,
-            const Reader *R)
-      : SymI(SymI), SymE(SymE), R(R) {
-    read();
-  }
 
   void read() {
     if (SymI == SymE)
@@ -267,16 +317,27 @@ public:
     ComdatIndex = SymI->ComdatIndex;
     Flags = SymI->Flags;
 
-    uint32_t UncI = SymI->UncommonIndex;
-    if (UncI != -1u) {
-      const storage::Uncommon &Unc = R->Uncommons[UncI];
-      CommonSize = Unc.CommonSize;
-      CommonAlign = Unc.CommonAlign;
-      COFFWeakExternFallbackName = R->str(Unc.COFFWeakExternFallbackName);
-    }
+    if (Flags & (1 << storage::Symbol::FB_has_uncommon)) {
+      CommonSize = UncI->CommonSize;
+      CommonAlign = UncI->CommonAlign;
+      COFFWeakExternFallbackName = R->str(UncI->COFFWeakExternFallbackName);
+      SectionName = R->str(UncI->SectionName);
+    } else
+      // Reset this field so it can be queried unconditionally for all symbols.
+      SectionName = "";
   }
+
+public:
+  SymbolRef(const storage::Symbol *SymI, const storage::Symbol *SymE,
+            const storage::Uncommon *UncI, const Reader *R)
+      : SymI(SymI), SymE(SymE), UncI(UncI), R(R) {
+    read();
+  }
+
   void moveNext() {
     ++SymI;
+    if (Flags & (1 << storage::Symbol::FB_has_uncommon))
+      ++UncI;
     read();
   }
 
@@ -284,19 +345,29 @@ public:
 };
 
 inline Reader::symbol_range Reader::symbols() const {
-  return {SymbolRef(Symbols.begin(), Symbols.end(), this),
-          SymbolRef(Symbols.end(), Symbols.end(), this)};
+  return {SymbolRef(Symbols.begin(), Symbols.end(), Uncommons.begin(), this),
+          SymbolRef(Symbols.end(), Symbols.end(), nullptr, this)};
 }
 
 inline Reader::symbol_range Reader::module_symbols(unsigned I) const {
   const storage::Module &M = Modules[I];
   const storage::Symbol *MBegin = Symbols.begin() + M.Begin,
                         *MEnd = Symbols.begin() + M.End;
-  return {SymbolRef(MBegin, MEnd, this), SymbolRef(MEnd, MEnd, this)};
+  return {SymbolRef(MBegin, MEnd, Uncommons.begin() + M.UncBegin, this),
+          SymbolRef(MEnd, MEnd, nullptr, this)};
 }
 
-}
+/// The contents of the irsymtab in a bitcode file. Any underlying data for the
+/// irsymtab are owned by Symtab and Strtab.
+struct FileContents {
+  SmallVector<char, 0> Symtab, Strtab;
+  Reader TheReader;
+};
 
-}
+/// Reads the contents of a bitcode file, creating its irsymtab if necessary.
+Expected<FileContents> readBitcode(const BitcodeFileContents &BFC);
 
-#endif
+} // end namespace irsymtab
+} // end namespace llvm
+
+#endif // LLVM_OBJECT_IRSYMTAB_H

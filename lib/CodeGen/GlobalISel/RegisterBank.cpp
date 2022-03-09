@@ -1,9 +1,8 @@
 //===- llvm/CodeGen/GlobalISel/RegisterBank.cpp - Register Bank --*- C++ -*-==//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 /// \file
@@ -11,7 +10,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/GlobalISel/RegisterBank.h"
-#include "llvm/Target/TargetRegisterInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/Config/llvm-config.h"
+#include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "registerbank"
 
@@ -48,7 +49,7 @@ bool RegisterBank::verify(const TargetRegisterInfo &TRI) const {
 
       // Verify that the Size of the register bank is big enough to cover
       // all the register classes it covers.
-      assert((getSize() >= SubRC.getSize() * 8) &&
+      assert(getSize() >= TRI.getRegSizeInBits(SubRC) &&
              "Size is not big enough for all the subclasses!");
       assert(covers(SubRC) && "Not all subclasses are covered");
     }

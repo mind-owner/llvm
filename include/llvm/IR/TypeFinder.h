@@ -1,9 +1,8 @@
 //===- llvm/IR/TypeFinder.h - Class to find used struct types ---*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -44,8 +43,8 @@ public:
   void run(const Module &M, bool onlyNamed);
   void clear();
 
-  typedef std::vector<StructType*>::iterator iterator;
-  typedef std::vector<StructType*>::const_iterator const_iterator;
+  using iterator = std::vector<StructType*>::iterator;
+  using const_iterator = std::vector<StructType*>::const_iterator;
 
   iterator begin() { return StructTypes.begin(); }
   iterator end() { return StructTypes.end(); }

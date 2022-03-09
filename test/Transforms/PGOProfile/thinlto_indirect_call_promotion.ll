@@ -7,12 +7,12 @@
 ; IMPORTS-DAG: Import a
 ; IMPORTS-DAG: Import c
 
-; RUN: opt %t4.bc -icp-lto -pgo-icall-prom -S -icp-count-threshold=1 | FileCheck %s --check-prefix=ICALL-PROM
-; RUN: opt %t4.bc -icp-lto -pgo-icall-prom -S -pass-remarks=pgo-icall-prom -icp-count-threshold=1 2>&1 | FileCheck %s --check-prefix=PASS-REMARK
+; RUN: opt %t4.bc -icp-lto -pgo-icall-prom -S | FileCheck %s --check-prefix=ICALL-PROM
+; RUN: opt %t4.bc -icp-lto -pgo-icall-prom -S -pass-remarks=pgo-icall-prom 2>&1 | FileCheck %s --check-prefix=PASS-REMARK
 ; PASS-REMARK: Promote indirect call to a with count 1 out of 1
 ; PASS-REMARK: Promote indirect call to c.llvm.0 with count 1 out of 1
 
-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
 @foo = external local_unnamed_addr global void ()*, align 8

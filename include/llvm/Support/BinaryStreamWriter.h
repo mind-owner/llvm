@@ -1,9 +1,8 @@
 //===- BinaryStreamWriter.h - Writes objects to a BinaryStream ---*- C++-*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -20,10 +19,11 @@
 #include "llvm/Support/Error.h"
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 namespace llvm {
 
-/// \brief Provides write only access to a subclass of `WritableBinaryStream`.
+/// Provides write only access to a subclass of `WritableBinaryStream`.
 /// Provides bounds checking and helpers for writing certain common data types
 /// such as null-terminated strings, integers in various flavors of endianness,
 /// etc.  Can be subclassed to provide reading and writing of custom datatypes,
@@ -31,7 +31,20 @@ namespace llvm {
 class BinaryStreamWriter {
 public:
   BinaryStreamWriter() = default;
-  explicit BinaryStreamWriter(WritableBinaryStreamRef Stream);
+  explicit BinaryStreamWriter(WritableBinaryStreamRef Ref);
+  explicit BinaryStreamWriter(WritableBinaryStream &Stream);
+  explicit BinaryStreamWriter(MutableArrayRef<uint8_t> Data,
+                              llvm::support::endianness Endian);
+
+  BinaryStreamWriter(const BinaryStreamWriter &Other)
+      : Stream(Other.Stream), Offset(Other.Offset) {}
+
+  BinaryStreamWriter &operator=(const BinaryStreamWriter &Other) {
+    Stream = Other.Stream;
+    Offset = Other.Offset;
+    return *this;
+  }
+
   virtual ~BinaryStreamWriter() {}
 
   /// Write the bytes specified in \p Buffer to the underlying stream.
@@ -42,7 +55,7 @@ public:
   /// otherwise returns an appropriate error code.
   Error writeBytes(ArrayRef<uint8_t> Buffer);
 
-  /// Write the the integer \p Value to the underlying stream in the
+  /// Write the integer \p Value to the underlying stream in the
   /// specified endianness.  On success, updates the offset so that
   /// subsequent writes occur at the next unwritten position.
   ///
@@ -66,7 +79,21 @@ public:
     return writeInteger<U>(static_cast<U>(Num));
   }
 
-  /// Write the the string \p Str to the underlying stream followed by a null
+  /// Write the unsigned integer Value to the underlying stream using ULEB128
+  /// encoding.
+  ///
+  /// \returns a success error code if the data was successfully written,
+  /// otherwise returns an appropriate error code.
+  Error writeULEB128(uint64_t Value);
+
+  /// Write the unsigned integer Value to the underlying stream using ULEB128
+  /// encoding.
+  ///
+  /// \returns a success error code if the data was successfully written,
+  /// otherwise returns an appropriate error code.
+  Error writeSLEB128(int64_t Value);
+
+  /// Write the string \p Str to the underlying stream followed by a null
   /// terminator.  On success, updates the offset so that subsequent writes
   /// occur at the next unwritten position.  \p Str need not be null terminated
   /// on input.
@@ -75,7 +102,7 @@ public:
   /// otherwise returns an appropriate error code.
   Error writeCString(StringRef Str);
 
-  /// Write the the string \p Str to the underlying stream without a null
+  /// Write the string \p Str to the underlying stream without a null
   /// terminator.  On success, updates the offset so that subsequent writes
   /// occur at the next unwritten position.
   ///
@@ -149,6 +176,9 @@ public:
   template <typename T> Error writeArray(FixedStreamArray<T> Array) {
     return writeStreamRef(Array.getUnderlyingStream());
   }
+
+  /// Splits the Writer into two Writers at a given offset.
+  std::pair<BinaryStreamWriter, BinaryStreamWriter> split(uint32_t Off) const;
 
   void setOffset(uint32_t Off) { Offset = Off; }
   uint32_t getOffset() const { return Offset; }

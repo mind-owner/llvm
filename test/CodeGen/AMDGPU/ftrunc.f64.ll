@@ -1,6 +1,6 @@
-; RUN: llc -march=amdgcn -mcpu=SI < %s | FileCheck -check-prefix=SI -check-prefix=FUNC %s
-; RUN: llc -march=amdgcn -mcpu=bonaire < %s | FileCheck -check-prefix=CI -check-prefix=FUNC %s
-; RUN: llc -march=amdgcn -mcpu=tonga < %s | FileCheck -check-prefix=CI -check-prefix=FUNC %s
+; RUN: llc -amdgpu-scalarize-global-loads=false -march=amdgcn -mcpu=tahiti < %s | FileCheck -check-prefix=SI -check-prefix=FUNC %s
+; RUN: llc -amdgpu-scalarize-global-loads=false -march=amdgcn -mcpu=bonaire < %s | FileCheck -check-prefix=CI -check-prefix=FUNC %s
+; RUN: llc -amdgpu-scalarize-global-loads=false -march=amdgcn -mcpu=tonga < %s | FileCheck -check-prefix=CI -check-prefix=FUNC %s
 
 declare double @llvm.trunc.f64(double) nounwind readnone
 declare <2 x double> @llvm.trunc.v2f64(<2 x double>) nounwind readnone
@@ -27,8 +27,7 @@ define amdgpu_kernel void @v_ftrunc_f64(double addrspace(1)* %out, double addrsp
 ; SI-DAG: s_and_b32 s{{[0-9]+}}, s{{[0-9]+}}, 0x80000000
 ; SI-DAG: s_add_i32 [[SEXP1:s[0-9]+]], [[SEXP]], 0xfffffc01
 ; SI-DAG: s_lshr_b64 s[{{[0-9]+:[0-9]+}}], s[{{[0-9]+:[0-9]+}}], [[SEXP1]]
-; SI-DAG: s_not_b64
-; SI-DAG: s_and_b64
+; SI-DAG: s_andn2_b64
 ; SI-DAG: cmp_gt_i32
 ; SI-DAG: cndmask_b32
 ; SI-DAG: cndmask_b32

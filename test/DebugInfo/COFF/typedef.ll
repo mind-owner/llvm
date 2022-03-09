@@ -1,8 +1,8 @@
-; RUN: llc < %s -filetype=obj | llvm-readobj - -codeview | FileCheck %s
+; RUN: llc < %s -filetype=obj | llvm-readobj - --codeview | FileCheck %s
 
 ; CHECK: CodeViewDebugInfo [
 ; CHECK:   Subsection [
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: wchar_t (0x71)
 ; CHECK:       Flags [ (0x0)
 ; CHECK:       ]
@@ -10,7 +10,7 @@
 ; CHECK:     }
 ; CHECK:   Subsection [
 ; CHECK:     SubSectionType: Symbols (0xF1)
-; CHECK:     UDT {
+; CHECK:     UDTSym {
 ; CHECK:       Type: wchar_t (0x71)
 ; CHECK:       UDTName: XYZ
 ; CHECK:     }
@@ -35,7 +35,7 @@ declare void @llvm.dbg.declare(metadata, metadata, metadata)
 !1 = !DIFile(filename: "-", directory: "/usr/local/google/home/majnemer/llvm/src")
 !3 = !{i32 2, !"CodeView", i32 1}
 !4 = !{i32 2, !"Debug Info Version", i32 3}
-!5 = distinct !DISubprogram(name: "test1", linkageName: "test1", scope: !6, file: !6, type: !7, unit: !0, variables: !{})
+!5 = distinct !DISubprogram(name: "test1", linkageName: "test1", scope: !6, file: !6, type: !7, unit: !0, retainedNodes: !{})
 !6 = !DIFile(filename: "<stdin>", directory: ".")
 !7 = !DISubroutineType(types: !{})
 !8 = !DILocalVariable(name: "foo", scope: !5, file: !6, line: 3, type: !9)

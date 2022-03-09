@@ -1,9 +1,8 @@
 //===- ScheduleDAG.cpp - Implement the ScheduleDAG class ------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,20 +11,22 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ADT/iterator_range.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/ScheduleDAG.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/iterator_range.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/ScheduleHazardRecognizer.h"
 #include "llvm/CodeGen/SelectionDAGNodes.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Target/TargetInstrInfo.h"
-#include "llvm/Target/TargetRegisterInfo.h"
-#include "llvm/Target/TargetSubtargetInfo.h"
 #include <algorithm>
 #include <cassert>
 #include <iterator>
@@ -36,6 +37,10 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "pre-RA-sched"
+
+STATISTIC(NumNewPredsAdded, "Number of times a  single predecessor was added");
+STATISTIC(NumTopoInits,
+          "Number of times the topological order has been recomputed");
 
 #ifndef NDEBUG
 static cl::opt<bool> StressSchedOpt(
@@ -65,6 +70,38 @@ void ScheduleDAG::clearDAG() {
 const MCInstrDesc *ScheduleDAG::getNodeDesc(const SDNode *Node) const {
   if (!Node || !Node->isMachineOpcode()) return nullptr;
   return &TII->get(Node->getMachineOpcode());
+}
+
+LLVM_DUMP_METHOD void SDep::dump(const TargetRegisterInfo *TRI) const {
+  switch (getKind()) {
+  case Data:   dbgs() << "Data"; break;
+  case Anti:   dbgs() << "Anti"; break;
+  case Output: dbgs() << "Out "; break;
+  case Order:  dbgs() << "Ord "; break;
+  }
+
+  switch (getKind()) {
+  case Data:
+    dbgs() << " Latency=" << getLatency();
+    if (TRI && isAssignedRegDep())
+      dbgs() << " Reg=" << printReg(getReg(), TRI);
+    break;
+  case Anti:
+  case Output:
+    dbgs() << " Latency=" << getLatency();
+    break;
+  case Order:
+    dbgs() << " Latency=" << getLatency();
+    switch(Contents.OrdKind) {
+    case Barrier:      dbgs() << " Barrier"; break;
+    case MayAliasMem:
+    case MustAliasMem: dbgs() << " Memory"; break;
+    case Artificial:   dbgs() << " Artificial"; break;
+    case Weak:         dbgs() << " Weak"; break;
+    case Cluster:      dbgs() << " Cluster"; break;
+    }
+    break;
+  }
 }
 
 bool SUnit::addPred(const SDep &D, bool Required) {
@@ -301,25 +338,7 @@ void SUnit::biasCriticalPath() {
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
-LLVM_DUMP_METHOD
-void SUnit::print(raw_ostream &OS, const ScheduleDAG *DAG) const {
-  if (this == &DAG->ExitSU)
-    OS << "ExitSU";
-  else if (this == &DAG->EntrySU)
-    OS << "EntrySU";
-  else
-    OS << "SU(" << NodeNum << ")";
-}
-
-LLVM_DUMP_METHOD void SUnit::dump(const ScheduleDAG *G) const {
-  print(dbgs(), G);
-  dbgs() << ": ";
-  G->dumpNode(this);
-}
-
-LLVM_DUMP_METHOD void SUnit::dumpAll(const ScheduleDAG *G) const {
-  dump(G);
-
+LLVM_DUMP_METHOD void SUnit::dumpAttributes() const {
   dbgs() << "  # preds left       : " << NumPredsLeft << "\n";
   dbgs() << "  # succs left       : " << NumSuccsLeft << "\n";
   if (WeakPredsLeft)
@@ -330,43 +349,38 @@ LLVM_DUMP_METHOD void SUnit::dumpAll(const ScheduleDAG *G) const {
   dbgs() << "  Latency            : " << Latency << "\n";
   dbgs() << "  Depth              : " << getDepth() << "\n";
   dbgs() << "  Height             : " << getHeight() << "\n";
+}
 
-  if (Preds.size() != 0) {
+LLVM_DUMP_METHOD void ScheduleDAG::dumpNodeName(const SUnit &SU) const {
+  if (&SU == &EntrySU)
+    dbgs() << "EntrySU";
+  else if (&SU == &ExitSU)
+    dbgs() << "ExitSU";
+  else
+    dbgs() << "SU(" << SU.NodeNum << ")";
+}
+
+LLVM_DUMP_METHOD void ScheduleDAG::dumpNodeAll(const SUnit &SU) const {
+  dumpNode(SU);
+  SU.dumpAttributes();
+  if (SU.Preds.size() > 0) {
     dbgs() << "  Predecessors:\n";
-    for (const SDep &SuccDep : Preds) {
-      dbgs() << "   ";
-      switch (SuccDep.getKind()) {
-      case SDep::Data:   dbgs() << "data "; break;
-      case SDep::Anti:   dbgs() << "anti "; break;
-      case SDep::Output: dbgs() << "out  "; break;
-      case SDep::Order:  dbgs() << "ord  "; break;
-      }
-      SuccDep.getSUnit()->print(dbgs(), G);
-      if (SuccDep.isArtificial())
-        dbgs() << " *";
-      dbgs() << ": Latency=" << SuccDep.getLatency();
-      if (SuccDep.isAssignedRegDep())
-        dbgs() << " Reg=" << PrintReg(SuccDep.getReg(), G->TRI);
-      dbgs() << "\n";
+    for (const SDep &Dep : SU.Preds) {
+      dbgs() << "    ";
+      dumpNodeName(*Dep.getSUnit());
+      dbgs() << ": ";
+      Dep.dump(TRI);
+      dbgs() << '\n';
     }
   }
-  if (Succs.size() != 0) {
+  if (SU.Succs.size() > 0) {
     dbgs() << "  Successors:\n";
-    for (const SDep &SuccDep : Succs) {
-      dbgs() << "   ";
-      switch (SuccDep.getKind()) {
-      case SDep::Data:   dbgs() << "data "; break;
-      case SDep::Anti:   dbgs() << "anti "; break;
-      case SDep::Output: dbgs() << "out  "; break;
-      case SDep::Order:  dbgs() << "ord  "; break;
-      }
-      SuccDep.getSUnit()->print(dbgs(), G);
-      if (SuccDep.isArtificial())
-        dbgs() << " *";
-      dbgs() << ": Latency=" << SuccDep.getLatency();
-      if (SuccDep.isAssignedRegDep())
-        dbgs() << " Reg=" << PrintReg(SuccDep.getReg(), G->TRI);
-      dbgs() << "\n";
+    for (const SDep &Dep : SU.Succs) {
+      dbgs() << "    ";
+      dumpNodeName(*Dep.getSUnit());
+      dbgs() << ": ";
+      Dep.dump(TRI);
+      dbgs() << '\n';
     }
   }
 }
@@ -384,7 +398,7 @@ unsigned ScheduleDAG::VerifyScheduledDAG(bool isBottomUp) {
       }
       if (!AnyNotSched)
         dbgs() << "*** Scheduling failed! ***\n";
-      SUnit.dump(this);
+      dumpNode(SUnit);
       dbgs() << "has not been scheduled!\n";
       AnyNotSched = true;
     }
@@ -393,7 +407,7 @@ unsigned ScheduleDAG::VerifyScheduledDAG(bool isBottomUp) {
           unsigned(std::numeric_limits<int>::max())) {
       if (!AnyNotSched)
         dbgs() << "*** Scheduling failed! ***\n";
-      SUnit.dump(this);
+      dumpNode(SUnit);
       dbgs() << "has an unexpected "
            << (isBottomUp ? "Height" : "Depth") << " value!\n";
       AnyNotSched = true;
@@ -402,7 +416,7 @@ unsigned ScheduleDAG::VerifyScheduledDAG(bool isBottomUp) {
       if (SUnit.NumSuccsLeft != 0) {
         if (!AnyNotSched)
           dbgs() << "*** Scheduling failed! ***\n";
-        SUnit.dump(this);
+        dumpNode(SUnit);
         dbgs() << "has successors left!\n";
         AnyNotSched = true;
       }
@@ -410,7 +424,7 @@ unsigned ScheduleDAG::VerifyScheduledDAG(bool isBottomUp) {
       if (SUnit.NumPredsLeft != 0) {
         if (!AnyNotSched)
           dbgs() << "*** Scheduling failed! ***\n";
-        SUnit.dump(this);
+        dumpNode(SUnit);
         dbgs() << "has predecessors left!\n";
         AnyNotSched = true;
       }
@@ -448,6 +462,11 @@ void ScheduleDAGTopologicalSort::InitDAGTopologicalSorting() {
   // On insertion of the edge X->Y, the algorithm first marks by calling DFS
   // the nodes reachable from Y, and then shifts them using Shift to lie
   // immediately after X in Index2Node.
+
+  // Cancel pending updates, mark as valid.
+  Dirty = false;
+  Updates.clear();
+
   unsigned DAGSize = SUnits.size();
   std::vector<SUnit*> WorkList;
   WorkList.reserve(DAGSize);
@@ -488,6 +507,7 @@ void ScheduleDAGTopologicalSort::InitDAGTopologicalSorting() {
   }
 
   Visited.resize(DAGSize);
+  NumTopoInits++;
 
 #ifndef NDEBUG
   // Check correctness of the ordering
@@ -498,6 +518,31 @@ void ScheduleDAGTopologicalSort::InitDAGTopologicalSorting() {
     }
   }
 #endif
+}
+
+void ScheduleDAGTopologicalSort::FixOrder() {
+  // Recompute from scratch after new nodes have been added.
+  if (Dirty) {
+    InitDAGTopologicalSorting();
+    return;
+  }
+
+  // Otherwise apply updates one-by-one.
+  for (auto &U : Updates)
+    AddPred(U.first, U.second);
+  Updates.clear();
+}
+
+void ScheduleDAGTopologicalSort::AddPredQueued(SUnit *Y, SUnit *X) {
+  // Recomputing the order from scratch is likely more efficient than applying
+  // updates one-by-one for too many updates. The current cut-off is arbitrarily
+  // chosen.
+  Dirty = Dirty || Updates.size() > 10;
+
+  if (Dirty)
+    return;
+
+  Updates.emplace_back(Y, X);
 }
 
 void ScheduleDAGTopologicalSort::AddPred(SUnit *Y, SUnit *X) {
@@ -514,6 +559,8 @@ void ScheduleDAGTopologicalSort::AddPred(SUnit *Y, SUnit *X) {
     // Recompute topological indexes.
     Shift(Visited, LowerBound, UpperBound);
   }
+
+  NumNewPredsAdded++;
 }
 
 void ScheduleDAGTopologicalSort::RemovePred(SUnit *M, SUnit *N) {
@@ -655,6 +702,7 @@ void ScheduleDAGTopologicalSort::Shift(BitVector& Visited, int LowerBound,
 }
 
 bool ScheduleDAGTopologicalSort::WillCreateCycle(SUnit *TargetSU, SUnit *SU) {
+  FixOrder();
   // Is SU reachable from TargetSU via successor edges?
   if (IsReachable(SU, TargetSU))
     return true;
@@ -667,6 +715,7 @@ bool ScheduleDAGTopologicalSort::WillCreateCycle(SUnit *TargetSU, SUnit *SU) {
 
 bool ScheduleDAGTopologicalSort::IsReachable(const SUnit *SU,
                                              const SUnit *TargetSU) {
+  FixOrder();
   // If insertion of the edge SU->TargetSU would create a cycle
   // then there is a path from TargetSU to SU.
   int UpperBound, LowerBound;

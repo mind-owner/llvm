@@ -1,9 +1,8 @@
 //===- llvm/CodeGen/LiveRegUnits.h - Register Unit Set ----------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,7 +15,8 @@
 #define LLVM_CODEGEN_LIVEREGUNITS_H
 
 #include "llvm/ADT/BitVector.h"
-#include "llvm/Target/TargetRegisterInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/MC/LaneBitmask.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include <cstdint>
@@ -40,6 +40,36 @@ public:
     init(TRI);
   }
 
+  /// For a machine instruction \p MI, adds all register units used in
+  /// \p UsedRegUnits and defined or clobbered in \p ModifiedRegUnits. This is
+  /// useful when walking over a range of instructions to track registers
+  /// used or defined seperately.
+  static void accumulateUsedDefed(const MachineInstr &MI,
+                                  LiveRegUnits &ModifiedRegUnits,
+                                  LiveRegUnits &UsedRegUnits,
+                                  const TargetRegisterInfo *TRI) {
+    for (ConstMIBundleOperands O(MI); O.isValid(); ++O) {
+      if (O->isRegMask())
+        ModifiedRegUnits.addRegsInMask(O->getRegMask());
+      if (!O->isReg())
+        continue;
+      Register Reg = O->getReg();
+      if (!Reg.isPhysical())
+        continue;
+      if (O->isDef()) {
+        // Some architectures (e.g. AArch64 XZR/WZR) have registers that are
+        // constant and may be used as destinations to indicate the generated
+        // value is discarded. No need to track such case as a def.
+        if (!TRI->isConstantPhysReg(Reg))
+          ModifiedRegUnits.addReg(Reg);
+      } else {
+        assert(O->isUse() && "Reg operand not a def and not a use");
+        UsedRegUnits.addReg(Reg);
+      }
+    }
+    return;
+  }
+
   /// Initialize and clear the set.
   void init(const TargetRegisterInfo &TRI) {
     this->TRI = &TRI;
@@ -51,17 +81,17 @@ public:
   void clear() { Units.reset(); }
 
   /// Returns true if the set is empty.
-  bool empty() const { return Units.empty(); }
+  bool empty() const { return Units.none(); }
 
   /// Adds register units covered by physical register \p Reg.
-  void addReg(unsigned Reg) {
+  void addReg(MCPhysReg Reg) {
     for (MCRegUnitIterator Unit(Reg, TRI); Unit.isValid(); ++Unit)
       Units.set(*Unit);
   }
 
-  /// \brief Adds register units covered by physical register \p Reg that are
+  /// Adds register units covered by physical register \p Reg that are
   /// part of the lanemask \p Mask.
-  void addRegMasked(unsigned Reg, LaneBitmask Mask) {
+  void addRegMasked(MCPhysReg Reg, LaneBitmask Mask) {
     for (MCRegUnitMaskIterator Unit(Reg, TRI); Unit.isValid(); ++Unit) {
       LaneBitmask UnitMask = (*Unit).second;
       if (UnitMask.none() || (UnitMask & Mask).any())
@@ -70,7 +100,7 @@ public:
   }
 
   /// Removes all register units covered by physical register \p Reg.
-  void removeReg(unsigned Reg) {
+  void removeReg(MCPhysReg Reg) {
     for (MCRegUnitIterator Unit(Reg, TRI); Unit.isValid(); ++Unit)
       Units.reset(*Unit);
   }
@@ -84,7 +114,7 @@ public:
   void addRegsInMask(const uint32_t *RegMask);
 
   /// Returns true if no part of physical register \p Reg is live.
-  bool available(unsigned Reg) const {
+  bool available(MCPhysReg Reg) const {
     for (MCRegUnitIterator Unit(Reg, TRI); Unit.isValid(); ++Unit) {
       if (Units.test(*Unit))
         return false;
@@ -93,12 +123,14 @@ public:
   }
 
   /// Updates liveness when stepping backwards over the instruction \p MI.
+  /// This removes all register units defined or clobbered in \p MI and then
+  /// adds the units used (as in use operands) in \p MI.
   void stepBackward(const MachineInstr &MI);
 
-  /// Mark all register units live during instruction \p MI.
-  /// This can be used to accumulate live/unoccupied registers over a range of
-  /// instructions.
-  void accumulateBackward(const MachineInstr &MI);
+  /// Adds all register units used, defined or clobbered in \p MI.
+  /// This is useful when walking over a range of instruction to find registers
+  /// unused over the whole range.
+  void accumulate(const MachineInstr &MI);
 
   /// Adds registers living out of block \p MBB.
   /// Live out registers are the union of the live-in registers of the successor
@@ -121,6 +153,11 @@ public:
   const BitVector &getBitVector() const {
     return Units;
   }
+
+private:
+  /// Adds pristine registers. Pristine registers are callee saved registers
+  /// that are unused in the function.
+  void addPristines(const MachineFunction &MF);
 };
 
 } // end namespace llvm

@@ -978,7 +978,7 @@ _func:
         bfm x5, x6, #12, #63
 // CHECK: bfi      x4, x5, #52, #11           // encoding: [0xa4,0x28,0x4c,0xb3]
 // CHECK: bfxil    xzr, x4, #0, #1            // encoding: [0x9f,0x00,0x40,0xb3]
-// CHECK: bfc      x4, #1, #6                 // encoding: [0xe4,0x17,0x7f,0xb3]
+// CHECK: bfi      x4, xzr, #1, #6            // encoding: [0xe4,0x17,0x7f,0xb3]
 // CHECK: bfxil    x5, x6, #12, #52           // encoding: [0xc5,0xfc,0x4c,0xb3]
 
         sxtb w1, w2
@@ -1078,7 +1078,7 @@ _func:
 // CHECK: bfxil    w9, w10, #0, #32           // encoding: [0x49,0x7d,0x00,0x33]
 // CHECK: bfi      w11, w12, #31, #1          // encoding: [0x8b,0x01,0x01,0x33]
 // CHECK: bfi      w13, w14, #29, #3          // encoding: [0xcd,0x09,0x03,0x33]
-// CHECK: bfc      xzr, #10, #11              // encoding: [0xff,0x2b,0x76,0xb3]
+// CHECK: bfi      xzr, xzr, #10, #11         // encoding: [0xff,0x2b,0x76,0xb3]
 
         bfxil w9, w10, #0, #1
         bfxil x2, x3, #63, #1
@@ -1137,10 +1137,10 @@ _func:
         bfc wzr, #31, #1
         bfc x0, #5, #9
         bfc xzr, #63, #1
-// CHECK: bfc w3, #0, #32             // encoding: [0xe3,0x7f,0x00,0x33]
-// CHECK: bfc wzr, #31, #1            // encoding: [0xff,0x03,0x01,0x33]
-// CHECK: bfc x0, #5, #9              // encoding: [0xe0,0x23,0x7b,0xb3]
-// CHECK: bfc xzr, #63, #1            // encoding: [0xff,0x03,0x41,0xb3]
+// CHECK: bfxil w3, wzr, #0, #32      // encoding: [0xe3,0x7f,0x00,0x33]
+// CHECK: bfi wzr, wzr, #31, #1       // encoding: [0xff,0x03,0x01,0x33]
+// CHECK: bfi x0, xzr, #5, #9         // encoding: [0xe0,0x23,0x7b,0xb3]
+// CHECK: bfi xzr, xzr, #63, #1       // encoding: [0xff,0x03,0x41,0xb3]
 
 //------------------------------------------------------------------------------
 // Compare & branch (immediate)
@@ -1495,23 +1495,6 @@ _func:
 //------------------------------------------------------------------------------
 // Data-processing (2 source)
 //------------------------------------------------------------------------------
-
-        crc32b  w5, w7, w20
-        crc32h  w28, wzr, w30
-        crc32w  w0, w1, w2
-        crc32x  w7, w9, x20
-        crc32cb w9, w5, w4
-        crc32ch w13, w17, w25
-        crc32cw wzr, w3, w5
-        crc32cx w18, w16, xzr
-// CHECK: crc32b   w5, w7, w20             // encoding: [0xe5,0x40,0xd4,0x1a]
-// CHECK: crc32h   w28, wzr, w30           // encoding: [0xfc,0x47,0xde,0x1a]
-// CHECK: crc32w   w0, w1, w2              // encoding: [0x20,0x48,0xc2,0x1a]
-// CHECK: crc32x   w7, w9, x20             // encoding: [0x27,0x4d,0xd4,0x9a]
-// CHECK: crc32cb  w9, w5, w4              // encoding: [0xa9,0x50,0xc4,0x1a]
-// CHECK: crc32ch  w13, w17, w25           // encoding: [0x2d,0x56,0xd9,0x1a]
-// CHECK: crc32cw  wzr, w3, w5             // encoding: [0x7f,0x58,0xc5,0x1a]
-// CHECK: crc32cx  w18, w16, xzr           // encoding: [0x12,0x5e,0xdf,0x9a]
 
         udiv	w0, w7, w10
         udiv	x9, x22, x4
@@ -3499,6 +3482,7 @@ _func:
 // CHECK: clrex                           // encoding: [0x5f,0x3f,0x03,0xd5]
 
         dsb #0
+        dsb #4
         dsb #12
         dsb #15
         dsb oshld
@@ -3513,7 +3497,8 @@ _func:
         dsb ld
         dsb st
         dsb sy
-// CHECK: dsb     #0                      // encoding: [0x9f,0x30,0x03,0xd5]
+// CHECK: ssbb                            // encoding: [0x9f,0x30,0x03,0xd5]
+// CHECK: pssbb                           // encoding: [0x9f,0x34,0x03,0xd5]
 // CHECK: dsb     #12                     // encoding: [0x9f,0x3c,0x03,0xd5]
 // CHECK: dsb     sy                      // encoding: [0x9f,0x3f,0x03,0xd5]
 // CHECK: dsb     oshld                   // encoding: [0x9f,0x31,0x03,0xd5]
@@ -4310,6 +4295,7 @@ _func:
 	mrs x9, ID_MMFR2_EL1
 	mrs x9, ID_MMFR3_EL1
 	mrs x9, ID_MMFR4_EL1
+	mrs x9, ID_MMFR5_EL1
 	mrs x9, ID_ISAR0_EL1
 	mrs x9, ID_ISAR1_EL1
 	mrs x9, ID_ISAR2_EL1
@@ -4611,6 +4597,7 @@ _func:
 // CHECK: mrs      x9, {{id_mmfr2_el1|ID_MMFR2_EL1}}           // encoding: [0xc9,0x01,0x38,0xd5]
 // CHECK: mrs      x9, {{id_mmfr3_el1|ID_MMFR3_EL1}}           // encoding: [0xe9,0x01,0x38,0xd5]
 // CHECK: mrs      x9, {{id_mmfr4_el1|ID_MMFR4_EL1}}           // encoding: [0xc9,0x02,0x38,0xd5]
+// CHECK: mrs      x9, {{id_mmfr5_el1|ID_MMFR5_EL1}}           // encoding: [0xc9,0x03,0x38,0xd5]
 // CHECK: mrs      x9, {{id_isar0_el1|ID_ISAR0_EL1}}           // encoding: [0x09,0x02,0x38,0xd5]
 // CHECK: mrs      x9, {{id_isar1_el1|ID_ISAR1_EL1}}           // encoding: [0x29,0x02,0x38,0xd5]
 // CHECK: mrs      x9, {{id_isar2_el1|ID_ISAR2_EL1}}           // encoding: [0x49,0x02,0x38,0xd5]

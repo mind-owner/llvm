@@ -352,7 +352,7 @@ define <8 x float> @shuffle_v8f32_11335577(<8 x float> %a, <8 x float> %b) {
 }
 
 define <4 x float> @shuffle_v4f32_1133(<4 x float> %a, <4 x float> %b) {
-; vmovshdup 128 test 
+; vmovshdup 128 test
   %shuffle = shufflevector <4 x float> %a, <4 x float> %b, <4 x i32> <i32 1, i32 1, i32 3, i32 3>
   ret <4 x float> %shuffle
 }
@@ -679,4 +679,9 @@ define   <4 x double> @_inreg4xdouble(double %a) {
   %b = insertelement <4 x double> undef, double %a, i32 0
   %c = shufflevector <4 x double> %b, <4 x double> undef, <4 x i32> zeroinitializer
   ret <4 x double> %c
+}
+
+define <8 x i32> @test_mul_v8i32(<8 x i32> %arg1, <8 x i32> %arg2) #0 {
+  %ret = mul <8 x i32> %arg1, %arg2
+  ret <8 x i32> %ret
 }

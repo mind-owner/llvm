@@ -1,85 +1,57 @@
 //===-- llvm/MC/MCWasmObjectWriter.h - Wasm Object Writer -------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_MC_MCWASMOBJECTWRITER_H
 #define LLVM_MC_MCWASMOBJECTWRITER_H
 
-#include "llvm/ADT/Triple.h"
-#include "llvm/MC/MCValue.h"
-#include "llvm/Support/DataTypes.h"
-#include "llvm/Support/raw_ostream.h"
-#include <vector>
+#include "llvm/MC/MCObjectWriter.h"
+#include <memory>
 
 namespace llvm {
-class MCAssembler;
-class MCContext;
+
 class MCFixup;
-class MCFragment;
-class MCObjectWriter;
-class MCSectionWasm;
-class MCSymbol;
-class MCSymbolWasm;
 class MCValue;
 class raw_pwrite_stream;
 
-// Information about a single relocation.
-struct WasmRelocationEntry {
-  uint64_t Offset;            // Where is the relocation.
-  const MCSymbolWasm *Symbol; // The symbol to relocate with.
-  uint64_t Addend;            // A value to add to the symbol.
-  unsigned Type;              // The type of the relocation.
-  MCSectionWasm *FixupSection;// The section the relocation is targeting.
-
-  WasmRelocationEntry(uint64_t Offset, const MCSymbolWasm *Symbol,
-                      uint64_t Addend, unsigned Type,
-                      MCSectionWasm *FixupSection)
-      : Offset(Offset), Symbol(Symbol), Addend(Addend), Type(Type),
-        FixupSection(FixupSection) {}
-
-  void print(raw_ostream &Out) const {
-    Out << "Off=" << Offset << ", Sym=" << Symbol << ", Addend=" << Addend
-        << ", Type=" << Type << ", FixupSection=" << FixupSection;
-  }
-  void dump() const { print(errs()); }
-};
-
-class MCWasmObjectTargetWriter {
+class MCWasmObjectTargetWriter : public MCObjectTargetWriter {
   const unsigned Is64Bit : 1;
+  const unsigned IsEmscripten : 1;
 
 protected:
-  explicit MCWasmObjectTargetWriter(bool Is64Bit_);
+  explicit MCWasmObjectTargetWriter(bool Is64Bit_, bool IsEmscripten);
 
 public:
-  virtual ~MCWasmObjectTargetWriter() {}
+  virtual ~MCWasmObjectTargetWriter();
 
-  virtual unsigned getRelocType(MCContext &Ctx, const MCValue &Target,
-                                const MCFixup &Fixup, bool IsPCRel) const = 0;
+  virtual Triple::ObjectFormatType getFormat() const { return Triple::Wasm; }
+  static bool classof(const MCObjectTargetWriter *W) {
+    return W->getFormat() == Triple::Wasm;
+  }
 
-  virtual bool needsRelocateWithSymbol(const MCSymbol &Sym,
-                                       unsigned Type) const;
-
-  virtual void sortRelocs(const MCAssembler &Asm,
-                          std::vector<WasmRelocationEntry> &Relocs);
+  virtual unsigned getRelocType(const MCValue &Target,
+                                const MCFixup &Fixup) const = 0;
 
   /// \name Accessors
   /// @{
   bool is64Bit() const { return Is64Bit; }
+  bool isEmscripten() const { return IsEmscripten; }
   /// @}
 };
 
-/// \brief Construct a new Wasm writer instance.
+/// Construct a new Wasm writer instance.
 ///
 /// \param MOTW - The target specific Wasm writer subclass.
 /// \param OS - The stream to write to.
 /// \returns The constructed object writer.
-MCObjectWriter *createWasmObjectWriter(MCWasmObjectTargetWriter *MOTW,
-                                       raw_pwrite_stream &OS);
-} // End llvm namespace
+std::unique_ptr<MCObjectWriter>
+createWasmObjectWriter(std::unique_ptr<MCWasmObjectTargetWriter> MOTW,
+                       raw_pwrite_stream &OS);
+
+} // namespace llvm
 
 #endif

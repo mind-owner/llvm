@@ -9,10 +9,10 @@ Introduction
 ============
 
 Branch Weight Metadata represents branch weights as its likeliness to be taken
-(see :doc:`BlockFrequencyTerminology`). Metadata is assigned to the
-``TerminatorInst`` as a ``MDNode`` of the ``MD_prof`` kind. The first operator
-is always a ``MDString`` node with the string "branch_weights".  Number of
-operators depends on the terminator type.
+(see :doc:`BlockFrequencyTerminology`). Metadata is assigned to an
+``Instruction`` that is a terminator as a ``MDNode`` of the ``MD_prof`` kind.
+The first operator is always a ``MDString`` node with the string
+"branch_weights".  Number of operators depends on the terminator type.
 
 Branch weights might be fetch from the profiling file, or generated based on
 `__builtin_expect`_ instruction.
@@ -62,6 +62,20 @@ Branch weights are assigned to every destination.
     metadata !"branch_weights",
     i32 <LABEL_BRANCH_WEIGHT>
     [ , i32 <LABEL_BRANCH_WEIGHT> ... ]
+  }
+
+``CallInst``
+^^^^^^^^^^^^^^^^^^
+
+Calls may have branch weight metadata, containing the execution count of
+the call. It is currently used in SamplePGO mode only, to augment the
+block and entry counts which may not be accurate with sampling.
+
+.. code-block:: none
+
+  !0 = metadata !{
+    metadata !"branch_weights",
+    i32 <CALL_BRANCH_WEIGHT>
   }
 
 Other

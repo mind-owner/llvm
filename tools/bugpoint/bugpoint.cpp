@@ -1,9 +1,8 @@
 //===- bugpoint.cpp - The LLVM Bugpoint utility ---------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,17 +14,19 @@
 
 #include "BugDriver.h"
 #include "ToolRunner.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/LegacyPassNameParser.h"
 #include "llvm/LinkAllIR.h"
 #include "llvm/LinkAllPasses.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/PluginLoader.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Process.h"
-#include "llvm/Support/Signals.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/Valgrind.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
@@ -49,10 +50,10 @@ static cl::opt<unsigned> TimeoutValue(
     cl::desc("Number of seconds program is allowed to run before it "
              "is killed (default is 300s), 0 disables timeout"));
 
-static cl::opt<int>
-    MemoryLimit("mlimit", cl::init(-1), cl::value_desc("MBytes"),
-                cl::desc("Maximum amount of memory to use. 0 disables check."
-                         " Defaults to 400MB (800MB under valgrind)."));
+static cl::opt<int> MemoryLimit(
+    "mlimit", cl::init(-1), cl::value_desc("MBytes"),
+    cl::desc("Maximum amount of memory to use. 0 disables check. Defaults to "
+             "400MB (800MB under valgrind, 0 with sanitizers)."));
 
 static cl::opt<bool>
     UseValgrind("enable-valgrind",
@@ -78,6 +79,10 @@ static cl::opt<bool> OptLevelOs(
     "Os",
     cl::desc(
         "Like -O2 with extra optimizations for size. Similar to clang -Os"));
+
+static cl::opt<bool>
+OptLevelOz("Oz",
+           cl::desc("Like -Os but reduces code size further. Similar to clang -Oz"));
 
 static cl::opt<bool>
     OptLevelO3("O3", cl::desc("Optimization level 3. Identical to 'opt -O3'"));
@@ -108,6 +113,26 @@ public:
 };
 }
 
+// This routine adds optimization passes based on selected optimization level,
+// OptLevel.
+//
+// OptLevel - Optimization Level
+static void AddOptimizationPasses(legacy::FunctionPassManager &FPM,
+                                  unsigned OptLevel,
+                                  unsigned SizeLevel) {
+  PassManagerBuilder Builder;
+  Builder.OptLevel = OptLevel;
+  Builder.SizeLevel = SizeLevel;
+
+  if (OptLevel > 1)
+    Builder.Inliner = createFunctionInliningPass(OptLevel, SizeLevel, false);
+  else
+    Builder.Inliner = createAlwaysInlinerLegacyPass();
+
+  Builder.populateFunctionPassManager(FPM);
+  Builder.populateModulePassManager(FPM);
+}
+
 #ifdef LINK_POLLY_INTO_TOOLS
 namespace polly {
 void initializePollyPasses(llvm::PassRegistry &Registry);
@@ -116,9 +141,7 @@ void initializePollyPasses(llvm::PassRegistry &Registry);
 
 int main(int argc, char **argv) {
 #ifndef DEBUG_BUGPOINT
-  llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
-  llvm::PrettyStackTraceProgram X(argc, argv);
-  llvm_shutdown_obj Y; // Call llvm_shutdown() on exit.
+  InitLLVM X(argc, argv);
 #endif
 
   // Initialize passes
@@ -131,12 +154,20 @@ int main(int argc, char **argv) {
   initializeAnalysis(Registry);
   initializeTransformUtils(Registry);
   initializeInstCombine(Registry);
+  initializeAggressiveInstCombine(Registry);
   initializeInstrumentation(Registry);
   initializeTarget(Registry);
 
 #ifdef LINK_POLLY_INTO_TOOLS
   polly::initializePollyPasses(Registry);
 #endif
+
+  if (std::getenv("bar") == (char*) -1) {
+    InitializeAllTargets();
+    InitializeAllTargetMCs();
+    InitializeAllAsmPrinters();
+    InitializeAllAsmParsers();
+  }
 
   cl::ParseCommandLineOptions(argc, argv,
                               "LLVM automatic testcase reducer. See\nhttp://"
@@ -161,6 +192,12 @@ int main(int argc, char **argv) {
       MemoryLimit = 800;
     else
       MemoryLimit = 400;
+#if (LLVM_ADDRESS_SANITIZER_BUILD || LLVM_MEMORY_SANITIZER_BUILD ||            \
+     LLVM_THREAD_SANITIZER_BUILD)
+    // Starting from kernel 4.9 memory allocated with mmap is counted against
+    // RLIMIT_DATA. Sanitizers need to allocate tens of terabytes for shadow.
+    MemoryLimit = 0;
+#endif
   }
 
   BugDriver D(argv[0], FindBugs, TimeoutValue, MemoryLimit, UseValgrind,
@@ -176,18 +213,16 @@ int main(int argc, char **argv) {
     Builder.populateLTOPassManager(PM);
   }
 
-  if (OptLevelO1 || OptLevelO2 || OptLevelO3) {
-    PassManagerBuilder Builder;
-    if (OptLevelO1)
-      Builder.Inliner = createAlwaysInlinerLegacyPass();
-    else if (OptLevelOs || OptLevelO2)
-      Builder.Inliner = createFunctionInliningPass(
-          2, OptLevelOs ? 1 : 0, false);
-    else
-      Builder.Inliner = createFunctionInliningPass(275);
-    Builder.populateFunctionPassManager(PM);
-    Builder.populateModulePassManager(PM);
-  }
+  if (OptLevelO1)
+    AddOptimizationPasses(PM, 1, 0);
+  else if (OptLevelO2)
+    AddOptimizationPasses(PM, 2, 0);
+  else if (OptLevelO3)
+    AddOptimizationPasses(PM, 3, 0);
+  else if (OptLevelOs)
+    AddOptimizationPasses(PM, 2, 1);
+  else if (OptLevelOz)
+    AddOptimizationPasses(PM, 2, 2);
 
   for (const PassInfo *PI : PassList)
     D.addPass(PI->getPassArgument());

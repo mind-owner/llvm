@@ -1,27 +1,36 @@
 //===- DWARFEmitter - Convert YAML to DWARF binary data -------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// \brief The DWARF component of yaml2obj. Provided as library code for tests.
+/// The DWARF component of yaml2obj. Provided as library code for tests.
 ///
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ObjectYAML/DWARFEmitter.h"
+#include "DWARFVisitor.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ObjectYAML/DWARFYAML.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/Host.h"
 #include "llvm/Support/LEB128.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SwapByteOrder.h"
-
-#include "DWARFVisitor.h"
-
+#include "llvm/Support/YAMLTraits.h"
+#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
 using namespace llvm;
 
@@ -52,8 +61,8 @@ static void ZeroFillBytes(raw_ostream &OS, size_t Size) {
   OS.write(reinterpret_cast<char *>(FillData.data()), Size);
 }
 
-void writeInitialLength(const DWARFYAML::InitialLength &Length, raw_ostream &OS,
-                        bool IsLittleEndian) {
+static void writeInitialLength(const DWARFYAML::InitialLength &Length,
+                               raw_ostream &OS, bool IsLittleEndian) {
   writeInteger((uint32_t)Length.TotalLength, OS, IsLittleEndian);
   if (Length.isDWARF64())
     writeInteger((uint64_t)Length.TotalLength64, OS, IsLittleEndian);
@@ -121,13 +130,14 @@ void DWARFYAML::EmitPubSection(raw_ostream &OS,
   }
 }
 
-/// \brief An extension of the DWARFYAML::ConstVisitor which writes compile
+namespace {
+/// An extension of the DWARFYAML::ConstVisitor which writes compile
 /// units and DIEs to a stream.
 class DumpVisitor : public DWARFYAML::ConstVisitor {
   raw_ostream &OS;
 
 protected:
-  virtual void onStartCompileUnit(const DWARFYAML::Unit &CU) {
+  void onStartCompileUnit(const DWARFYAML::Unit &CU) override {
     writeInitialLength(CU.Length, OS, DebugInfo.IsLittleEndian);
     writeInteger((uint16_t)CU.Version, OS, DebugInfo.IsLittleEndian);
     if(CU.Version >= 5) {
@@ -138,44 +148,45 @@ protected:
       writeInteger((uint32_t)CU.AbbrOffset, OS, DebugInfo.IsLittleEndian);
       writeInteger((uint8_t)CU.AddrSize, OS, DebugInfo.IsLittleEndian);
     }
-    
   }
 
-  virtual void onStartDIE(const DWARFYAML::Unit &CU,
-                          const DWARFYAML::Entry &DIE) {
+  void onStartDIE(const DWARFYAML::Unit &CU,
+                  const DWARFYAML::Entry &DIE) override {
     encodeULEB128(DIE.AbbrCode, OS);
   }
 
-  virtual void onValue(const uint8_t U) {
+  void onValue(const uint8_t U) override {
     writeInteger(U, OS, DebugInfo.IsLittleEndian);
   }
 
-  virtual void onValue(const uint16_t U) {
+  void onValue(const uint16_t U) override {
     writeInteger(U, OS, DebugInfo.IsLittleEndian);
   }
-  virtual void onValue(const uint32_t U) {
+
+  void onValue(const uint32_t U) override {
     writeInteger(U, OS, DebugInfo.IsLittleEndian);
   }
-  virtual void onValue(const uint64_t U, const bool LEB = false) {
+
+  void onValue(const uint64_t U, const bool LEB = false) override {
     if (LEB)
       encodeULEB128(U, OS);
     else
       writeInteger(U, OS, DebugInfo.IsLittleEndian);
   }
 
-  virtual void onValue(const int64_t S, const bool LEB = false) {
+  void onValue(const int64_t S, const bool LEB = false) override {
     if (LEB)
       encodeSLEB128(S, OS);
     else
       writeInteger(S, OS, DebugInfo.IsLittleEndian);
   }
 
-  virtual void onValue(const StringRef String) {
+  void onValue(const StringRef String) override {
     OS.write(String.data(), String.size());
     OS.write('\0');
   }
 
-  virtual void onValue(const MemoryBufferRef MBR) {
+  void onValue(const MemoryBufferRef MBR) override {
     OS.write(MBR.getBufferStart(), MBR.getBufferSize());
   }
 
@@ -183,6 +194,7 @@ public:
   DumpVisitor(const DWARFYAML::Data &DI, raw_ostream &Out)
       : DWARFYAML::ConstVisitor(DI), OS(Out) {}
 };
+} // namespace
 
 void DWARFYAML::EmitDebugInfo(raw_ostream &OS, const DWARFYAML::Data &DI) {
   DumpVisitor Visitor(DI, OS);
@@ -280,7 +292,7 @@ void DWARFYAML::EmitDebugLine(raw_ostream &OS, const DWARFYAML::Data &DI) {
   }
 }
 
-typedef void (*EmitFuncType)(raw_ostream &, const DWARFYAML::Data &);
+using EmitFuncType = void (*)(raw_ostream &, const DWARFYAML::Data &);
 
 static void
 EmitDebugSectionImpl(const DWARFYAML::Data &DI, EmitFuncType EmitFunc,
@@ -294,11 +306,50 @@ EmitDebugSectionImpl(const DWARFYAML::Data &DI, EmitFuncType EmitFunc,
     OutputBuffers[Sec] = MemoryBuffer::getMemBufferCopy(Data);
 }
 
-Expected<StringMap<std::unique_ptr<MemoryBuffer>>>
-DWARFYAML::EmitDebugSections(StringRef YAMLString,
-                             bool IsLittleEndian) {
-  StringMap<std::unique_ptr<MemoryBuffer>> DebugSections;
+namespace {
+class DIEFixupVisitor : public DWARFYAML::Visitor {
+  uint64_t Length;
 
+public:
+  DIEFixupVisitor(DWARFYAML::Data &DI) : DWARFYAML::Visitor(DI){};
+
+private:
+  virtual void onStartCompileUnit(DWARFYAML::Unit &CU) { Length = 7; }
+
+  virtual void onEndCompileUnit(DWARFYAML::Unit &CU) {
+    CU.Length.setLength(Length);
+  }
+
+  virtual void onStartDIE(DWARFYAML::Unit &CU, DWARFYAML::Entry &DIE) {
+    Length += getULEB128Size(DIE.AbbrCode);
+  }
+
+  virtual void onValue(const uint8_t U) { Length += 1; }
+  virtual void onValue(const uint16_t U) { Length += 2; }
+  virtual void onValue(const uint32_t U) { Length += 4; }
+  virtual void onValue(const uint64_t U, const bool LEB = false) {
+    if (LEB)
+      Length += getULEB128Size(U);
+    else
+      Length += 8;
+  }
+  virtual void onValue(const int64_t S, const bool LEB = false) {
+    if (LEB)
+      Length += getSLEB128Size(S);
+    else
+      Length += 8;
+  }
+  virtual void onValue(const StringRef String) { Length += String.size() + 1; }
+
+  virtual void onValue(const MemoryBufferRef MBR) {
+    Length += MBR.getBufferSize();
+  }
+};
+} // namespace
+
+Expected<StringMap<std::unique_ptr<MemoryBuffer>>>
+DWARFYAML::EmitDebugSections(StringRef YAMLString, bool ApplyFixups,
+                             bool IsLittleEndian) {
   yaml::Input YIn(YAMLString);
 
   DWARFYAML::Data DI;
@@ -307,6 +358,12 @@ DWARFYAML::EmitDebugSections(StringRef YAMLString,
   if (YIn.error())
     return errorCodeToError(YIn.error());
 
+  if (ApplyFixups) {
+    DIEFixupVisitor DIFixer(DI);
+    DIFixer.traverseDebugInfo();
+  }
+
+  StringMap<std::unique_ptr<MemoryBuffer>> DebugSections;
   EmitDebugSectionImpl(DI, &DWARFYAML::EmitDebugInfo, "debug_info",
                        DebugSections);
   EmitDebugSectionImpl(DI, &DWARFYAML::EmitDebugLine, "debug_line",

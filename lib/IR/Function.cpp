@@ -1,9 +1,8 @@
-//===-- Function.cpp - Implement the Global object classes ----------------===//
+//===- Function.cpp - Implement the Global object classes -----------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,21 +11,49 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Function.h"
-#include "LLVMContextImpl.h"
 #include "SymbolTableListTraitsImpl.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/None.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/CodeGen/ValueTypes.h"
-#include "llvm/IR/CallSite.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Argument.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/SymbolTableListTraits.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Use.h"
+#include "llvm/IR/User.h"
+#include "llvm/IR/Value.h"
+#include "llvm/IR/ValueSymbolTable.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/ErrorHandling.h"
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+
 using namespace llvm;
+using ProfileCount = Function::ProfileCount;
 
 // Explicit instantiations of SymbolTableListTraits since some of the methods
 // are not in the public header file...
@@ -35,8 +62,6 @@ template class llvm::SymbolTableListTraits<BasicBlock>;
 //===----------------------------------------------------------------------===//
 // Argument Implementation
 //===----------------------------------------------------------------------===//
-
-void Argument::anchor() { }
 
 Argument::Argument(Type *Ty, const Twine &Name, Function *Par, unsigned ArgNo)
     : Value(Ty, Value::ArgumentVal), Parent(Par), ArgNo(ArgNo) {
@@ -52,7 +77,8 @@ bool Argument::hasNonNullAttr() const {
   if (getParent()->hasParamAttribute(getArgNo(), Attribute::NonNull))
     return true;
   else if (getDereferenceableBytes() > 0 &&
-           getType()->getPointerAddressSpace() == 0)
+           !NullPointerIsDefined(getParent(),
+                                 getType()->getPointerAddressSpace()))
     return true;
   return false;
 }
@@ -84,20 +110,24 @@ bool Argument::hasByValOrInAllocaAttr() const {
 
 unsigned Argument::getParamAlignment() const {
   assert(getType()->isPointerTy() && "Only pointers have alignments");
-  return getParent()->getParamAlignment(getArgNo()+1);
+  return getParent()->getParamAlignment(getArgNo());
+}
 
+Type *Argument::getParamByValType() const {
+  assert(getType()->isPointerTy() && "Only pointers have byval types");
+  return getParent()->getParamByValType(getArgNo());
 }
 
 uint64_t Argument::getDereferenceableBytes() const {
   assert(getType()->isPointerTy() &&
          "Only pointers have dereferenceable bytes");
-  return getParent()->getDereferenceableBytes(getArgNo()+1);
+  return getParent()->getParamDereferenceableBytes(getArgNo());
 }
 
 uint64_t Argument::getDereferenceableOrNullBytes() const {
   assert(getType()->isPointerTy() &&
          "Only pointers have dereferenceable bytes");
-  return getParent()->getDereferenceableOrNullBytes(getArgNo()+1);
+  return getParent()->getParamDereferenceableOrNullBytes(getArgNo());
 }
 
 bool Argument::hasNestAttr() const {
@@ -120,6 +150,10 @@ bool Argument::hasStructRetAttr() const {
   return hasAttribute(Attribute::StructRet);
 }
 
+bool Argument::hasInRegAttr() const {
+  return hasAttribute(Attribute::InReg);
+}
+
 bool Argument::hasReturnedAttr() const {
   return hasAttribute(Attribute::Returned);
 }
@@ -138,26 +172,30 @@ bool Argument::onlyReadsMemory() const {
          Attrs.hasParamAttribute(getArgNo(), Attribute::ReadNone);
 }
 
-void Argument::addAttr(AttributeList AS) {
-  assert(AS.getNumSlots() <= 1 &&
-         "Trying to add more than one attribute set to an argument!");
-  AttrBuilder B(AS, AS.getSlotIndex(0));
-  getParent()->addAttributes(
-      getArgNo() + 1,
-      AttributeList::get(Parent->getContext(), getArgNo() + 1, B));
+void Argument::addAttrs(AttrBuilder &B) {
+  AttributeList AL = getParent()->getAttributes();
+  AL = AL.addParamAttributes(Parent->getContext(), getArgNo(), B);
+  getParent()->setAttributes(AL);
 }
 
-void Argument::removeAttr(AttributeList AS) {
-  assert(AS.getNumSlots() <= 1 &&
-         "Trying to remove more than one attribute set from an argument!");
-  AttrBuilder B(AS, AS.getSlotIndex(0));
-  getParent()->removeAttributes(
-      getArgNo() + 1,
-      AttributeList::get(Parent->getContext(), getArgNo() + 1, B));
+void Argument::addAttr(Attribute::AttrKind Kind) {
+  getParent()->addParamAttr(getArgNo(), Kind);
+}
+
+void Argument::addAttr(Attribute Attr) {
+  getParent()->addParamAttr(getArgNo(), Attr);
+}
+
+void Argument::removeAttr(Attribute::AttrKind Kind) {
+  getParent()->removeParamAttr(getArgNo(), Kind);
 }
 
 bool Argument::hasAttribute(Attribute::AttrKind Kind) const {
   return getParent()->hasParamAttribute(getArgNo(), Kind);
+}
+
+Attribute Argument::getAttribute(Attribute::AttrKind Kind) const {
+  return getParent()->getParamAttribute(getArgNo(), Kind);
 }
 
 //===----------------------------------------------------------------------===//
@@ -166,6 +204,19 @@ bool Argument::hasAttribute(Attribute::AttrKind Kind) const {
 
 LLVMContext &Function::getContext() const {
   return getType()->getContext();
+}
+
+unsigned Function::getInstructionCount() const {
+  unsigned NumInstrs = 0;
+  for (const BasicBlock &BB : BasicBlocks)
+    NumInstrs += std::distance(BB.instructionsWithoutDebug().begin(),
+                               BB.instructionsWithoutDebug().end());
+  return NumInstrs;
+}
+
+Function *Function::Create(FunctionType *Ty, LinkageTypes Linkage,
+                           const Twine &N, Module &M) {
+  return Create(Ty, Linkage, M.getDataLayout().getProgramAddressSpace(), N, &M);
 }
 
 void Function::removeFromParent() {
@@ -180,18 +231,27 @@ void Function::eraseFromParent() {
 // Function Implementation
 //===----------------------------------------------------------------------===//
 
-Function::Function(FunctionType *Ty, LinkageTypes Linkage, const Twine &name,
-                   Module *ParentModule)
+static unsigned computeAddrSpace(unsigned AddrSpace, Module *M) {
+  // If AS == -1 and we are passed a valid module pointer we place the function
+  // in the program address space. Otherwise we default to AS0.
+  if (AddrSpace == static_cast<unsigned>(-1))
+    return M ? M->getDataLayout().getProgramAddressSpace() : 0;
+  return AddrSpace;
+}
+
+Function::Function(FunctionType *Ty, LinkageTypes Linkage, unsigned AddrSpace,
+                   const Twine &name, Module *ParentModule)
     : GlobalObject(Ty, Value::FunctionVal,
-                   OperandTraits<Function>::op_begin(this), 0, Linkage, name),
-      Arguments(nullptr), NumArgs(Ty->getNumParams()) {
+                   OperandTraits<Function>::op_begin(this), 0, Linkage, name,
+                   computeAddrSpace(AddrSpace, ParentModule)),
+      NumArgs(Ty->getNumParams()) {
   assert(FunctionType::isValidReturnType(getReturnType()) &&
          "invalid return type");
   setGlobalObjectSubClassData(0);
 
   // We only need a symbol table for a function if the context keeps value names
   if (!getContext().shouldDiscardValueNames())
-    SymTab = make_unique<ValueSymbolTable>();
+    SymTab = std::make_unique<ValueSymbolTable>();
 
   // If the function has arguments, mark them as lazily built.
   if (Ty->getNumParams())
@@ -233,7 +293,8 @@ void Function::BuildLazyArguments() const {
 
   // Clear the lazy arguments bit.
   unsigned SDC = getSubclassDataFromValue();
-  const_cast<Function*>(this)->setValueSubclassData(SDC &= ~(1<<0));
+  SDC &= ~(1 << 0);
+  const_cast<Function*>(this)->setValueSubclassData(SDC);
   assert(!hasLazyArguments());
 }
 
@@ -329,9 +390,27 @@ void Function::addAttribute(unsigned i, Attribute Attr) {
   setAttributes(PAL);
 }
 
-void Function::addAttributes(unsigned i, AttributeList Attrs) {
+void Function::addAttributes(unsigned i, const AttrBuilder &Attrs) {
   AttributeList PAL = getAttributes();
   PAL = PAL.addAttributes(getContext(), i, Attrs);
+  setAttributes(PAL);
+}
+
+void Function::addParamAttr(unsigned ArgNo, Attribute::AttrKind Kind) {
+  AttributeList PAL = getAttributes();
+  PAL = PAL.addParamAttribute(getContext(), ArgNo, Kind);
+  setAttributes(PAL);
+}
+
+void Function::addParamAttr(unsigned ArgNo, Attribute Attr) {
+  AttributeList PAL = getAttributes();
+  PAL = PAL.addParamAttribute(getContext(), ArgNo, Attr);
+  setAttributes(PAL);
+}
+
+void Function::addParamAttrs(unsigned ArgNo, const AttrBuilder &Attrs) {
+  AttributeList PAL = getAttributes();
+  PAL = PAL.addParamAttributes(getContext(), ArgNo, Attrs);
   setAttributes(PAL);
 }
 
@@ -347,9 +426,27 @@ void Function::removeAttribute(unsigned i, StringRef Kind) {
   setAttributes(PAL);
 }
 
-void Function::removeAttributes(unsigned i, AttributeList Attrs) {
+void Function::removeAttributes(unsigned i, const AttrBuilder &Attrs) {
   AttributeList PAL = getAttributes();
   PAL = PAL.removeAttributes(getContext(), i, Attrs);
+  setAttributes(PAL);
+}
+
+void Function::removeParamAttr(unsigned ArgNo, Attribute::AttrKind Kind) {
+  AttributeList PAL = getAttributes();
+  PAL = PAL.removeParamAttribute(getContext(), ArgNo, Kind);
+  setAttributes(PAL);
+}
+
+void Function::removeParamAttr(unsigned ArgNo, StringRef Kind) {
+  AttributeList PAL = getAttributes();
+  PAL = PAL.removeParamAttribute(getContext(), ArgNo, Kind);
+  setAttributes(PAL);
+}
+
+void Function::removeParamAttrs(unsigned ArgNo, const AttrBuilder &Attrs) {
+  AttributeList PAL = getAttributes();
+  PAL = PAL.removeParamAttributes(getContext(), ArgNo, Attrs);
   setAttributes(PAL);
 }
 
@@ -359,9 +456,22 @@ void Function::addDereferenceableAttr(unsigned i, uint64_t Bytes) {
   setAttributes(PAL);
 }
 
+void Function::addDereferenceableParamAttr(unsigned ArgNo, uint64_t Bytes) {
+  AttributeList PAL = getAttributes();
+  PAL = PAL.addDereferenceableParamAttr(getContext(), ArgNo, Bytes);
+  setAttributes(PAL);
+}
+
 void Function::addDereferenceableOrNullAttr(unsigned i, uint64_t Bytes) {
   AttributeList PAL = getAttributes();
   PAL = PAL.addDereferenceableOrNullAttr(getContext(), i, Bytes);
+  setAttributes(PAL);
+}
+
+void Function::addDereferenceableOrNullParamAttr(unsigned ArgNo,
+                                                 uint64_t Bytes) {
+  AttributeList PAL = getAttributes();
+  PAL = PAL.addDereferenceableOrNullParamAttr(getContext(), ArgNo, Bytes);
   setAttributes(PAL);
 }
 
@@ -384,37 +494,33 @@ void Function::clearGC() {
 
 /// Copy all additional attributes (those not needed to create a Function) from
 /// the Function Src to this one.
-void Function::copyAttributesFrom(const GlobalValue *Src) {
+void Function::copyAttributesFrom(const Function *Src) {
   GlobalObject::copyAttributesFrom(Src);
-  const Function *SrcF = dyn_cast<Function>(Src);
-  if (!SrcF)
-    return;
-
-  setCallingConv(SrcF->getCallingConv());
-  setAttributes(SrcF->getAttributes());
-  if (SrcF->hasGC())
-    setGC(SrcF->getGC());
+  setCallingConv(Src->getCallingConv());
+  setAttributes(Src->getAttributes());
+  if (Src->hasGC())
+    setGC(Src->getGC());
   else
     clearGC();
-  if (SrcF->hasPersonalityFn())
-    setPersonalityFn(SrcF->getPersonalityFn());
-  if (SrcF->hasPrefixData())
-    setPrefixData(SrcF->getPrefixData());
-  if (SrcF->hasPrologueData())
-    setPrologueData(SrcF->getPrologueData());
+  if (Src->hasPersonalityFn())
+    setPersonalityFn(Src->getPersonalityFn());
+  if (Src->hasPrefixData())
+    setPrefixData(Src->getPrefixData());
+  if (Src->hasPrologueData())
+    setPrologueData(Src->getPrologueData());
 }
 
 /// Table of string intrinsic names indexed by enum value.
 static const char * const IntrinsicNameTable[] = {
   "not_intrinsic",
 #define GET_INTRINSIC_NAME_TABLE
-#include "llvm/IR/Intrinsics.gen"
+#include "llvm/IR/IntrinsicImpl.inc"
 #undef GET_INTRINSIC_NAME_TABLE
 };
 
 /// Table of per-target intrinsic name tables.
 #define GET_INTRINSIC_TARGET_DATA
-#include "llvm/IR/Intrinsics.gen"
+#include "llvm/IR/IntrinsicImpl.inc"
 #undef GET_INTRINSIC_TARGET_DATA
 
 /// Find the segment of \c IntrinsicNameTable for intrinsics with the same
@@ -428,16 +534,15 @@ static ArrayRef<const char *> findTargetSubtable(StringRef Name) {
   // Drop "llvm." and take the first dotted component. That will be the target
   // if this is target specific.
   StringRef Target = Name.drop_front(5).split('.').first;
-  auto It = std::lower_bound(Targets.begin(), Targets.end(), Target,
-                             [](const IntrinsicTargetInfo &TI,
-                                StringRef Target) { return TI.Name < Target; });
+  auto It = partition_point(
+      Targets, [=](const IntrinsicTargetInfo &TI) { return TI.Name < Target; });
   // We've either found the target or just fall back to the generic set, which
   // is always first.
   const auto &TI = It != Targets.end() && It->Name == Target ? *It : Targets[0];
   return makeArrayRef(&IntrinsicNameTable[1] + TI.Offset, TI.Count);
 }
 
-/// \brief This does the actual lookup of an intrinsic ID which
+/// This does the actual lookup of an intrinsic ID which
 /// matches the given function name.
 Intrinsic::ID Function::lookupIntrinsicID(StringRef Name) {
   ArrayRef<const char *> NameTable = findTargetSubtable(Name);
@@ -451,9 +556,11 @@ Intrinsic::ID Function::lookupIntrinsicID(StringRef Name) {
   Intrinsic::ID ID = static_cast<Intrinsic::ID>(Idx + Adjust);
 
   // If the intrinsic is not overloaded, require an exact match. If it is
-  // overloaded, require a prefix match.
-  bool IsPrefixMatch = Name.size() > strlen(NameTable[Idx]);
-  return IsPrefixMatch == isOverloaded(ID) ? ID : Intrinsic::not_intrinsic;
+  // overloaded, require either exact or prefix match.
+  const auto MatchSize = strlen(NameTable[Idx]);
+  assert(Name.size() >= MatchSize && "Expected either exact or prefix match");
+  bool IsExactMatch = Name.size() == MatchSize;
+  return IsExactMatch || isOverloaded(ID) ? ID : Intrinsic::not_intrinsic;
 }
 
 void Function::recalculateIntrinsicID() {
@@ -477,17 +584,14 @@ void Function::recalculateIntrinsicID() {
 /// which can't be confused with it's prefix.  This ensures we don't have
 /// collisions between two unrelated function types. Otherwise, you might
 /// parse ffXX as f(fXX) or f(fX)X.  (X is a placeholder for any other type.)
-/// Manglings of integers, floats, and vectors ('i', 'f', and 'v' prefix in most
-/// cases) fall back to the MVT codepath, where they could be mangled to
-/// 'x86mmx', for example; matching on derived types is not sufficient to mangle
-/// everything.
+///
 static std::string getMangledTypeStr(Type* Ty) {
   std::string Result;
   if (PointerType* PTyp = dyn_cast<PointerType>(Ty)) {
-    Result += "p" + llvm::utostr(PTyp->getAddressSpace()) +
+    Result += "p" + utostr(PTyp->getAddressSpace()) +
       getMangledTypeStr(PTyp->getElementType());
   } else if (ArrayType* ATyp = dyn_cast<ArrayType>(Ty)) {
-    Result += "a" + llvm::utostr(ATyp->getNumElements()) +
+    Result += "a" + utostr(ATyp->getNumElements()) +
       getMangledTypeStr(ATyp->getElementType());
   } else if (StructType *STyp = dyn_cast<StructType>(Ty)) {
     if (!STyp->isLiteral()) {
@@ -507,12 +611,29 @@ static std::string getMangledTypeStr(Type* Ty) {
     if (FT->isVarArg())
       Result += "vararg";
     // Ensure nested function types are distinguishable.
-    Result += "f"; 
-  } else if (isa<VectorType>(Ty))
-    Result += "v" + utostr(Ty->getVectorNumElements()) +
-      getMangledTypeStr(Ty->getVectorElementType());
-  else if (Ty)
-    Result += EVT::getEVT(Ty).getEVTString();
+    Result += "f";
+  } else if (VectorType* VTy = dyn_cast<VectorType>(Ty)) {
+    if (VTy->isScalable())
+      Result += "nx";
+    Result += "v" + utostr(VTy->getVectorNumElements()) +
+      getMangledTypeStr(VTy->getVectorElementType());
+  } else if (Ty) {
+    switch (Ty->getTypeID()) {
+    default: llvm_unreachable("Unhandled type");
+    case Type::VoidTyID:      Result += "isVoid";   break;
+    case Type::MetadataTyID:  Result += "Metadata"; break;
+    case Type::HalfTyID:      Result += "f16";      break;
+    case Type::FloatTyID:     Result += "f32";      break;
+    case Type::DoubleTyID:    Result += "f64";      break;
+    case Type::X86_FP80TyID:  Result += "f80";      break;
+    case Type::FP128TyID:     Result += "f128";     break;
+    case Type::PPC_FP128TyID: Result += "ppcf128";  break;
+    case Type::X86_MMXTyID:   Result += "x86mmx";   break;
+    case Type::IntegerTyID:
+      Result += "i" + utostr(cast<IntegerType>(Ty)->getBitWidth());
+      break;
+    }
+  }
   return Result;
 }
 
@@ -531,7 +652,6 @@ std::string Intrinsic::getName(ID id, ArrayRef<Type*> Tys) {
   }
   return Result;
 }
-
 
 /// IIT_Info - These are enumerators that describe the entries returned by the
 /// getIntrinsicInfoTableEntries function.
@@ -575,18 +695,27 @@ enum IIT_Info {
   IIT_SAME_VEC_WIDTH_ARG = 31,
   IIT_PTR_TO_ARG = 32,
   IIT_PTR_TO_ELT = 33,
-  IIT_VEC_OF_PTRS_TO_ELT = 34,
+  IIT_VEC_OF_ANYPTRS_TO_ELT = 34,
   IIT_I128 = 35,
   IIT_V512 = 36,
-  IIT_V1024 = 37
+  IIT_V1024 = 37,
+  IIT_STRUCT6 = 38,
+  IIT_STRUCT7 = 39,
+  IIT_STRUCT8 = 40,
+  IIT_F128 = 41,
+  IIT_VEC_ELEMENT = 42,
+  IIT_SCALABLE_VEC = 43,
+  IIT_SUBDIVIDE2_ARG = 44,
+  IIT_SUBDIVIDE4_ARG = 45,
+  IIT_VEC_OF_BITCASTS_TO_INT = 46
 };
-
 
 static void DecodeIITType(unsigned &NextElt, ArrayRef<unsigned char> Infos,
                       SmallVectorImpl<Intrinsic::IITDescriptor> &OutputTable) {
+  using namespace Intrinsic;
+
   IIT_Info Info = IIT_Info(Infos[NextElt++]);
   unsigned StructElts = 2;
-  using namespace Intrinsic;
 
   switch (Info) {
   case IIT_Done:
@@ -612,6 +741,9 @@ static void DecodeIITType(unsigned &NextElt, ArrayRef<unsigned char> Infos,
     return;
   case IIT_F64:
     OutputTable.push_back(IITDescriptor::get(IITDescriptor::Double, 0));
+    return;
+  case IIT_F128:
+    OutputTable.push_back(IITDescriptor::get(IITDescriptor::Quad, 0));
     return;
   case IIT_I1:
     OutputTable.push_back(IITDescriptor::get(IITDescriptor::Integer, 1));
@@ -717,15 +849,19 @@ static void DecodeIITType(unsigned &NextElt, ArrayRef<unsigned char> Infos,
     OutputTable.push_back(IITDescriptor::get(IITDescriptor::PtrToElt, ArgInfo));
     return;
   }
-  case IIT_VEC_OF_PTRS_TO_ELT: {
-    unsigned ArgInfo = (NextElt == Infos.size() ? 0 : Infos[NextElt++]);
-    OutputTable.push_back(IITDescriptor::get(IITDescriptor::VecOfPtrsToElt,
-                                             ArgInfo));
+  case IIT_VEC_OF_ANYPTRS_TO_ELT: {
+    unsigned short ArgNo = (NextElt == Infos.size() ? 0 : Infos[NextElt++]);
+    unsigned short RefNo = (NextElt == Infos.size() ? 0 : Infos[NextElt++]);
+    OutputTable.push_back(
+        IITDescriptor::get(IITDescriptor::VecOfAnyPtrsToElt, ArgNo, RefNo));
     return;
   }
   case IIT_EMPTYSTRUCT:
     OutputTable.push_back(IITDescriptor::get(IITDescriptor::Struct, 0));
     return;
+  case IIT_STRUCT8: ++StructElts; LLVM_FALLTHROUGH;
+  case IIT_STRUCT7: ++StructElts; LLVM_FALLTHROUGH;
+  case IIT_STRUCT6: ++StructElts; LLVM_FALLTHROUGH;
   case IIT_STRUCT5: ++StructElts; LLVM_FALLTHROUGH;
   case IIT_STRUCT4: ++StructElts; LLVM_FALLTHROUGH;
   case IIT_STRUCT3: ++StructElts; LLVM_FALLTHROUGH;
@@ -736,13 +872,42 @@ static void DecodeIITType(unsigned &NextElt, ArrayRef<unsigned char> Infos,
       DecodeIITType(NextElt, Infos, OutputTable);
     return;
   }
+  case IIT_SUBDIVIDE2_ARG: {
+    unsigned ArgInfo = (NextElt == Infos.size() ? 0 : Infos[NextElt++]);
+    OutputTable.push_back(IITDescriptor::get(IITDescriptor::Subdivide2Argument,
+                                             ArgInfo));
+    return;
+  }
+  case IIT_SUBDIVIDE4_ARG: {
+    unsigned ArgInfo = (NextElt == Infos.size() ? 0 : Infos[NextElt++]);
+    OutputTable.push_back(IITDescriptor::get(IITDescriptor::Subdivide4Argument,
+                                             ArgInfo));
+    return;
+  }
+  case IIT_VEC_ELEMENT: {
+    unsigned ArgInfo = (NextElt == Infos.size() ? 0 : Infos[NextElt++]);
+    OutputTable.push_back(IITDescriptor::get(IITDescriptor::VecElementArgument,
+                                             ArgInfo));
+    return;
+  }
+  case IIT_SCALABLE_VEC: {
+    OutputTable.push_back(IITDescriptor::get(IITDescriptor::ScalableVecArgument,
+                                             0));
+    DecodeIITType(NextElt, Infos, OutputTable);
+    return;
+  }
+  case IIT_VEC_OF_BITCASTS_TO_INT: {
+    unsigned ArgInfo = (NextElt == Infos.size() ? 0 : Infos[NextElt++]);
+    OutputTable.push_back(IITDescriptor::get(IITDescriptor::VecOfBitcastsToInt,
+                                             ArgInfo));
+    return;
+  }
   }
   llvm_unreachable("unhandled");
 }
 
-
 #define GET_INTRINSIC_GENERATOR_GLOBAL
-#include "llvm/IR/Intrinsics.gen"
+#include "llvm/IR/IntrinsicImpl.inc"
 #undef GET_INTRINSIC_GENERATOR_GLOBAL
 
 void Intrinsic::getIntrinsicInfoTableEntries(ID id,
@@ -778,10 +943,10 @@ void Intrinsic::getIntrinsicInfoTableEntries(ID id,
     DecodeIITType(NextElt, IITEntries, T);
 }
 
-
 static Type *DecodeFixedType(ArrayRef<Intrinsic::IITDescriptor> &Infos,
                              ArrayRef<Type*> Tys, LLVMContext &Context) {
   using namespace Intrinsic;
+
   IITDescriptor D = Infos.front();
   Infos = Infos.slice(1);
 
@@ -794,6 +959,7 @@ static Type *DecodeFixedType(ArrayRef<Intrinsic::IITDescriptor> &Infos,
   case IITDescriptor::Half: return Type::getHalfTy(Context);
   case IITDescriptor::Float: return Type::getFloatTy(Context);
   case IITDescriptor::Double: return Type::getDoubleTy(Context);
+  case IITDescriptor::Quad: return Type::getFP128Ty(Context);
 
   case IITDescriptor::Integer:
     return IntegerType::get(Context, D.Integer_Width);
@@ -803,13 +969,11 @@ static Type *DecodeFixedType(ArrayRef<Intrinsic::IITDescriptor> &Infos,
     return PointerType::get(DecodeFixedType(Infos, Tys, Context),
                             D.Pointer_AddressSpace);
   case IITDescriptor::Struct: {
-    Type *Elts[5];
-    assert(D.Struct_NumElements <= 5 && "Can't handle this yet");
+    SmallVector<Type *, 8> Elts;
     for (unsigned i = 0, e = D.Struct_NumElements; i != e; ++i)
-      Elts[i] = DecodeFixedType(Infos, Tys, Context);
-    return StructType::get(Context, makeArrayRef(Elts,D.Struct_NumElements));
+      Elts.push_back(DecodeFixedType(Infos, Tys, Context));
+    return StructType::get(Context, Elts);
   }
-
   case IITDescriptor::Argument:
     return Tys[D.getArgumentNumber()];
   case IITDescriptor::ExtendArgument: {
@@ -828,16 +992,23 @@ static Type *DecodeFixedType(ArrayRef<Intrinsic::IITDescriptor> &Infos,
     assert(ITy->getBitWidth() % 2 == 0);
     return IntegerType::get(Context, ITy->getBitWidth() / 2);
   }
+  case IITDescriptor::Subdivide2Argument:
+  case IITDescriptor::Subdivide4Argument: {
+    Type *Ty = Tys[D.getArgumentNumber()];
+    VectorType *VTy = dyn_cast<VectorType>(Ty);
+    assert(VTy && "Expected an argument of Vector Type");
+    int SubDivs = D.Kind == IITDescriptor::Subdivide2Argument ? 1 : 2;
+    return VectorType::getSubdividedVectorType(VTy, SubDivs);
+  }
   case IITDescriptor::HalfVecArgument:
     return VectorType::getHalfElementsVectorType(cast<VectorType>(
                                                   Tys[D.getArgumentNumber()]));
   case IITDescriptor::SameVecWidthArgument: {
     Type *EltTy = DecodeFixedType(Infos, Tys, Context);
     Type *Ty = Tys[D.getArgumentNumber()];
-    if (VectorType *VTy = dyn_cast<VectorType>(Ty)) {
-      return VectorType::get(EltTy, VTy->getNumElements());
-    }
-    llvm_unreachable("unhandled");
+    if (auto *VTy = dyn_cast<VectorType>(Ty))
+      return VectorType::get(EltTy, VTy->getElementCount());
+    return EltTy;
   }
   case IITDescriptor::PtrToArgument: {
     Type *Ty = Tys[D.getArgumentNumber()];
@@ -851,20 +1022,29 @@ static Type *DecodeFixedType(ArrayRef<Intrinsic::IITDescriptor> &Infos,
     Type *EltTy = VTy->getVectorElementType();
     return PointerType::getUnqual(EltTy);
   }
-  case IITDescriptor::VecOfPtrsToElt: {
+  case IITDescriptor::VecElementArgument: {
+    Type *Ty = Tys[D.getArgumentNumber()];
+    if (VectorType *VTy = dyn_cast<VectorType>(Ty))
+      return VTy->getElementType();
+    llvm_unreachable("Expected an argument of Vector Type");
+  }
+  case IITDescriptor::VecOfBitcastsToInt: {
     Type *Ty = Tys[D.getArgumentNumber()];
     VectorType *VTy = dyn_cast<VectorType>(Ty);
-    if (!VTy)
-      llvm_unreachable("Expected an argument of Vector Type");
-    Type *EltTy = VTy->getVectorElementType();
-    return VectorType::get(PointerType::getUnqual(EltTy),
-                           VTy->getNumElements());
+    assert(VTy && "Expected an argument of Vector Type");
+    return VectorType::getInteger(VTy);
   }
- }
+  case IITDescriptor::VecOfAnyPtrsToElt:
+    // Return the overloaded type (which determines the pointers address space)
+    return Tys[D.getOverloadArgNumber()];
+  case IITDescriptor::ScalableVecArgument: {
+    Type *Ty = DecodeFixedType(Infos, Tys, Context);
+    return VectorType::get(Ty->getVectorElementType(),
+                           { Ty->getVectorNumElements(), true });
+  }
+  }
   llvm_unreachable("unhandled");
 }
-
-
 
 FunctionType *Intrinsic::getType(LLVMContext &Context,
                                  ID id, ArrayRef<Type*> Tys) {
@@ -889,7 +1069,7 @@ FunctionType *Intrinsic::getType(LLVMContext &Context,
 
 bool Intrinsic::isOverloaded(ID id) {
 #define GET_INTRINSIC_OVERLOAD_TABLE
-#include "llvm/IR/Intrinsics.gen"
+#include "llvm/IR/IntrinsicImpl.inc"
 #undef GET_INTRINSIC_OVERLOAD_TABLE
 }
 
@@ -907,33 +1087,48 @@ bool Intrinsic::isLeaf(ID id) {
 
 /// This defines the "Intrinsic::getAttributes(ID id)" method.
 #define GET_INTRINSIC_ATTRIBUTES
-#include "llvm/IR/Intrinsics.gen"
+#include "llvm/IR/IntrinsicImpl.inc"
 #undef GET_INTRINSIC_ATTRIBUTES
 
 Function *Intrinsic::getDeclaration(Module *M, ID id, ArrayRef<Type*> Tys) {
   // There can never be multiple globals with the same name of different types,
   // because intrinsics must be a specific type.
-  return
-    cast<Function>(M->getOrInsertFunction(getName(id, Tys),
-                                          getType(M->getContext(), id, Tys)));
+  return cast<Function>(
+      M->getOrInsertFunction(getName(id, Tys),
+                             getType(M->getContext(), id, Tys))
+          .getCallee());
 }
 
 // This defines the "Intrinsic::getIntrinsicForGCCBuiltin()" method.
 #define GET_LLVM_INTRINSIC_FOR_GCC_BUILTIN
-#include "llvm/IR/Intrinsics.gen"
+#include "llvm/IR/IntrinsicImpl.inc"
 #undef GET_LLVM_INTRINSIC_FOR_GCC_BUILTIN
 
 // This defines the "Intrinsic::getIntrinsicForMSBuiltin()" method.
 #define GET_LLVM_INTRINSIC_FOR_MS_BUILTIN
-#include "llvm/IR/Intrinsics.gen"
+#include "llvm/IR/IntrinsicImpl.inc"
 #undef GET_LLVM_INTRINSIC_FOR_MS_BUILTIN
 
-bool Intrinsic::matchIntrinsicType(Type *Ty, ArrayRef<Intrinsic::IITDescriptor> &Infos,
-                                   SmallVectorImpl<Type*> &ArgTys) {
+using DeferredIntrinsicMatchPair =
+    std::pair<Type *, ArrayRef<Intrinsic::IITDescriptor>>;
+
+static bool matchIntrinsicType(
+    Type *Ty, ArrayRef<Intrinsic::IITDescriptor> &Infos,
+    SmallVectorImpl<Type *> &ArgTys,
+    SmallVectorImpl<DeferredIntrinsicMatchPair> &DeferredChecks,
+    bool IsDeferredCheck) {
   using namespace Intrinsic;
 
   // If we ran out of descriptors, there are too many arguments.
   if (Infos.empty()) return true;
+
+  // Do this before slicing off the 'front' part
+  auto InfosRef = Infos;
+  auto DeferCheck = [&DeferredChecks, &InfosRef](Type *T) {
+    DeferredChecks.emplace_back(T, InfosRef);
+    return false;
+  };
+
   IITDescriptor D = Infos.front();
   Infos = Infos.slice(1);
 
@@ -946,16 +1141,19 @@ bool Intrinsic::matchIntrinsicType(Type *Ty, ArrayRef<Intrinsic::IITDescriptor> 
     case IITDescriptor::Half: return !Ty->isHalfTy();
     case IITDescriptor::Float: return !Ty->isFloatTy();
     case IITDescriptor::Double: return !Ty->isDoubleTy();
+    case IITDescriptor::Quad: return !Ty->isFP128Ty();
     case IITDescriptor::Integer: return !Ty->isIntegerTy(D.Integer_Width);
     case IITDescriptor::Vector: {
       VectorType *VT = dyn_cast<VectorType>(Ty);
       return !VT || VT->getNumElements() != D.Vector_Width ||
-             matchIntrinsicType(VT->getElementType(), Infos, ArgTys);
+             matchIntrinsicType(VT->getElementType(), Infos, ArgTys,
+                                DeferredChecks, IsDeferredCheck);
     }
     case IITDescriptor::Pointer: {
       PointerType *PT = dyn_cast<PointerType>(Ty);
       return !PT || PT->getAddressSpace() != D.Pointer_AddressSpace ||
-             matchIntrinsicType(PT->getElementType(), Infos, ArgTys);
+             matchIntrinsicType(PT->getElementType(), Infos, ArgTys,
+                                DeferredChecks, IsDeferredCheck);
     }
 
     case IITDescriptor::Struct: {
@@ -964,35 +1162,40 @@ bool Intrinsic::matchIntrinsicType(Type *Ty, ArrayRef<Intrinsic::IITDescriptor> 
         return true;
 
       for (unsigned i = 0, e = D.Struct_NumElements; i != e; ++i)
-        if (matchIntrinsicType(ST->getElementType(i), Infos, ArgTys))
+        if (matchIntrinsicType(ST->getElementType(i), Infos, ArgTys,
+                               DeferredChecks, IsDeferredCheck))
           return true;
       return false;
     }
 
     case IITDescriptor::Argument:
-      // Two cases here - If this is the second occurrence of an argument, verify
-      // that the later instance matches the previous instance.
+      // If this is the second occurrence of an argument,
+      // verify that the later instance matches the previous instance.
       if (D.getArgumentNumber() < ArgTys.size())
         return Ty != ArgTys[D.getArgumentNumber()];
 
-          // Otherwise, if this is the first instance of an argument, record it and
-          // verify the "Any" kind.
-          assert(D.getArgumentNumber() == ArgTys.size() && "Table consistency error");
-          ArgTys.push_back(Ty);
+      if (D.getArgumentNumber() > ArgTys.size() ||
+          D.getArgumentKind() == IITDescriptor::AK_MatchType)
+        return IsDeferredCheck || DeferCheck(Ty);
 
-          switch (D.getArgumentKind()) {
-            case IITDescriptor::AK_Any:        return false; // Success
-            case IITDescriptor::AK_AnyInteger: return !Ty->isIntOrIntVectorTy();
-            case IITDescriptor::AK_AnyFloat:   return !Ty->isFPOrFPVectorTy();
-            case IITDescriptor::AK_AnyVector:  return !isa<VectorType>(Ty);
-            case IITDescriptor::AK_AnyPointer: return !isa<PointerType>(Ty);
-          }
-          llvm_unreachable("all argument kinds not covered");
+      assert(D.getArgumentNumber() == ArgTys.size() && !IsDeferredCheck &&
+             "Table consistency error");
+      ArgTys.push_back(Ty);
+
+      switch (D.getArgumentKind()) {
+        case IITDescriptor::AK_Any:        return false; // Success
+        case IITDescriptor::AK_AnyInteger: return !Ty->isIntOrIntVectorTy();
+        case IITDescriptor::AK_AnyFloat:   return !Ty->isFPOrFPVectorTy();
+        case IITDescriptor::AK_AnyVector:  return !isa<VectorType>(Ty);
+        case IITDescriptor::AK_AnyPointer: return !isa<PointerType>(Ty);
+        default:                           break;
+      }
+      llvm_unreachable("all argument kinds not covered");
 
     case IITDescriptor::ExtendArgument: {
-      // This may only be used when referring to a previous vector argument.
+      // If this is a forward reference, defer the check for later.
       if (D.getArgumentNumber() >= ArgTys.size())
-        return true;
+        return IsDeferredCheck || DeferCheck(Ty);
 
       Type *NewTy = ArgTys[D.getArgumentNumber()];
       if (VectorType *VTy = dyn_cast<VectorType>(NewTy))
@@ -1005,9 +1208,9 @@ bool Intrinsic::matchIntrinsicType(Type *Ty, ArrayRef<Intrinsic::IITDescriptor> 
       return Ty != NewTy;
     }
     case IITDescriptor::TruncArgument: {
-      // This may only be used when referring to a previous vector argument.
+      // If this is a forward reference, defer the check for later.
       if (D.getArgumentNumber() >= ArgTys.size())
-        return true;
+        return IsDeferredCheck || DeferCheck(Ty);
 
       Type *NewTy = ArgTys[D.getArgumentNumber()];
       if (VectorType *VTy = dyn_cast<VectorType>(NewTy))
@@ -1020,34 +1223,43 @@ bool Intrinsic::matchIntrinsicType(Type *Ty, ArrayRef<Intrinsic::IITDescriptor> 
       return Ty != NewTy;
     }
     case IITDescriptor::HalfVecArgument:
-      // This may only be used when referring to a previous vector argument.
-      return D.getArgumentNumber() >= ArgTys.size() ||
-             !isa<VectorType>(ArgTys[D.getArgumentNumber()]) ||
+      // If this is a forward reference, defer the check for later.
+      if (D.getArgumentNumber() >= ArgTys.size())
+        return IsDeferredCheck || DeferCheck(Ty);
+      return !isa<VectorType>(ArgTys[D.getArgumentNumber()]) ||
              VectorType::getHalfElementsVectorType(
                      cast<VectorType>(ArgTys[D.getArgumentNumber()])) != Ty;
     case IITDescriptor::SameVecWidthArgument: {
-      if (D.getArgumentNumber() >= ArgTys.size())
+      if (D.getArgumentNumber() >= ArgTys.size()) {
+        // Defer check and subsequent check for the vector element type.
+        Infos = Infos.slice(1);
+        return IsDeferredCheck || DeferCheck(Ty);
+      }
+      auto *ReferenceType = dyn_cast<VectorType>(ArgTys[D.getArgumentNumber()]);
+      auto *ThisArgType = dyn_cast<VectorType>(Ty);
+      // Both must be vectors of the same number of elements or neither.
+      if ((ReferenceType != nullptr) != (ThisArgType != nullptr))
         return true;
-      VectorType * ReferenceType =
-        dyn_cast<VectorType>(ArgTys[D.getArgumentNumber()]);
-      VectorType *ThisArgType = dyn_cast<VectorType>(Ty);
-      if (!ThisArgType || !ReferenceType ||
-          (ReferenceType->getVectorNumElements() !=
-           ThisArgType->getVectorNumElements()))
-        return true;
-      return matchIntrinsicType(ThisArgType->getVectorElementType(),
-                                Infos, ArgTys);
+      Type *EltTy = Ty;
+      if (ThisArgType) {
+        if (ReferenceType->getElementCount() !=
+            ThisArgType->getElementCount())
+          return true;
+        EltTy = ThisArgType->getVectorElementType();
+      }
+      return matchIntrinsicType(EltTy, Infos, ArgTys, DeferredChecks,
+                                IsDeferredCheck);
     }
     case IITDescriptor::PtrToArgument: {
       if (D.getArgumentNumber() >= ArgTys.size())
-        return true;
+        return IsDeferredCheck || DeferCheck(Ty);
       Type * ReferenceType = ArgTys[D.getArgumentNumber()];
       PointerType *ThisArgType = dyn_cast<PointerType>(Ty);
       return (!ThisArgType || ThisArgType->getElementType() != ReferenceType);
     }
     case IITDescriptor::PtrToElt: {
       if (D.getArgumentNumber() >= ArgTys.size())
-        return true;
+        return IsDeferredCheck || DeferCheck(Ty);
       VectorType * ReferenceType =
         dyn_cast<VectorType> (ArgTys[D.getArgumentNumber()]);
       PointerType *ThisArgType = dyn_cast<PointerType>(Ty);
@@ -1055,11 +1267,27 @@ bool Intrinsic::matchIntrinsicType(Type *Ty, ArrayRef<Intrinsic::IITDescriptor> 
       return (!ThisArgType || !ReferenceType ||
               ThisArgType->getElementType() != ReferenceType->getElementType());
     }
-    case IITDescriptor::VecOfPtrsToElt: {
-      if (D.getArgumentNumber() >= ArgTys.size())
-        return true;
-      VectorType * ReferenceType =
-              dyn_cast<VectorType> (ArgTys[D.getArgumentNumber()]);
+    case IITDescriptor::VecOfAnyPtrsToElt: {
+      unsigned RefArgNumber = D.getRefArgNumber();
+      if (RefArgNumber >= ArgTys.size()) {
+        if (IsDeferredCheck)
+          return true;
+        // If forward referencing, already add the pointer-vector type and
+        // defer the checks for later.
+        ArgTys.push_back(Ty);
+        return DeferCheck(Ty);
+      }
+
+      if (!IsDeferredCheck){
+        assert(D.getOverloadArgNumber() == ArgTys.size() &&
+               "Table consistency error");
+        ArgTys.push_back(Ty);
+      }
+
+      // Verify the overloaded type "matches" the Ref type.
+      // i.e. Ty is a vector with the same width as Ref.
+      // Composed of pointers to the same element type as Ref.
+      VectorType *ReferenceType = dyn_cast<VectorType>(ArgTys[RefArgNumber]);
       VectorType *ThisArgVecTy = dyn_cast<VectorType>(Ty);
       if (!ThisArgVecTy || !ReferenceType ||
           (ReferenceType->getVectorNumElements() !=
@@ -1072,8 +1300,70 @@ bool Intrinsic::matchIntrinsicType(Type *Ty, ArrayRef<Intrinsic::IITDescriptor> 
       return ThisArgEltTy->getElementType() !=
              ReferenceType->getVectorElementType();
     }
+    case IITDescriptor::VecElementArgument: {
+      if (D.getArgumentNumber() >= ArgTys.size())
+        return IsDeferredCheck ? true : DeferCheck(Ty);
+      auto *ReferenceType = dyn_cast<VectorType>(ArgTys[D.getArgumentNumber()]);
+      return !ReferenceType || Ty != ReferenceType->getElementType();
+    }
+    case IITDescriptor::Subdivide2Argument:
+    case IITDescriptor::Subdivide4Argument: {
+      // If this is a forward reference, defer the check for later.
+      if (D.getArgumentNumber() >= ArgTys.size())
+        return IsDeferredCheck || DeferCheck(Ty);
+
+      Type *NewTy = ArgTys[D.getArgumentNumber()];
+      if (auto *VTy = dyn_cast<VectorType>(NewTy)) {
+        int SubDivs = D.Kind == IITDescriptor::Subdivide2Argument ? 1 : 2;
+        NewTy = VectorType::getSubdividedVectorType(VTy, SubDivs);
+        return Ty != NewTy;
+      }
+      return true;
+    }
+    case IITDescriptor::ScalableVecArgument: {
+      VectorType *VTy = dyn_cast<VectorType>(Ty);
+      if (!VTy || !VTy->isScalable())
+        return true;
+      return matchIntrinsicType(VTy, Infos, ArgTys, DeferredChecks,
+                                IsDeferredCheck);
+    }
+    case IITDescriptor::VecOfBitcastsToInt: {
+      if (D.getArgumentNumber() >= ArgTys.size())
+        return IsDeferredCheck || DeferCheck(Ty);
+      auto *ReferenceType = dyn_cast<VectorType>(ArgTys[D.getArgumentNumber()]);
+      auto *ThisArgVecTy = dyn_cast<VectorType>(Ty);
+      if (!ThisArgVecTy || !ReferenceType)
+        return true;
+      return ThisArgVecTy != VectorType::getInteger(ReferenceType);
+    }
   }
   llvm_unreachable("unhandled");
+}
+
+Intrinsic::MatchIntrinsicTypesResult
+Intrinsic::matchIntrinsicSignature(FunctionType *FTy,
+                                   ArrayRef<Intrinsic::IITDescriptor> &Infos,
+                                   SmallVectorImpl<Type *> &ArgTys) {
+  SmallVector<DeferredIntrinsicMatchPair, 2> DeferredChecks;
+  if (matchIntrinsicType(FTy->getReturnType(), Infos, ArgTys, DeferredChecks,
+                         false))
+    return MatchIntrinsicTypes_NoMatchRet;
+
+  unsigned NumDeferredReturnChecks = DeferredChecks.size();
+
+  for (auto Ty : FTy->params())
+    if (matchIntrinsicType(Ty, Infos, ArgTys, DeferredChecks, false))
+      return MatchIntrinsicTypes_NoMatchArg;
+
+  for (unsigned I = 0, E = DeferredChecks.size(); I != E; ++I) {
+    DeferredIntrinsicMatchPair &Check = DeferredChecks[I];
+    if (matchIntrinsicType(Check.first, Check.second, ArgTys, DeferredChecks,
+                           true))
+      return I < NumDeferredReturnChecks ? MatchIntrinsicTypes_NoMatchRet
+                                         : MatchIntrinsicTypes_NoMatchArg;
+  }
+
+  return MatchIntrinsicTypes_Match;
 }
 
 bool
@@ -1109,13 +1399,8 @@ Optional<Function*> Intrinsic::remangleIntrinsicFunction(Function *F) {
     getIntrinsicInfoTableEntries(ID, Table);
     ArrayRef<Intrinsic::IITDescriptor> TableRef = Table;
 
-    // If we encounter any problems matching the signature with the descriptor
-    // just give up remangling. It's up to verifier to report the discrepancy.
-    if (Intrinsic::matchIntrinsicType(FTy->getReturnType(), TableRef, ArgTys))
+    if (Intrinsic::matchIntrinsicSignature(FTy, TableRef, ArgTys))
       return None;
-    for (auto Ty : FTy->params())
-      if (Intrinsic::matchIntrinsicType(Ty, TableRef, ArgTys))
-        return None;
     if (Intrinsic::matchIntrinsicVarArg(FTy->isVarArg(), TableRef))
       return None;
   }
@@ -1137,13 +1422,13 @@ bool Function::hasAddressTaken(const User* *PutOffender) const {
     const User *FU = U.getUser();
     if (isa<BlockAddress>(FU))
       continue;
-    if (!isa<CallInst>(FU) && !isa<InvokeInst>(FU)) {
+    const auto *Call = dyn_cast<CallBase>(FU);
+    if (!Call) {
       if (PutOffender)
         *PutOffender = FU;
       return true;
     }
-    ImmutableCallSite CS(cast<Instruction>(FU));
-    if (!CS.isCallee(&U)) {
+    if (!Call->isCallee(&U)) {
       if (PutOffender)
         *PutOffender = FU;
       return true;
@@ -1169,12 +1454,10 @@ bool Function::isDefTriviallyDead() const {
 /// callsFunctionThatReturnsTwice - Return true if the function has a call to
 /// setjmp or other function that gcc recognizes as "returning twice".
 bool Function::callsFunctionThatReturnsTwice() const {
-  for (const_inst_iterator
-         I = inst_begin(this), E = inst_end(this); I != E; ++I) {
-    ImmutableCallSite CS(&*I);
-    if (CS && CS.hasFnAttr(Attribute::ReturnsTwice))
-      return true;
-  }
+  for (const Instruction &I : instructions(this))
+    if (const auto *Call = dyn_cast<CallBase>(&I))
+      if (Call->hasFnAttr(Attribute::ReturnsTwice))
+        return true;
 
   return false;
 }
@@ -1243,24 +1526,44 @@ void Function::setValueSubclassDataBit(unsigned Bit, bool On) {
     setValueSubclassData(getSubclassDataFromValue() & ~(1 << Bit));
 }
 
-void Function::setEntryCount(uint64_t Count,
+void Function::setEntryCount(ProfileCount Count,
                              const DenseSet<GlobalValue::GUID> *S) {
+  assert(Count.hasValue());
+#if !defined(NDEBUG)
+  auto PrevCount = getEntryCount();
+  assert(!PrevCount.hasValue() || PrevCount.getType() == Count.getType());
+#endif
   MDBuilder MDB(getContext());
-  setMetadata(LLVMContext::MD_prof, MDB.createFunctionEntryCount(Count, S));
+  setMetadata(
+      LLVMContext::MD_prof,
+      MDB.createFunctionEntryCount(Count.getCount(), Count.isSynthetic(), S));
 }
 
-Optional<uint64_t> Function::getEntryCount() const {
+void Function::setEntryCount(uint64_t Count, Function::ProfileCountType Type,
+                             const DenseSet<GlobalValue::GUID> *Imports) {
+  setEntryCount(ProfileCount(Count, Type), Imports);
+}
+
+ProfileCount Function::getEntryCount(bool AllowSynthetic) const {
   MDNode *MD = getMetadata(LLVMContext::MD_prof);
   if (MD && MD->getOperand(0))
-    if (MDString *MDS = dyn_cast<MDString>(MD->getOperand(0)))
+    if (MDString *MDS = dyn_cast<MDString>(MD->getOperand(0))) {
       if (MDS->getString().equals("function_entry_count")) {
         ConstantInt *CI = mdconst::extract<ConstantInt>(MD->getOperand(1));
         uint64_t Count = CI->getValue().getZExtValue();
-        if (Count == 0)
-          return None;
-        return Count;
+        // A value of -1 is used for SamplePGO when there were no samples.
+        // Treat this the same as unknown.
+        if (Count == (uint64_t)-1)
+          return ProfileCount::getInvalid();
+        return ProfileCount(Count, PCT_Real);
+      } else if (AllowSynthetic &&
+                 MDS->getString().equals("synthetic_function_entry_count")) {
+        ConstantInt *CI = mdconst::extract<ConstantInt>(MD->getOperand(1));
+        uint64_t Count = CI->getValue().getZExtValue();
+        return ProfileCount(Count, PCT_Synthetic);
       }
-  return None;
+    }
+  return ProfileCount::getInvalid();
 }
 
 DenseSet<GlobalValue::GUID> Function::getImportGUIDs() const {
@@ -1283,11 +1586,27 @@ void Function::setSectionPrefix(StringRef Prefix) {
 
 Optional<StringRef> Function::getSectionPrefix() const {
   if (MDNode *MD = getMetadata(LLVMContext::MD_section_prefix)) {
-    assert(dyn_cast<MDString>(MD->getOperand(0))
+    assert(cast<MDString>(MD->getOperand(0))
                ->getString()
                .equals("function_section_prefix") &&
            "Metadata not match");
-    return dyn_cast<MDString>(MD->getOperand(1))->getString();
+    return cast<MDString>(MD->getOperand(1))->getString();
   }
   return None;
+}
+
+bool Function::nullPointerIsDefined() const {
+  return getFnAttribute("null-pointer-is-valid")
+          .getValueAsString()
+          .equals("true");
+}
+
+bool llvm::NullPointerIsDefined(const Function *F, unsigned AS) {
+  if (F && F->nullPointerIsDefined())
+    return true;
+
+  if (AS != 0)
+    return true;
+
+  return false;
 }

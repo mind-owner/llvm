@@ -1,9 +1,8 @@
 //===- MCTargetOptions.h - MC Target Options --------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -16,11 +15,18 @@
 namespace llvm {
 
 enum class ExceptionHandling {
-  None,     /// No exception support
-  DwarfCFI, /// DWARF-like instruction based exceptions
-  SjLj,     /// setjmp/longjmp based exceptions
-  ARM,      /// ARM EHABI
-  WinEH,    /// Windows Exception Handling
+  None,     ///< No exception support
+  DwarfCFI, ///< DWARF-like instruction based exceptions
+  SjLj,     ///< setjmp/longjmp based exceptions
+  ARM,      ///< ARM EHABI
+  WinEH,    ///< Windows Exception Handling
+  Wasm,     ///< WebAssembly Exception Handling
+};
+
+enum class DebugCompressionType {
+  None, ///< No compression
+  GNU,  ///< zlib-gnu style compression
+  Z,    ///< zlib style complession
 };
 
 class StringRef;
@@ -31,9 +37,6 @@ public:
     AsmInstrumentationNone,
     AsmInstrumentationAddress
   };
-
-  /// Enables AddressSanitizer instrumentation at machine level.
-  bool SanitizeAddress : 1;
 
   bool MCRelaxAll : 1;
   bool MCNoExecStack : 1;
@@ -54,6 +57,7 @@ public:
   int DwarfVersion = 0;
 
   std::string ABIName;
+  std::string SplitDwarfFile;
 
   /// Additional paths to search for `.include` directives when using the
   /// integrated assembler.

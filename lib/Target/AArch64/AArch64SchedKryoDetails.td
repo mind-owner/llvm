@@ -1,9 +1,8 @@
 //=- AArch64SchedKryoDetails.td - QC Kryo Scheduling Defs ----*- tablegen -*-=//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -1374,7 +1373,9 @@ def KryoWrite_3cyc_LS_LS_400ln :
 	let Latency = 3; let NumMicroOps = 2;
 }
 def : InstRW<[KryoWrite_3cyc_LS_LS_400ln],
-	(instregex "(LDAX?R(B|H|W|X)|LDAXP(W|X))")>;
+	(instregex "LDAX?R(B|H|W|X)")>;
+def : InstRW<[KryoWrite_3cyc_LS_LS_400ln, WriteLDHi],
+	(instregex "LDAXP(W|X)")>;
 def KryoWrite_3cyc_LS_LS_401ln :
 	SchedWriteRes<[KryoUnitLS, KryoUnitLS]> {
 	let Latency = 3; let NumMicroOps = 2;
@@ -1565,7 +1566,7 @@ def KryoWrite_3cyc_LS_258ln :
 	SchedWriteRes<[KryoUnitLS]> {
 	let Latency = 3; let NumMicroOps = 1;
 }
-def : InstRW<[KryoWrite_3cyc_LS_258ln],
+def : InstRW<[KryoWrite_3cyc_LS_258ln, WriteLDHi],
 	(instregex "LDXP(W|X)")>;
 def KryoWrite_3cyc_LS_258_1ln :
 	SchedWriteRes<[KryoUnitLS]> {

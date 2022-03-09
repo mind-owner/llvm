@@ -1,43 +1,84 @@
-//===-- LowerTypeTests.cpp - type metadata lowering pass ------------------===//
+//===- LowerTypeTests.cpp - type metadata lowering pass -------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
 // This pass lowers type metadata and calls to the llvm.type.test intrinsic.
+// It also ensures that globals are properly laid out for the
+// llvm.icall.branch.funnel intrinsic.
 // See http://llvm.org/docs/TypeMetadata.html for more information.
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/IPO/LowerTypeTests.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/EquivalenceClasses.h"
+#include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/ADT/Triple.h"
+#include "llvm/Analysis/TypeMetadataUtils.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalObject.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/ModuleSummaryIndex.h"
 #include "llvm/IR/ModuleSummaryIndexYAML.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Use.h"
+#include "llvm/IR/User.h"
+#include "llvm/IR/Value.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/Allocator.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TrailingObjects.h"
+#include "llvm/Support/YAMLTraits.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <set>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
 
 using namespace llvm;
 using namespace lowertypetests;
@@ -189,6 +230,16 @@ void ByteArrayBuilder::allocate(const std::set<uint64_t> &Bits,
     Bytes[AllocByteOffset + B] |= AllocMask;
 }
 
+bool lowertypetests::isJumpTableCanonical(Function *F) {
+  if (F->isDeclarationForLinker())
+    return false;
+  auto *CI = mdconst::extract_or_null<ConstantInt>(
+      F->getParent()->getModuleFlag("CFI Canonical Jump Tables"));
+  if (!CI || CI->getZExtValue() != 0)
+    return true;
+  return F->hasFnAttribute("cfi-canonical-jump-table");
+}
+
 namespace {
 
 struct ByteArrayInfo {
@@ -196,6 +247,7 @@ struct ByteArrayInfo {
   uint64_t BitSize;
   GlobalVariable *ByteArray;
   GlobalVariable *MaskGlobal;
+  uint8_t *MaskPtr = nullptr;
 };
 
 /// A POD-like structure that we use to store a global reference together with
@@ -204,28 +256,123 @@ struct ByteArrayInfo {
 /// operation involving a map lookup; this data structure helps to reduce the
 /// number of times we need to do this lookup.
 class GlobalTypeMember final : TrailingObjects<GlobalTypeMember, MDNode *> {
+  friend TrailingObjects;
+
   GlobalObject *GO;
   size_t NTypes;
 
-  friend TrailingObjects;
+  // For functions: true if the jump table is canonical. This essentially means
+  // whether the canonical address (i.e. the symbol table entry) of the function
+  // is provided by the local jump table. This is normally the same as whether
+  // the function is defined locally, but if canonical jump tables are disabled
+  // by the user then the jump table never provides a canonical definition.
+  bool IsJumpTableCanonical;
+
+  // For functions: true if this function is either defined or used in a thinlto
+  // module and its jumptable entry needs to be exported to thinlto backends.
+  bool IsExported;
+
   size_t numTrailingObjects(OverloadToken<MDNode *>) const { return NTypes; }
 
 public:
   static GlobalTypeMember *create(BumpPtrAllocator &Alloc, GlobalObject *GO,
+                                  bool IsJumpTableCanonical, bool IsExported,
                                   ArrayRef<MDNode *> Types) {
     auto *GTM = static_cast<GlobalTypeMember *>(Alloc.Allocate(
         totalSizeToAlloc<MDNode *>(Types.size()), alignof(GlobalTypeMember)));
     GTM->GO = GO;
     GTM->NTypes = Types.size();
+    GTM->IsJumpTableCanonical = IsJumpTableCanonical;
+    GTM->IsExported = IsExported;
     std::uninitialized_copy(Types.begin(), Types.end(),
                             GTM->getTrailingObjects<MDNode *>());
     return GTM;
   }
+
   GlobalObject *getGlobal() const {
     return GO;
   }
+
+  bool isJumpTableCanonical() const {
+    return IsJumpTableCanonical;
+  }
+
+  bool isExported() const {
+    return IsExported;
+  }
+
   ArrayRef<MDNode *> types() const {
     return makeArrayRef(getTrailingObjects<MDNode *>(), NTypes);
+  }
+};
+
+struct ICallBranchFunnel final
+    : TrailingObjects<ICallBranchFunnel, GlobalTypeMember *> {
+  static ICallBranchFunnel *create(BumpPtrAllocator &Alloc, CallInst *CI,
+                                   ArrayRef<GlobalTypeMember *> Targets,
+                                   unsigned UniqueId) {
+    auto *Call = static_cast<ICallBranchFunnel *>(
+        Alloc.Allocate(totalSizeToAlloc<GlobalTypeMember *>(Targets.size()),
+                       alignof(ICallBranchFunnel)));
+    Call->CI = CI;
+    Call->UniqueId = UniqueId;
+    Call->NTargets = Targets.size();
+    std::uninitialized_copy(Targets.begin(), Targets.end(),
+                            Call->getTrailingObjects<GlobalTypeMember *>());
+    return Call;
+  }
+
+  CallInst *CI;
+  ArrayRef<GlobalTypeMember *> targets() const {
+    return makeArrayRef(getTrailingObjects<GlobalTypeMember *>(), NTargets);
+  }
+
+  unsigned UniqueId;
+
+private:
+  size_t NTargets;
+};
+
+struct ScopedSaveAliaseesAndUsed {
+  Module &M;
+  SmallPtrSet<GlobalValue *, 16> Used, CompilerUsed;
+  std::vector<std::pair<GlobalIndirectSymbol *, Function *>> FunctionAliases;
+
+  ScopedSaveAliaseesAndUsed(Module &M) : M(M) {
+    // The users of this class want to replace all function references except
+    // for aliases and llvm.used/llvm.compiler.used with references to a jump
+    // table. We avoid replacing aliases in order to avoid introducing a double
+    // indirection (or an alias pointing to a declaration in ThinLTO mode), and
+    // we avoid replacing llvm.used/llvm.compiler.used because these global
+    // variables describe properties of the global, not the jump table (besides,
+    // offseted references to the jump table in llvm.used are invalid).
+    // Unfortunately, LLVM doesn't have a "RAUW except for these (possibly
+    // indirect) users", so what we do is save the list of globals referenced by
+    // llvm.used/llvm.compiler.used and aliases, erase the used lists, let RAUW
+    // replace the aliasees and then set them back to their original values at
+    // the end.
+    if (GlobalVariable *GV = collectUsedGlobalVariables(M, Used, false))
+      GV->eraseFromParent();
+    if (GlobalVariable *GV = collectUsedGlobalVariables(M, CompilerUsed, true))
+      GV->eraseFromParent();
+
+    for (auto &GIS : concat<GlobalIndirectSymbol>(M.aliases(), M.ifuncs())) {
+      // FIXME: This should look past all aliases not just interposable ones,
+      // see discussion on D65118.
+      if (auto *F =
+              dyn_cast<Function>(GIS.getIndirectSymbol()->stripPointerCasts()))
+        FunctionAliases.push_back({&GIS, F});
+    }
+  }
+
+  ~ScopedSaveAliaseesAndUsed() {
+    appendToUsed(M, std::vector<GlobalValue *>(Used.begin(), Used.end()));
+    appendToCompilerUsed(M, std::vector<GlobalValue *>(CompilerUsed.begin(),
+                                                       CompilerUsed.end()));
+
+    for (auto P : FunctionAliases)
+      P.first->setIndirectSymbol(
+          ConstantExpr::getBitCast(P.second, P.first->getType()));
   }
 };
 
@@ -235,7 +382,6 @@ class LowerTypeTestsModule {
   ModuleSummaryIndex *ExportSummary;
   const ModuleSummaryIndex *ImportSummary;
 
-  bool LinkerSubsectionsViaSymbols;
   Triple::ArchType Arch;
   Triple::OSType OS;
   Triple::ObjectFormatType ObjectFormat;
@@ -243,6 +389,7 @@ class LowerTypeTestsModule {
   IntegerType *Int1Ty = Type::getInt1Ty(M.getContext());
   IntegerType *Int8Ty = Type::getInt8Ty(M.getContext());
   PointerType *Int8PtrTy = Type::getInt8PtrTy(M.getContext());
+  ArrayType *Int8Arr0Ty = ArrayType::get(Type::getInt8Ty(M.getContext()), 0);
   IntegerType *Int32Ty = Type::getInt32Ty(M.getContext());
   PointerType *Int32PtrTy = PointerType::getUnqual(Int32Ty);
   IntegerType *Int64Ty = Type::getInt64Ty(M.getContext());
@@ -292,9 +439,12 @@ class LowerTypeTestsModule {
 
   Function *WeakInitializerFn = nullptr;
 
-  void exportTypeId(StringRef TypeId, const TypeIdLowering &TIL);
+  bool shouldExportConstantsAsAbsoluteSymbols();
+  uint8_t *exportTypeId(StringRef TypeId, const TypeIdLowering &TIL);
   TypeIdLowering importTypeId(StringRef TypeId);
   void importTypeTest(CallInst *CI);
+  void importFunction(Function *F, bool isJumpTableCanonical,
+                      std::vector<GlobalAlias *> &AliasesToErase);
 
   BitSetInfo
   buildBitSet(Metadata *TypeId,
@@ -308,32 +458,49 @@ class LowerTypeTestsModule {
       const DenseMap<GlobalTypeMember *, uint64_t> &GlobalLayout);
   Value *lowerTypeTestCall(Metadata *TypeId, CallInst *CI,
                            const TypeIdLowering &TIL);
+
   void buildBitSetsFromGlobalVariables(ArrayRef<Metadata *> TypeIds,
                                        ArrayRef<GlobalTypeMember *> Globals);
   unsigned getJumpTableEntrySize();
   Type *getJumpTableEntryType();
   void createJumpTableEntry(raw_ostream &AsmOS, raw_ostream &ConstraintOS,
+                            Triple::ArchType JumpTableArch,
                             SmallVectorImpl<Value *> &AsmArgs, Function *Dest);
   void verifyTypeMDNode(GlobalObject *GO, MDNode *Type);
   void buildBitSetsFromFunctions(ArrayRef<Metadata *> TypeIds,
                                  ArrayRef<GlobalTypeMember *> Functions);
   void buildBitSetsFromFunctionsNative(ArrayRef<Metadata *> TypeIds,
-                                    ArrayRef<GlobalTypeMember *> Functions);
+                                       ArrayRef<GlobalTypeMember *> Functions);
   void buildBitSetsFromFunctionsWASM(ArrayRef<Metadata *> TypeIds,
                                      ArrayRef<GlobalTypeMember *> Functions);
-  void buildBitSetsFromDisjointSet(ArrayRef<Metadata *> TypeIds,
-                                   ArrayRef<GlobalTypeMember *> Globals);
+  void
+  buildBitSetsFromDisjointSet(ArrayRef<Metadata *> TypeIds,
+                              ArrayRef<GlobalTypeMember *> Globals,
+                              ArrayRef<ICallBranchFunnel *> ICallBranchFunnels);
 
-  void replaceWeakDeclarationWithJumpTablePtr(Function *F, Constant *JT);
+  void replaceWeakDeclarationWithJumpTablePtr(Function *F, Constant *JT,
+                                              bool IsJumpTableCanonical);
   void moveInitializerToModuleConstructor(GlobalVariable *GV);
   void findGlobalVariableUsersOf(Constant *C,
                                  SmallSetVector<GlobalVariable *, 8> &Out);
 
   void createJumpTable(Function *F, ArrayRef<GlobalTypeMember *> Functions);
 
+  /// replaceCfiUses - Go through the uses list for this definition
+  /// and make each use point to "V" instead of "this" when the use is outside
+  /// the block. 'This's use list is expected to have at least one element.
+  /// Unlike replaceAllUsesWith this function skips blockaddr and direct call
+  /// uses.
+  void replaceCfiUses(Function *Old, Value *New, bool IsJumpTableCanonical);
+
+  /// replaceDirectCalls - Go through the uses list for this definition and
+  /// replace each use, which is a direct function call.
+  void replaceDirectCalls(Value *Old, Value *New);
+
 public:
   LowerTypeTestsModule(Module &M, ModuleSummaryIndex *ExportSummary,
                        const ModuleSummaryIndex *ImportSummary);
+
   bool lower();
 
   // Lower the module using the action and summary passed as command line
@@ -361,19 +528,18 @@ struct LowerTypeTests : public ModulePass {
   }
 
   bool runOnModule(Module &M) override {
-    if (skipModule(M))
-      return false;
     if (UseCommandLine)
       return LowerTypeTestsModule::runForTesting(M);
     return LowerTypeTestsModule(M, ExportSummary, ImportSummary).lower();
   }
 };
 
-} // anonymous namespace
+} // end anonymous namespace
+
+char LowerTypeTests::ID = 0;
 
 INITIALIZE_PASS(LowerTypeTests, "lowertypetests", "Lower type metadata", false,
                 false)
-char LowerTypeTests::ID = 0;
 
 ModulePass *
 llvm::createLowerTypeTestsPass(ModuleSummaryIndex *ExportSummary,
@@ -440,10 +606,10 @@ ByteArrayInfo *LowerTypeTestsModule::createByteArray(BitSetInfo &BSI) {
 }
 
 void LowerTypeTestsModule::allocateByteArrays() {
-  std::stable_sort(ByteArrayInfos.begin(), ByteArrayInfos.end(),
-                   [](const ByteArrayInfo &BAI1, const ByteArrayInfo &BAI2) {
-                     return BAI1.BitSize > BAI2.BitSize;
-                   });
+  llvm::stable_sort(ByteArrayInfos,
+                    [](const ByteArrayInfo &BAI1, const ByteArrayInfo &BAI2) {
+                      return BAI1.BitSize > BAI2.BitSize;
+                    });
 
   std::vector<uint64_t> ByteArrayOffsets(ByteArrayInfos.size());
 
@@ -457,6 +623,8 @@ void LowerTypeTestsModule::allocateByteArrays() {
     BAI->MaskGlobal->replaceAllUsesWith(
         ConstantExpr::getIntToPtr(ConstantInt::get(Int8Ty, Mask), Int8PtrTy));
     BAI->MaskGlobal->eraseFromParent();
+    if (BAI->MaskPtr)
+      *BAI->MaskPtr = Mask;
   }
 
   Constant *ByteArrayConst = ConstantDataArray::get(M.getContext(), BAB.Bytes);
@@ -475,13 +643,9 @@ void LowerTypeTestsModule::allocateByteArrays() {
     // Create an alias instead of RAUW'ing the gep directly. On x86 this ensures
     // that the pc-relative displacement is folded into the lea instead of the
     // test instruction getting another displacement.
-    if (LinkerSubsectionsViaSymbols) {
-      BAI->ByteArray->replaceAllUsesWith(GEP);
-    } else {
-      GlobalAlias *Alias = GlobalAlias::create(
-          Int8Ty, 0, GlobalValue::PrivateLinkage, "bits", GEP, &M);
-      BAI->ByteArray->replaceAllUsesWith(Alias);
-    }
+    GlobalAlias *Alias = GlobalAlias::create(
+        Int8Ty, 0, GlobalValue::PrivateLinkage, "bits", GEP, &M);
+    BAI->ByteArray->replaceAllUsesWith(Alias);
     BAI->ByteArray->eraseFromParent();
   }
 
@@ -502,7 +666,7 @@ Value *LowerTypeTestsModule::createBitSetTest(IRBuilder<> &B,
     return createMaskedBitTest(B, TIL.InlineBits, BitOffset);
   } else {
     Constant *ByteArray = TIL.TheByteArray;
-    if (!LinkerSubsectionsViaSymbols && AvoidReuse && !ImportSummary) {
+    if (AvoidReuse && !ImportSummary) {
       // Each use of the byte array uses a different alias. This makes the
       // backend less likely to reuse previously computed byte array addresses,
       // improving the security of the CFI mechanism based on this pass.
@@ -512,7 +676,7 @@ Value *LowerTypeTestsModule::createBitSetTest(IRBuilder<> &B,
     }
 
     Value *ByteAddr = B.CreateGEP(Int8Ty, ByteArray, BitOffset);
-    Value *Byte = B.CreateLoad(ByteAddr);
+    Value *Byte = B.CreateLoad(Int8Ty, ByteAddr);
 
     Value *ByteAndMask =
         B.CreateAnd(Byte, ConstantExpr::getPtrToInt(TIL.BitMask, Int8Ty));
@@ -608,8 +772,29 @@ Value *LowerTypeTestsModule::lowerTypeTestCall(Metadata *TypeId, CallInst *CI,
   if (TIL.TheKind == TypeTestResolution::AllOnes)
     return OffsetInRange;
 
-  TerminatorInst *Term = SplitBlockAndInsertIfThen(OffsetInRange, CI, false);
-  IRBuilder<> ThenB(Term);
+  // See if the intrinsic is used in the following common pattern:
+  //   br(llvm.type.test(...), thenbb, elsebb)
+  // where nothing happens between the type test and the br.
+  // If so, create slightly simpler IR.
+  if (CI->hasOneUse())
+    if (auto *Br = dyn_cast<BranchInst>(*CI->user_begin()))
+      if (CI->getNextNode() == Br) {
+        BasicBlock *Then = InitialBB->splitBasicBlock(CI->getIterator());
+        BasicBlock *Else = Br->getSuccessor(1);
+        BranchInst *NewBr = BranchInst::Create(Then, Else, OffsetInRange);
+        NewBr->setMetadata(LLVMContext::MD_prof,
+                           Br->getMetadata(LLVMContext::MD_prof));
+        ReplaceInstWithInst(InitialBB->getTerminator(), NewBr);
+
+        // Update phis in Else resulting from InitialBB being split
+        for (auto &Phi : Else->phis())
+          Phi.addIncoming(Phi.getIncomingValueForBlock(Then), InitialBB);
+
+        IRBuilder<> ThenB(CI);
+        return createBitSetTest(ThenB, TIL, BitOffset);
+      }
+
+  IRBuilder<> ThenB(SplitBlockAndInsertIfThen(OffsetInRange, CI, false));
 
   // Now that we know that the offset is in range and aligned, load the
   // appropriate bit from the bitset.
@@ -632,41 +817,50 @@ void LowerTypeTestsModule::buildBitSetsFromGlobalVariables(
   // Build a new global with the combined contents of the referenced globals.
   // This global is a struct whose even-indexed elements contain the original
   // contents of the referenced globals and whose odd-indexed elements contain
-  // any padding required to align the next element to the next power of 2.
+  // any padding required to align the next element to the next power of 2 plus
+  // any additional padding required to meet its alignment requirements.
   std::vector<Constant *> GlobalInits;
   const DataLayout &DL = M.getDataLayout();
+  DenseMap<GlobalTypeMember *, uint64_t> GlobalLayout;
+  Align MaxAlign;
+  uint64_t CurOffset = 0;
+  uint64_t DesiredPadding = 0;
   for (GlobalTypeMember *G : Globals) {
-    GlobalVariable *GV = cast<GlobalVariable>(G->getGlobal());
+    auto *GV = cast<GlobalVariable>(G->getGlobal());
+    MaybeAlign Alignment(GV->getAlignment());
+    if (!Alignment)
+      Alignment = Align(DL.getABITypeAlignment(GV->getValueType()));
+    MaxAlign = std::max(MaxAlign, *Alignment);
+    uint64_t GVOffset = alignTo(CurOffset + DesiredPadding, *Alignment);
+    GlobalLayout[G] = GVOffset;
+    if (GVOffset != 0) {
+      uint64_t Padding = GVOffset - CurOffset;
+      GlobalInits.push_back(
+          ConstantAggregateZero::get(ArrayType::get(Int8Ty, Padding)));
+    }
+
     GlobalInits.push_back(GV->getInitializer());
     uint64_t InitSize = DL.getTypeAllocSize(GV->getValueType());
+    CurOffset = GVOffset + InitSize;
 
-    // Compute the amount of padding required.
-    uint64_t Padding = NextPowerOf2(InitSize - 1) - InitSize;
+    // Compute the amount of padding that we'd like for the next element.
+    DesiredPadding = NextPowerOf2(InitSize - 1) - InitSize;
 
-    // Cap at 128 was found experimentally to have a good data/instruction
-    // overhead tradeoff.
-    if (Padding > 128)
-      Padding = alignTo(InitSize, 128) - InitSize;
-
-    GlobalInits.push_back(
-        ConstantAggregateZero::get(ArrayType::get(Int8Ty, Padding)));
+    // Experiments of different caps with Chromium on both x64 and ARM64
+    // have shown that the 32-byte cap generates the smallest binary on
+    // both platforms while different caps yield similar performance.
+    // (see https://lists.llvm.org/pipermail/llvm-dev/2018-July/124694.html)
+    if (DesiredPadding > 32)
+      DesiredPadding = alignTo(InitSize, 32) - InitSize;
   }
-  if (!GlobalInits.empty())
-    GlobalInits.pop_back();
+
   Constant *NewInit = ConstantStruct::getAnon(M.getContext(), GlobalInits);
   auto *CombinedGlobal =
       new GlobalVariable(M, NewInit->getType(), /*isConstant=*/true,
                          GlobalValue::PrivateLinkage, NewInit);
+  CombinedGlobal->setAlignment(MaxAlign);
 
   StructType *NewTy = cast<StructType>(NewInit->getType());
-  const StructLayout *CombinedGlobalLayout = DL.getStructLayout(NewTy);
-
-  // Compute the offsets of the original globals within the new global.
-  DenseMap<GlobalTypeMember *, uint64_t> GlobalLayout;
-  for (unsigned I = 0; I != Globals.size(); ++I)
-    // Multiply by 2 to account for padding elements.
-    GlobalLayout[Globals[I]] = CombinedGlobalLayout->getElementOffset(I * 2);
-
   lowerTypeTestCalls(TypeIds, CombinedGlobal, GlobalLayout);
 
   // Build aliases pointing to offsets into the combined global for each
@@ -680,19 +874,20 @@ void LowerTypeTestsModule::buildBitSetsFromGlobalVariables(
                                       ConstantInt::get(Int32Ty, I * 2)};
     Constant *CombinedGlobalElemPtr = ConstantExpr::getGetElementPtr(
         NewInit->getType(), CombinedGlobal, CombinedGlobalIdxs);
-    if (LinkerSubsectionsViaSymbols) {
-      GV->replaceAllUsesWith(CombinedGlobalElemPtr);
-    } else {
-      assert(GV->getType()->getAddressSpace() == 0);
-      GlobalAlias *GAlias = GlobalAlias::create(NewTy->getElementType(I * 2), 0,
-                                                GV->getLinkage(), "",
-                                                CombinedGlobalElemPtr, &M);
-      GAlias->setVisibility(GV->getVisibility());
-      GAlias->takeName(GV);
-      GV->replaceAllUsesWith(GAlias);
-    }
+    assert(GV->getType()->getAddressSpace() == 0);
+    GlobalAlias *GAlias =
+        GlobalAlias::create(NewTy->getElementType(I * 2), 0, GV->getLinkage(),
+                            "", CombinedGlobalElemPtr, &M);
+    GAlias->setVisibility(GV->getVisibility());
+    GAlias->takeName(GV);
+    GV->replaceAllUsesWith(GAlias);
     GV->eraseFromParent();
   }
+}
+
+bool LowerTypeTestsModule::shouldExportConstantsAsAbsoluteSymbols() {
+  return (Arch == Triple::x86 || Arch == Triple::x86_64) &&
+         ObjectFormat == Triple::ELF;
 }
 
 /// Export the given type identifier so that ThinLTO backends may import it.
@@ -700,8 +895,11 @@ void LowerTypeTestsModule::buildBitSetsFromGlobalVariables(
 /// to test the type identifier to the summary, and creating symbols in the
 /// object file (aliases and absolute symbols) containing fine-grained
 /// information about the type identifier.
-void LowerTypeTestsModule::exportTypeId(StringRef TypeId,
-                                        const TypeIdLowering &TIL) {
+///
+/// Returns a pointer to the location in which to store the bitmask, if
+/// applicable.
+uint8_t *LowerTypeTestsModule::exportTypeId(StringRef TypeId,
+                                            const TypeIdLowering &TIL) {
   TypeTestResolution &TTRes =
       ExportSummary->getOrInsertTypeIdSummary(TypeId).TTRes;
   TTRes.TheKind = TIL.TheKind;
@@ -713,14 +911,21 @@ void LowerTypeTestsModule::exportTypeId(StringRef TypeId,
     GA->setVisibility(GlobalValue::HiddenVisibility);
   };
 
+  auto ExportConstant = [&](StringRef Name, uint64_t &Storage, Constant *C) {
+    if (shouldExportConstantsAsAbsoluteSymbols())
+      ExportGlobal(Name, ConstantExpr::getIntToPtr(C, Int8PtrTy));
+    else
+      Storage = cast<ConstantInt>(C)->getZExtValue();
+  };
+
   if (TIL.TheKind != TypeTestResolution::Unsat)
     ExportGlobal("global_addr", TIL.OffsetedGlobal);
 
   if (TIL.TheKind == TypeTestResolution::ByteArray ||
       TIL.TheKind == TypeTestResolution::Inline ||
       TIL.TheKind == TypeTestResolution::AllOnes) {
-    ExportGlobal("align", ConstantExpr::getIntToPtr(TIL.AlignLog2, Int8PtrTy));
-    ExportGlobal("size_m1", ConstantExpr::getIntToPtr(TIL.SizeM1, Int8PtrTy));
+    ExportConstant("align", TTRes.AlignLog2, TIL.AlignLog2);
+    ExportConstant("size_m1", TTRes.SizeM1, TIL.SizeM1);
 
     uint64_t BitSize = cast<ConstantInt>(TIL.SizeM1)->getZExtValue() + 1;
     if (TIL.TheKind == TypeTestResolution::Inline)
@@ -731,12 +936,16 @@ void LowerTypeTestsModule::exportTypeId(StringRef TypeId,
 
   if (TIL.TheKind == TypeTestResolution::ByteArray) {
     ExportGlobal("byte_array", TIL.TheByteArray);
-    ExportGlobal("bit_mask", TIL.BitMask);
+    if (shouldExportConstantsAsAbsoluteSymbols())
+      ExportGlobal("bit_mask", TIL.BitMask);
+    else
+      return &TTRes.BitMask;
   }
 
   if (TIL.TheKind == TypeTestResolution::Inline)
-    ExportGlobal("inline_bits",
-                 ConstantExpr::getIntToPtr(TIL.InlineBits, Int8PtrTy));
+    ExportConstant("inline_bits", TTRes.InlineBits, TIL.InlineBits);
+
+  return nullptr;
 }
 
 LowerTypeTestsModule::TypeIdLowering
@@ -749,16 +958,34 @@ LowerTypeTestsModule::importTypeId(StringRef TypeId) {
   TypeIdLowering TIL;
   TIL.TheKind = TTRes.TheKind;
 
-  auto ImportGlobal = [&](StringRef Name, unsigned AbsWidth) {
-    Constant *C =
-        M.getOrInsertGlobal(("__typeid_" + TypeId + "_" + Name).str(), Int8Ty);
-    auto *GV = dyn_cast<GlobalVariable>(C);
-    // We only need to set metadata if the global is newly created, in which
-    // case it would not have hidden visibility.
-    if (!GV || GV->getVisibility() == GlobalValue::HiddenVisibility)
+  auto ImportGlobal = [&](StringRef Name) {
+    // Give the global a type of length 0 so that it is not assumed not to alias
+    // with any other global.
+    Constant *C = M.getOrInsertGlobal(("__typeid_" + TypeId + "_" + Name).str(),
+                                      Int8Arr0Ty);
+    if (auto *GV = dyn_cast<GlobalVariable>(C))
+      GV->setVisibility(GlobalValue::HiddenVisibility);
+    C = ConstantExpr::getBitCast(C, Int8PtrTy);
+    return C;
+  };
+
+  auto ImportConstant = [&](StringRef Name, uint64_t Const, unsigned AbsWidth,
+                            Type *Ty) {
+    if (!shouldExportConstantsAsAbsoluteSymbols()) {
+      Constant *C =
+          ConstantInt::get(isa<IntegerType>(Ty) ? Ty : Int64Ty, Const);
+      if (!isa<IntegerType>(Ty))
+        C = ConstantExpr::getIntToPtr(C, Ty);
+      return C;
+    }
+
+    Constant *C = ImportGlobal(Name);
+    auto *GV = cast<GlobalVariable>(C->stripPointerCasts());
+    if (isa<IntegerType>(Ty))
+      C = ConstantExpr::getPtrToInt(C, Ty);
+    if (GV->getMetadata(LLVMContext::MD_absolute_symbol))
       return C;
 
-    GV->setVisibility(GlobalValue::HiddenVisibility);
     auto SetAbsRange = [&](uint64_t Min, uint64_t Max) {
       auto *MinC = ConstantAsMetadata::get(ConstantInt::get(IntPtrTy, Min));
       auto *MaxC = ConstantAsMetadata::get(ConstantInt::get(IntPtrTy, Max));
@@ -767,30 +994,30 @@ LowerTypeTestsModule::importTypeId(StringRef TypeId) {
     };
     if (AbsWidth == IntPtrTy->getBitWidth())
       SetAbsRange(~0ull, ~0ull); // Full set.
-    else if (AbsWidth)
+    else
       SetAbsRange(0, 1ull << AbsWidth);
     return C;
   };
 
   if (TIL.TheKind != TypeTestResolution::Unsat)
-    TIL.OffsetedGlobal = ImportGlobal("global_addr", 0);
+    TIL.OffsetedGlobal = ImportGlobal("global_addr");
 
   if (TIL.TheKind == TypeTestResolution::ByteArray ||
       TIL.TheKind == TypeTestResolution::Inline ||
       TIL.TheKind == TypeTestResolution::AllOnes) {
-    TIL.AlignLog2 = ConstantExpr::getPtrToInt(ImportGlobal("align", 8), Int8Ty);
-    TIL.SizeM1 = ConstantExpr::getPtrToInt(
-        ImportGlobal("size_m1", TTRes.SizeM1BitWidth), IntPtrTy);
+    TIL.AlignLog2 = ImportConstant("align", TTRes.AlignLog2, 8, Int8Ty);
+    TIL.SizeM1 =
+        ImportConstant("size_m1", TTRes.SizeM1, TTRes.SizeM1BitWidth, IntPtrTy);
   }
 
   if (TIL.TheKind == TypeTestResolution::ByteArray) {
-    TIL.TheByteArray = ImportGlobal("byte_array", 0);
-    TIL.BitMask = ImportGlobal("bit_mask", 8);
+    TIL.TheByteArray = ImportGlobal("byte_array");
+    TIL.BitMask = ImportConstant("bit_mask", TTRes.BitMask, 8, Int8PtrTy);
   }
 
   if (TIL.TheKind == TypeTestResolution::Inline)
-    TIL.InlineBits = ConstantExpr::getPtrToInt(
-        ImportGlobal("inline_bits", 1 << TTRes.SizeM1BitWidth),
+    TIL.InlineBits = ImportConstant(
+        "inline_bits", TTRes.InlineBits, 1 << TTRes.SizeM1BitWidth,
         TTRes.SizeM1BitWidth <= 5 ? Int32Ty : Int64Ty);
 
   return TIL;
@@ -812,6 +1039,70 @@ void LowerTypeTestsModule::importTypeTest(CallInst *CI) {
   CI->eraseFromParent();
 }
 
+// ThinLTO backend: the function F has a jump table entry; update this module
+// accordingly. isJumpTableCanonical describes the type of the jump table entry.
+void LowerTypeTestsModule::importFunction(
+    Function *F, bool isJumpTableCanonical,
+    std::vector<GlobalAlias *> &AliasesToErase) {
+  assert(F->getType()->getAddressSpace() == 0);
+
+  GlobalValue::VisibilityTypes Visibility = F->getVisibility();
+  std::string Name = F->getName();
+
+  if (F->isDeclarationForLinker() && isJumpTableCanonical) {
+    // Non-dso_local functions may be overriden at run time,
+    // don't short curcuit them
+    if (F->isDSOLocal()) {
+      Function *RealF = Function::Create(F->getFunctionType(),
+                                         GlobalValue::ExternalLinkage,
+                                         F->getAddressSpace(),
+                                         Name + ".cfi", &M);
+      RealF->setVisibility(GlobalVariable::HiddenVisibility);
+      replaceDirectCalls(F, RealF);
+    }
+    return;
+  }
+
+  Function *FDecl;
+  if (!isJumpTableCanonical) {
+    // Either a declaration of an external function or a reference to a locally
+    // defined jump table.
+    FDecl = Function::Create(F->getFunctionType(), GlobalValue::ExternalLinkage,
+                             F->getAddressSpace(), Name + ".cfi_jt", &M);
+    FDecl->setVisibility(GlobalValue::HiddenVisibility);
+  } else {
+    F->setName(Name + ".cfi");
+    F->setLinkage(GlobalValue::ExternalLinkage);
+    FDecl = Function::Create(F->getFunctionType(), GlobalValue::ExternalLinkage,
+                             F->getAddressSpace(), Name, &M);
+    FDecl->setVisibility(Visibility);
+    Visibility = GlobalValue::HiddenVisibility;
+
+    // Delete aliases pointing to this function, they'll be re-created in the
+    // merged output. Don't do it yet though because ScopedSaveAliaseesAndUsed
+    // will want to reset the aliasees first.
+    for (auto &U : F->uses()) {
+      if (auto *A = dyn_cast<GlobalAlias>(U.getUser())) {
+        Function *AliasDecl = Function::Create(
+            F->getFunctionType(), GlobalValue::ExternalLinkage,
+            F->getAddressSpace(), "", &M);
+        AliasDecl->takeName(A);
+        A->replaceAllUsesWith(AliasDecl);
+        AliasesToErase.push_back(A);
+      }
+    }
+  }
+
+  if (F->hasExternalWeakLinkage())
+    replaceWeakDeclarationWithJumpTablePtr(F, FDecl, isJumpTableCanonical);
+  else
+    replaceCfiUses(F, FDecl, isJumpTableCanonical);
+
+  // Set visibility late because it's used in replaceCfiUses() to determine
+  // whether uses need to to be replaced.
+  F->setVisibility(Visibility);
+}
+
 void LowerTypeTestsModule::lowerTypeTestCalls(
     ArrayRef<Metadata *> TypeIds, Constant *CombinedGlobalAddr,
     const DenseMap<GlobalTypeMember *, uint64_t> &GlobalLayout) {
@@ -821,7 +1112,7 @@ void LowerTypeTestsModule::lowerTypeTestCalls(
   for (Metadata *TypeId : TypeIds) {
     // Build the bitset.
     BitSetInfo BSI = buildBitSet(TypeId, GlobalLayout);
-    DEBUG({
+    LLVM_DEBUG({
       if (auto MDS = dyn_cast<MDString>(TypeId))
         dbgs() << MDS->getString() << ": ";
       else
@@ -829,6 +1120,7 @@ void LowerTypeTestsModule::lowerTypeTestCalls(
       BSI.print(dbgs());
     });
 
+    ByteArrayInfo *BAI = nullptr;
     TypeIdLowering TIL;
     TIL.OffsetedGlobal = ConstantExpr::getGetElementPtr(
         Int8Ty, CombinedGlobalAddr, ConstantInt::get(IntPtrTy, BSI.ByteOffset)),
@@ -850,15 +1142,18 @@ void LowerTypeTestsModule::lowerTypeTestCalls(
     } else {
       TIL.TheKind = TypeTestResolution::ByteArray;
       ++NumByteArraysCreated;
-      ByteArrayInfo *BAI = createByteArray(BSI);
+      BAI = createByteArray(BSI);
       TIL.TheByteArray = BAI->ByteArray;
       TIL.BitMask = BAI->MaskGlobal;
     }
 
     TypeIdUserInfo &TIUI = TypeIdUsers[TypeId];
 
-    if (TIUI.IsExported)
-      exportTypeId(cast<MDString>(TypeId)->getString(), TIL);
+    if (TIUI.IsExported) {
+      uint8_t *MaskPtr = exportTypeId(cast<MDString>(TypeId)->getString(), TIL);
+      if (BAI)
+        BAI->MaskPtr = MaskPtr;
+    }
 
     // Lower each call to llvm.type.test for this type identifier.
     for (CallInst *CI : TIUI.CallSites) {
@@ -914,15 +1209,16 @@ unsigned LowerTypeTestsModule::getJumpTableEntrySize() {
 // constraints and arguments to AsmOS, ConstraintOS and AsmArgs.
 void LowerTypeTestsModule::createJumpTableEntry(
     raw_ostream &AsmOS, raw_ostream &ConstraintOS,
-    SmallVectorImpl<Value *> &AsmArgs, Function *Dest) {
+    Triple::ArchType JumpTableArch, SmallVectorImpl<Value *> &AsmArgs,
+    Function *Dest) {
   unsigned ArgIndex = AsmArgs.size();
 
-  if (Arch == Triple::x86 || Arch == Triple::x86_64) {
+  if (JumpTableArch == Triple::x86 || JumpTableArch == Triple::x86_64) {
     AsmOS << "jmp ${" << ArgIndex << ":c}@plt\n";
     AsmOS << "int3\nint3\nint3\n";
-  } else if (Arch == Triple::arm || Arch == Triple::aarch64) {
+  } else if (JumpTableArch == Triple::arm || JumpTableArch == Triple::aarch64) {
     AsmOS << "b $" << ArgIndex << "\n";
-  } else if (Arch == Triple::thumb) {
+  } else if (JumpTableArch == Triple::thumb) {
     AsmOS << "b.w $" << ArgIndex << "\n";
   } else {
     report_fatal_error("Unsupported architecture for jump tables");
@@ -955,7 +1251,9 @@ void LowerTypeTestsModule::moveInitializerToModuleConstructor(
     WeakInitializerFn = Function::Create(
         FunctionType::get(Type::getVoidTy(M.getContext()),
                           /* IsVarArg */ false),
-        GlobalValue::InternalLinkage, "__cfi_global_var_init", &M);
+        GlobalValue::InternalLinkage,
+        M.getDataLayout().getProgramAddressSpace(),
+        "__cfi_global_var_init", &M);
     BasicBlock *BB =
         BasicBlock::Create(M.getContext(), "entry", WeakInitializerFn);
     ReturnInst::Create(M.getContext(), BB);
@@ -986,7 +1284,7 @@ void LowerTypeTestsModule::findGlobalVariableUsersOf(
 
 // Replace all uses of F with (F ? JT : 0).
 void LowerTypeTestsModule::replaceWeakDeclarationWithJumpTablePtr(
-    Function *F, Constant *JT) {
+    Function *F, Constant *JT, bool IsJumpTableCanonical) {
   // The target expression can not appear in a constant initializer on most
   // (all?) targets. Switch to a runtime initializer.
   SmallSetVector<GlobalVariable *, 8> GlobalVarUsers;
@@ -998,8 +1296,9 @@ void LowerTypeTestsModule::replaceWeakDeclarationWithJumpTablePtr(
   // placeholder first.
   Function *PlaceholderFn =
       Function::Create(cast<FunctionType>(F->getValueType()),
-                       GlobalValue::ExternalWeakLinkage, "", &M);
-  F->replaceAllUsesWith(PlaceholderFn);
+                       GlobalValue::ExternalWeakLinkage,
+                       F->getAddressSpace(), "", &M);
+  replaceCfiUses(F, PlaceholderFn, IsJumpTableCanonical);
 
   Constant *Target = ConstantExpr::getSelect(
       ConstantExpr::getICmp(CmpInst::ICMP_NE, F,
@@ -1009,6 +1308,47 @@ void LowerTypeTestsModule::replaceWeakDeclarationWithJumpTablePtr(
   PlaceholderFn->eraseFromParent();
 }
 
+static bool isThumbFunction(Function *F, Triple::ArchType ModuleArch) {
+  Attribute TFAttr = F->getFnAttribute("target-features");
+  if (!TFAttr.hasAttribute(Attribute::None)) {
+    SmallVector<StringRef, 6> Features;
+    TFAttr.getValueAsString().split(Features, ',');
+    for (StringRef Feature : Features) {
+      if (Feature == "-thumb-mode")
+        return false;
+      else if (Feature == "+thumb-mode")
+        return true;
+    }
+  }
+
+  return ModuleArch == Triple::thumb;
+}
+
+// Each jump table must be either ARM or Thumb as a whole for the bit-test math
+// to work. Pick one that matches the majority of members to minimize interop
+// veneers inserted by the linker.
+static Triple::ArchType
+selectJumpTableArmEncoding(ArrayRef<GlobalTypeMember *> Functions,
+                           Triple::ArchType ModuleArch) {
+  if (ModuleArch != Triple::arm && ModuleArch != Triple::thumb)
+    return ModuleArch;
+
+  unsigned ArmCount = 0, ThumbCount = 0;
+  for (const auto GTM : Functions) {
+    if (!GTM->isJumpTableCanonical()) {
+      // PLT stubs are always ARM.
+      // FIXME: This is the wrong heuristic for non-canonical jump tables.
+      ++ArmCount;
+      continue;
+    }
+
+    Function *F = cast<Function>(GTM->getGlobal());
+    ++(isThumbFunction(F, ModuleArch) ? ThumbCount : ArmCount);
+  }
+
+  return ArmCount > ThumbCount ? Triple::arm : Triple::thumb;
+}
+
 void LowerTypeTestsModule::createJumpTable(
     Function *F, ArrayRef<GlobalTypeMember *> Functions) {
   std::string AsmStr, ConstraintStr;
@@ -1016,28 +1356,30 @@ void LowerTypeTestsModule::createJumpTable(
   SmallVector<Value *, 16> AsmArgs;
   AsmArgs.reserve(Functions.size() * 2);
 
+  Triple::ArchType JumpTableArch = selectJumpTableArmEncoding(Functions, Arch);
+
   for (unsigned I = 0; I != Functions.size(); ++I)
-    createJumpTableEntry(AsmOS, ConstraintOS, AsmArgs,
+    createJumpTableEntry(AsmOS, ConstraintOS, JumpTableArch, AsmArgs,
                          cast<Function>(Functions[I]->getGlobal()));
 
-  // Try to emit the jump table at the end of the text segment.
-  // Jump table must come after __cfi_check in the cross-dso mode.
-  // FIXME: this magic section name seems to do the trick.
-  F->setSection(ObjectFormat == Triple::MachO
-                    ? "__TEXT,__text,regular,pure_instructions"
-                    : ".text.cfi");
   // Align the whole table by entry size.
-  F->setAlignment(getJumpTableEntrySize());
+  F->setAlignment(Align(getJumpTableEntrySize()));
   // Skip prologue.
   // Disabled on win32 due to https://llvm.org/bugs/show_bug.cgi?id=28641#c3.
   // Luckily, this function does not get any prologue even without the
   // attribute.
   if (OS != Triple::Win32)
-    F->addFnAttr(llvm::Attribute::Naked);
-  // Thumb jump table assembly needs Thumb2. The following attribute is added by
-  // Clang for -march=armv7.
-  if (Arch == Triple::thumb)
+    F->addFnAttr(Attribute::Naked);
+  if (JumpTableArch == Triple::arm)
+    F->addFnAttr("target-features", "-thumb-mode");
+  if (JumpTableArch == Triple::thumb) {
+    F->addFnAttr("target-features", "+thumb-mode");
+    // Thumb jump table assembly needs Thumb2. The following attribute is added
+    // by Clang for -march=armv7.
     F->addFnAttr("target-cpu", "cortex-a8");
+  }
+  // Make sure we don't emit .eh_frame for this function.
+  F->addFnAttr(Attribute::NoUnwind);
 
   BasicBlock *BB = BasicBlock::Create(M.getContext(), "entry", F);
   IRBuilder<> IRB(BB);
@@ -1135,7 +1477,6 @@ void LowerTypeTestsModule::buildBitSetsFromFunctionsNative(
   // arithmetic that we normally use for globals.
 
   // FIXME: find a better way to represent the jumptable in the IR.
-
   assert(!Functions.empty());
 
   // Build a simple layout based on the regular layout of jump tables.
@@ -1147,7 +1488,9 @@ void LowerTypeTestsModule::buildBitSetsFromFunctionsNative(
   Function *JumpTableFn =
       Function::Create(FunctionType::get(Type::getVoidTy(M.getContext()),
                                          /* IsVarArg */ false),
-                       GlobalValue::PrivateLinkage, ".cfi.jumptable", &M);
+                       GlobalValue::PrivateLinkage,
+                       M.getDataLayout().getProgramAddressSpace(),
+                       ".cfi.jumptable", &M);
   ArrayType *JumpTableType =
       ArrayType::get(getJumpTableEntryType(), Functions.size());
   auto JumpTable =
@@ -1155,37 +1498,53 @@ void LowerTypeTestsModule::buildBitSetsFromFunctionsNative(
 
   lowerTypeTestCalls(TypeIds, JumpTable, GlobalLayout);
 
-  // Build aliases pointing to offsets into the jump table, and replace
-  // references to the original functions with references to the aliases.
-  for (unsigned I = 0; I != Functions.size(); ++I) {
-    Function *F = cast<Function>(Functions[I]->getGlobal());
+  {
+    ScopedSaveAliaseesAndUsed S(M);
 
-    Constant *CombinedGlobalElemPtr = ConstantExpr::getBitCast(
-        ConstantExpr::getInBoundsGetElementPtr(
-            JumpTableType, JumpTable,
-            ArrayRef<Constant *>{ConstantInt::get(IntPtrTy, 0),
-                                 ConstantInt::get(IntPtrTy, I)}),
-        F->getType());
-    if (LinkerSubsectionsViaSymbols || F->isDeclarationForLinker()) {
+    // Build aliases pointing to offsets into the jump table, and replace
+    // references to the original functions with references to the aliases.
+    for (unsigned I = 0; I != Functions.size(); ++I) {
+      Function *F = cast<Function>(Functions[I]->getGlobal());
+      bool IsJumpTableCanonical = Functions[I]->isJumpTableCanonical();
 
-      if (F->isWeakForLinker())
-        replaceWeakDeclarationWithJumpTablePtr(F, CombinedGlobalElemPtr);
-      else
-        F->replaceAllUsesWith(CombinedGlobalElemPtr);
-    } else {
-      assert(F->getType()->getAddressSpace() == 0);
+      Constant *CombinedGlobalElemPtr = ConstantExpr::getBitCast(
+          ConstantExpr::getInBoundsGetElementPtr(
+              JumpTableType, JumpTable,
+              ArrayRef<Constant *>{ConstantInt::get(IntPtrTy, 0),
+                                   ConstantInt::get(IntPtrTy, I)}),
+          F->getType());
+      if (Functions[I]->isExported()) {
+        if (IsJumpTableCanonical) {
+          ExportSummary->cfiFunctionDefs().insert(F->getName());
+        } else {
+          GlobalAlias *JtAlias = GlobalAlias::create(
+              F->getValueType(), 0, GlobalValue::ExternalLinkage,
+              F->getName() + ".cfi_jt", CombinedGlobalElemPtr, &M);
+          JtAlias->setVisibility(GlobalValue::HiddenVisibility);
+          ExportSummary->cfiFunctionDecls().insert(F->getName());
+        }
+      }
+      if (!IsJumpTableCanonical) {
+        if (F->hasExternalWeakLinkage())
+          replaceWeakDeclarationWithJumpTablePtr(F, CombinedGlobalElemPtr,
+                                                 IsJumpTableCanonical);
+        else
+          replaceCfiUses(F, CombinedGlobalElemPtr, IsJumpTableCanonical);
+      } else {
+        assert(F->getType()->getAddressSpace() == 0);
 
-      GlobalAlias *FAlias = GlobalAlias::create(F->getValueType(), 0,
-                                                F->getLinkage(), "",
-                                                CombinedGlobalElemPtr, &M);
-      FAlias->setVisibility(F->getVisibility());
-      FAlias->takeName(F);
-      if (FAlias->hasName())
-        F->setName(FAlias->getName() + ".cfi");
-      F->replaceAllUsesWith(FAlias);
+        GlobalAlias *FAlias =
+            GlobalAlias::create(F->getValueType(), 0, F->getLinkage(), "",
+                                CombinedGlobalElemPtr, &M);
+        FAlias->setVisibility(F->getVisibility());
+        FAlias->takeName(F);
+        if (FAlias->hasName())
+          F->setName(FAlias->getName() + ".cfi");
+        replaceCfiUses(F, FAlias, IsJumpTableCanonical);
+        if (!F->hasLocalLinkage())
+          F->setVisibility(GlobalVariable::HiddenVisibility);
+      }
     }
-    if (!F->isDeclarationForLinker())
-      F->setLinkage(GlobalValue::InternalLinkage);
   }
 
   createJumpTable(JumpTableFn, Functions);
@@ -1228,8 +1587,9 @@ void LowerTypeTestsModule::buildBitSetsFromFunctionsWASM(
 }
 
 void LowerTypeTestsModule::buildBitSetsFromDisjointSet(
-    ArrayRef<Metadata *> TypeIds, ArrayRef<GlobalTypeMember *> Globals) {
-  llvm::DenseMap<Metadata *, uint64_t> TypeIdIndices;
+    ArrayRef<Metadata *> TypeIds, ArrayRef<GlobalTypeMember *> Globals,
+    ArrayRef<ICallBranchFunnel *> ICallBranchFunnels) {
+  DenseMap<Metadata *, uint64_t> TypeIdIndices;
   for (unsigned I = 0; I != TypeIds.size(); ++I)
     TypeIdIndices[TypeIds[I]] = I;
 
@@ -1237,22 +1597,31 @@ void LowerTypeTestsModule::buildBitSetsFromDisjointSet(
   // the type identifier.
   std::vector<std::set<uint64_t>> TypeMembers(TypeIds.size());
   unsigned GlobalIndex = 0;
+  DenseMap<GlobalTypeMember *, uint64_t> GlobalIndices;
   for (GlobalTypeMember *GTM : Globals) {
     for (MDNode *Type : GTM->types()) {
       // Type = { offset, type identifier }
-      unsigned TypeIdIndex = TypeIdIndices[Type->getOperand(1)];
-      TypeMembers[TypeIdIndex].insert(GlobalIndex);
+      auto I = TypeIdIndices.find(Type->getOperand(1));
+      if (I != TypeIdIndices.end())
+        TypeMembers[I->second].insert(GlobalIndex);
     }
+    GlobalIndices[GTM] = GlobalIndex;
     GlobalIndex++;
+  }
+
+  for (ICallBranchFunnel *JT : ICallBranchFunnels) {
+    TypeMembers.emplace_back();
+    std::set<uint64_t> &TMSet = TypeMembers.back();
+    for (GlobalTypeMember *T : JT->targets())
+      TMSet.insert(GlobalIndices[T]);
   }
 
   // Order the sets of indices by size. The GlobalLayoutBuilder works best
   // when given small index sets first.
-  std::stable_sort(
-      TypeMembers.begin(), TypeMembers.end(),
-      [](const std::set<uint64_t> &O1, const std::set<uint64_t> &O2) {
-        return O1.size() < O2.size();
-      });
+  llvm::stable_sort(TypeMembers, [](const std::set<uint64_t> &O1,
+                                    const std::set<uint64_t> &O2) {
+    return O1.size() < O2.size();
+  });
 
   // Create a GlobalLayoutBuilder and provide it with index sets as layout
   // fragments. The GlobalLayoutBuilder tries to lay out members of fragments as
@@ -1261,38 +1630,25 @@ void LowerTypeTestsModule::buildBitSetsFromDisjointSet(
   for (auto &&MemSet : TypeMembers)
     GLB.addFragment(MemSet);
 
-  // Build the bitsets from this disjoint set.
-  if (Globals.empty() || isa<GlobalVariable>(Globals[0]->getGlobal())) {
-    // Build a vector of global variables with the computed layout.
-    std::vector<GlobalTypeMember *> OrderedGVs(Globals.size());
-    auto OGI = OrderedGVs.begin();
-    for (auto &&F : GLB.Fragments) {
-      for (auto &&Offset : F) {
-        auto GV = dyn_cast<GlobalVariable>(Globals[Offset]->getGlobal());
-        if (!GV)
-          report_fatal_error("Type identifier may not contain both global "
-                             "variables and functions");
-        *OGI++ = Globals[Offset];
-      }
+  // Build a vector of globals with the computed layout.
+  bool IsGlobalSet =
+      Globals.empty() || isa<GlobalVariable>(Globals[0]->getGlobal());
+  std::vector<GlobalTypeMember *> OrderedGTMs(Globals.size());
+  auto OGTMI = OrderedGTMs.begin();
+  for (auto &&F : GLB.Fragments) {
+    for (auto &&Offset : F) {
+      if (IsGlobalSet != isa<GlobalVariable>(Globals[Offset]->getGlobal()))
+        report_fatal_error("Type identifier may not contain both global "
+                           "variables and functions");
+      *OGTMI++ = Globals[Offset];
     }
-
-    buildBitSetsFromGlobalVariables(TypeIds, OrderedGVs);
-  } else {
-    // Build a vector of functions with the computed layout.
-    std::vector<GlobalTypeMember *> OrderedFns(Globals.size());
-    auto OFI = OrderedFns.begin();
-    for (auto &&F : GLB.Fragments) {
-      for (auto &&Offset : F) {
-        auto Fn = dyn_cast<Function>(Globals[Offset]->getGlobal());
-        if (!Fn)
-          report_fatal_error("Type identifier may not contain both global "
-                             "variables and functions");
-        *OFI++ = Globals[Offset];
-      }
-    }
-
-    buildBitSetsFromFunctions(TypeIds, OrderedFns);
   }
+
+  // Build the bitsets from this disjoint set.
+  if (IsGlobalSet)
+    buildBitSetsFromGlobalVariables(TypeIds, OrderedGTMs);
+  else
+    buildBitSetsFromFunctions(TypeIds, OrderedGTMs);
 }
 
 /// Lower all type tests in this module.
@@ -1302,14 +1658,13 @@ LowerTypeTestsModule::LowerTypeTestsModule(
     : M(M), ExportSummary(ExportSummary), ImportSummary(ImportSummary) {
   assert(!(ExportSummary && ImportSummary));
   Triple TargetTriple(M.getTargetTriple());
-  LinkerSubsectionsViaSymbols = TargetTriple.isMacOSX();
   Arch = TargetTriple.getArch();
   OS = TargetTriple.getOS();
   ObjectFormat = TargetTriple.getObjectFormat();
 }
 
 bool LowerTypeTestsModule::runForTesting(Module &M) {
-  ModuleSummaryIndex Summary;
+  ModuleSummaryIndex Summary(/*HaveGVs=*/false);
 
   // Handle the command-line summary arguments. This code is for testing
   // purposes only, so we handle errors directly.
@@ -1334,7 +1689,7 @@ bool LowerTypeTestsModule::runForTesting(Module &M) {
     ExitOnError ExitOnErr("-lowertypetests-write-summary: " + ClWriteSummary +
                           ": ");
     std::error_code EC;
-    raw_fd_ostream OS(ClWriteSummary, EC, sys::fs::F_Text);
+    raw_fd_ostream OS(ClWriteSummary, EC, sys::fs::OF_Text);
     ExitOnErr(errorCodeToError(EC));
 
     yaml::Output Out(OS);
@@ -1344,26 +1699,118 @@ bool LowerTypeTestsModule::runForTesting(Module &M) {
   return Changed;
 }
 
+static bool isDirectCall(Use& U) {
+  auto *Usr = dyn_cast<CallInst>(U.getUser());
+  if (Usr) {
+    CallSite CS(Usr);
+    if (CS.isCallee(&U))
+      return true;
+  }
+  return false;
+}
+
+void LowerTypeTestsModule::replaceCfiUses(Function *Old, Value *New,
+                                          bool IsJumpTableCanonical) {
+  SmallSetVector<Constant *, 4> Constants;
+  auto UI = Old->use_begin(), E = Old->use_end();
+  for (; UI != E;) {
+    Use &U = *UI;
+    ++UI;
+
+    // Skip block addresses
+    if (isa<BlockAddress>(U.getUser()))
+      continue;
+
+    // Skip direct calls to externally defined or non-dso_local functions
+    if (isDirectCall(U) && (Old->isDSOLocal() || !IsJumpTableCanonical))
+      continue;
+
+    // Must handle Constants specially, we cannot call replaceUsesOfWith on a
+    // constant because they are uniqued.
+    if (auto *C = dyn_cast<Constant>(U.getUser())) {
+      if (!isa<GlobalValue>(C)) {
+        // Save unique users to avoid processing operand replacement
+        // more than once.
+        Constants.insert(C);
+        continue;
+      }
+    }
+
+    U.set(New);
+  }
+
+  // Process operand replacement of saved constants.
+  for (auto *C : Constants)
+    C->handleOperandChange(Old, New);
+}
+
+void LowerTypeTestsModule::replaceDirectCalls(Value *Old, Value *New) {
+  Old->replaceUsesWithIf(New, [](Use &U) { return isDirectCall(U); });
+}
+
 bool LowerTypeTestsModule::lower() {
+  // If only some of the modules were split, we cannot correctly perform
+  // this transformation. We already checked for the presense of type tests
+  // with partially split modules during the thin link, and would have emitted
+  // an error if any were found, so here we can simply return.
+  if ((ExportSummary && ExportSummary->partiallySplitLTOUnits()) ||
+      (ImportSummary && ImportSummary->partiallySplitLTOUnits()))
+    return false;
+
   Function *TypeTestFunc =
       M.getFunction(Intrinsic::getName(Intrinsic::type_test));
-  if ((!TypeTestFunc || TypeTestFunc->use_empty()) && !ExportSummary)
+  Function *ICallBranchFunnelFunc =
+      M.getFunction(Intrinsic::getName(Intrinsic::icall_branch_funnel));
+  if ((!TypeTestFunc || TypeTestFunc->use_empty()) &&
+      (!ICallBranchFunnelFunc || ICallBranchFunnelFunc->use_empty()) &&
+      !ExportSummary && !ImportSummary)
     return false;
 
   if (ImportSummary) {
-    for (auto UI = TypeTestFunc->use_begin(), UE = TypeTestFunc->use_end();
-         UI != UE;) {
-      auto *CI = cast<CallInst>((*UI++).getUser());
-      importTypeTest(CI);
+    if (TypeTestFunc) {
+      for (auto UI = TypeTestFunc->use_begin(), UE = TypeTestFunc->use_end();
+           UI != UE;) {
+        auto *CI = cast<CallInst>((*UI++).getUser());
+        importTypeTest(CI);
+      }
     }
+
+    if (ICallBranchFunnelFunc && !ICallBranchFunnelFunc->use_empty())
+      report_fatal_error(
+          "unexpected call to llvm.icall.branch.funnel during import phase");
+
+    SmallVector<Function *, 8> Defs;
+    SmallVector<Function *, 8> Decls;
+    for (auto &F : M) {
+      // CFI functions are either external, or promoted. A local function may
+      // have the same name, but it's not the one we are looking for.
+      if (F.hasLocalLinkage())
+        continue;
+      if (ImportSummary->cfiFunctionDefs().count(F.getName()))
+        Defs.push_back(&F);
+      else if (ImportSummary->cfiFunctionDecls().count(F.getName()))
+        Decls.push_back(&F);
+    }
+
+    std::vector<GlobalAlias *> AliasesToErase;
+    {
+      ScopedSaveAliaseesAndUsed S(M);
+      for (auto F : Defs)
+        importFunction(F, /*isJumpTableCanonical*/ true, AliasesToErase);
+      for (auto F : Decls)
+        importFunction(F, /*isJumpTableCanonical*/ false, AliasesToErase);
+    }
+    for (GlobalAlias *GA : AliasesToErase)
+      GA->eraseFromParent();
+
     return true;
   }
 
   // Equivalence class set containing type identifiers and the globals that
   // reference them. This is used to partition the set of type identifiers in
   // the module into disjoint sets.
-  typedef EquivalenceClasses<PointerUnion<GlobalTypeMember *, Metadata *>>
-      GlobalClassesTy;
+  using GlobalClassesTy = EquivalenceClasses<
+      PointerUnion3<GlobalTypeMember *, Metadata *, ICallBranchFunnel *>>;
   GlobalClassesTy GlobalClasses;
 
   // Verify the type metadata and build a few data structures to let us
@@ -1375,26 +1822,155 @@ bool LowerTypeTestsModule::lower() {
   // identifiers.
   BumpPtrAllocator Alloc;
   struct TIInfo {
-    unsigned Index;
+    unsigned UniqueId;
     std::vector<GlobalTypeMember *> RefGlobals;
   };
-  llvm::DenseMap<Metadata *, TIInfo> TypeIdInfo;
-  unsigned I = 0;
+  DenseMap<Metadata *, TIInfo> TypeIdInfo;
+  unsigned CurUniqueId = 0;
   SmallVector<MDNode *, 2> Types;
+
+  // Cross-DSO CFI emits jumptable entries for exported functions as well as
+  // address taken functions in case they are address taken in other modules.
+  const bool CrossDsoCfi = M.getModuleFlag("Cross-DSO CFI") != nullptr;
+
+  struct ExportedFunctionInfo {
+    CfiFunctionLinkage Linkage;
+    MDNode *FuncMD; // {name, linkage, type[, type...]}
+  };
+  DenseMap<StringRef, ExportedFunctionInfo> ExportedFunctions;
+  if (ExportSummary) {
+    // A set of all functions that are address taken by a live global object.
+    DenseSet<GlobalValue::GUID> AddressTaken;
+    for (auto &I : *ExportSummary)
+      for (auto &GVS : I.second.SummaryList)
+        if (GVS->isLive())
+          for (auto &Ref : GVS->refs())
+            AddressTaken.insert(Ref.getGUID());
+
+    NamedMDNode *CfiFunctionsMD = M.getNamedMetadata("cfi.functions");
+    if (CfiFunctionsMD) {
+      for (auto FuncMD : CfiFunctionsMD->operands()) {
+        assert(FuncMD->getNumOperands() >= 2);
+        StringRef FunctionName =
+            cast<MDString>(FuncMD->getOperand(0))->getString();
+        CfiFunctionLinkage Linkage = static_cast<CfiFunctionLinkage>(
+            cast<ConstantAsMetadata>(FuncMD->getOperand(1))
+                ->getValue()
+                ->getUniqueInteger()
+                .getZExtValue());
+        const GlobalValue::GUID GUID = GlobalValue::getGUID(
+                GlobalValue::dropLLVMManglingEscape(FunctionName));
+        // Do not emit jumptable entries for functions that are not-live and
+        // have no live references (and are not exported with cross-DSO CFI.)
+        if (!ExportSummary->isGUIDLive(GUID))
+          continue;
+        if (!AddressTaken.count(GUID)) {
+          if (!CrossDsoCfi || Linkage != CFL_Definition)
+            continue;
+
+          bool Exported = false;
+          if (auto VI = ExportSummary->getValueInfo(GUID))
+            for (auto &GVS : VI.getSummaryList())
+              if (GVS->isLive() && !GlobalValue::isLocalLinkage(GVS->linkage()))
+                Exported = true;
+
+          if (!Exported)
+            continue;
+        }
+        auto P = ExportedFunctions.insert({FunctionName, {Linkage, FuncMD}});
+        if (!P.second && P.first->second.Linkage != CFL_Definition)
+          P.first->second = {Linkage, FuncMD};
+      }
+
+      for (const auto &P : ExportedFunctions) {
+        StringRef FunctionName = P.first;
+        CfiFunctionLinkage Linkage = P.second.Linkage;
+        MDNode *FuncMD = P.second.FuncMD;
+        Function *F = M.getFunction(FunctionName);
+        if (F && F->hasLocalLinkage()) {
+          // Locally defined function that happens to have the same name as a
+          // function defined in a ThinLTO module. Rename it to move it out of
+          // the way of the external reference that we're about to create.
+          // Note that setName will find a unique name for the function, so even
+          // if there is an existing function with the suffix there won't be a
+          // name collision.
+          F->setName(F->getName() + ".1");
+          F = nullptr;
+        }
+
+        if (!F)
+          F = Function::Create(
+              FunctionType::get(Type::getVoidTy(M.getContext()), false),
+              GlobalVariable::ExternalLinkage,
+              M.getDataLayout().getProgramAddressSpace(), FunctionName, &M);
+
+        // If the function is available_externally, remove its definition so
+        // that it is handled the same way as a declaration. Later we will try
+        // to create an alias using this function's linkage, which will fail if
+        // the linkage is available_externally. This will also result in us
+        // following the code path below to replace the type metadata.
+        if (F->hasAvailableExternallyLinkage()) {
+          F->setLinkage(GlobalValue::ExternalLinkage);
+          F->deleteBody();
+          F->setComdat(nullptr);
+          F->clearMetadata();
+        }
+
+        // Update the linkage for extern_weak declarations when a definition
+        // exists.
+        if (Linkage == CFL_Definition && F->hasExternalWeakLinkage())
+          F->setLinkage(GlobalValue::ExternalLinkage);
+
+        // If the function in the full LTO module is a declaration, replace its
+        // type metadata with the type metadata we found in cfi.functions. That
+        // metadata is presumed to be more accurate than the metadata attached
+        // to the declaration.
+        if (F->isDeclaration()) {
+          if (Linkage == CFL_WeakDeclaration)
+            F->setLinkage(GlobalValue::ExternalWeakLinkage);
+
+          F->eraseMetadata(LLVMContext::MD_type);
+          for (unsigned I = 2; I < FuncMD->getNumOperands(); ++I)
+            F->addMetadata(LLVMContext::MD_type,
+                           *cast<MDNode>(FuncMD->getOperand(I).get()));
+        }
+      }
+    }
+  }
+
+  DenseMap<GlobalObject *, GlobalTypeMember *> GlobalTypeMembers;
   for (GlobalObject &GO : M.global_objects()) {
     if (isa<GlobalVariable>(GO) && GO.isDeclarationForLinker())
       continue;
 
     Types.clear();
     GO.getMetadata(LLVMContext::MD_type, Types);
-    if (Types.empty())
-      continue;
 
-    auto *GTM = GlobalTypeMember::create(Alloc, &GO, Types);
+    bool IsJumpTableCanonical = false;
+    bool IsExported = false;
+    if (Function *F = dyn_cast<Function>(&GO)) {
+      IsJumpTableCanonical = isJumpTableCanonical(F);
+      if (ExportedFunctions.count(F->getName())) {
+        IsJumpTableCanonical |=
+            ExportedFunctions[F->getName()].Linkage == CFL_Definition;
+        IsExported = true;
+      // TODO: The logic here checks only that the function is address taken,
+      // not that the address takers are live. This can be updated to check
+      // their liveness and emit fewer jumptable entries once monolithic LTO
+      // builds also emit summaries.
+      } else if (!F->hasAddressTaken()) {
+        if (!CrossDsoCfi || !IsJumpTableCanonical || F->hasLocalLinkage())
+          continue;
+      }
+    }
+
+    auto *GTM = GlobalTypeMember::create(Alloc, &GO, IsJumpTableCanonical,
+                                         IsExported, Types);
+    GlobalTypeMembers[&GO] = GTM;
     for (MDNode *Type : Types) {
       verifyTypeMDNode(&GO, Type);
-      auto &Info = TypeIdInfo[cast<MDNode>(Type)->getOperand(1)];
-      Info.Index = ++I;
+      auto &Info = TypeIdInfo[Type->getOperand(1)];
+      Info.UniqueId = ++CurUniqueId;
       Info.RefGlobals.push_back(GTM);
     }
   }
@@ -1431,6 +2007,44 @@ bool LowerTypeTestsModule::lower() {
     }
   }
 
+  if (ICallBranchFunnelFunc) {
+    for (const Use &U : ICallBranchFunnelFunc->uses()) {
+      if (Arch != Triple::x86_64)
+        report_fatal_error(
+            "llvm.icall.branch.funnel not supported on this target");
+
+      auto CI = cast<CallInst>(U.getUser());
+
+      std::vector<GlobalTypeMember *> Targets;
+      if (CI->getNumArgOperands() % 2 != 1)
+        report_fatal_error("number of arguments should be odd");
+
+      GlobalClassesTy::member_iterator CurSet;
+      for (unsigned I = 1; I != CI->getNumArgOperands(); I += 2) {
+        int64_t Offset;
+        auto *Base = dyn_cast<GlobalObject>(GetPointerBaseWithConstantOffset(
+            CI->getOperand(I), Offset, M.getDataLayout()));
+        if (!Base)
+          report_fatal_error(
+              "Expected branch funnel operand to be global value");
+
+        GlobalTypeMember *GTM = GlobalTypeMembers[Base];
+        Targets.push_back(GTM);
+        GlobalClassesTy::member_iterator NewSet =
+            GlobalClasses.findLeader(GlobalClasses.insert(GTM));
+        if (I == 1)
+          CurSet = NewSet;
+        else
+          CurSet = GlobalClasses.unionSets(CurSet, NewSet);
+      }
+
+      GlobalClasses.unionSets(
+          CurSet, GlobalClasses.findLeader(
+                      GlobalClasses.insert(ICallBranchFunnel::create(
+                          Alloc, CI, Targets, ++CurUniqueId))));
+    }
+  }
+
   if (ExportSummary) {
     DenseMap<GlobalValue::GUID, TinyPtrVector<Metadata *>> MetadataByGUID;
     for (auto &P : TypeIdInfo) {
@@ -1440,14 +2054,13 @@ bool LowerTypeTestsModule::lower() {
     }
 
     for (auto &P : *ExportSummary) {
-      for (auto &S : P.second) {
-        auto *FS = dyn_cast<FunctionSummary>(S.get());
-        if (!FS)
+      for (auto &S : P.second.SummaryList) {
+        if (!ExportSummary->isGlobalValueLive(S.get()))
           continue;
-        // FIXME: Only add live functions.
-        for (GlobalValue::GUID G : FS->type_tests())
-          for (Metadata *MD : MetadataByGUID[G])
-            AddTypeIdUse(MD).IsExported = true;
+        if (auto *FS = dyn_cast<FunctionSummary>(S->getBaseObject()))
+          for (GlobalValue::GUID G : FS->type_tests())
+            for (Metadata *MD : MetadataByGUID[G])
+              AddTypeIdUse(MD).IsExported = true;
       }
     }
   }
@@ -1465,54 +2078,124 @@ bool LowerTypeTestsModule::lower() {
       continue;
     ++NumTypeIdDisjointSets;
 
-    unsigned MaxIndex = 0;
+    unsigned MaxUniqueId = 0;
     for (GlobalClassesTy::member_iterator MI = GlobalClasses.member_begin(I);
          MI != GlobalClasses.member_end(); ++MI) {
-      if ((*MI).is<Metadata *>())
-        MaxIndex = std::max(MaxIndex, TypeIdInfo[MI->get<Metadata *>()].Index);
+      if (auto *MD = MI->dyn_cast<Metadata *>())
+        MaxUniqueId = std::max(MaxUniqueId, TypeIdInfo[MD].UniqueId);
+      else if (auto *BF = MI->dyn_cast<ICallBranchFunnel *>())
+        MaxUniqueId = std::max(MaxUniqueId, BF->UniqueId);
     }
-    Sets.emplace_back(I, MaxIndex);
+    Sets.emplace_back(I, MaxUniqueId);
   }
-  std::sort(Sets.begin(), Sets.end(),
-            [](const std::pair<GlobalClassesTy::iterator, unsigned> &S1,
-               const std::pair<GlobalClassesTy::iterator, unsigned> &S2) {
-              return S1.second < S2.second;
-            });
+  llvm::sort(Sets,
+             [](const std::pair<GlobalClassesTy::iterator, unsigned> &S1,
+                const std::pair<GlobalClassesTy::iterator, unsigned> &S2) {
+               return S1.second < S2.second;
+             });
 
   // For each disjoint set we found...
   for (const auto &S : Sets) {
     // Build the list of type identifiers in this disjoint set.
     std::vector<Metadata *> TypeIds;
     std::vector<GlobalTypeMember *> Globals;
+    std::vector<ICallBranchFunnel *> ICallBranchFunnels;
     for (GlobalClassesTy::member_iterator MI =
              GlobalClasses.member_begin(S.first);
          MI != GlobalClasses.member_end(); ++MI) {
-      if ((*MI).is<Metadata *>())
+      if (MI->is<Metadata *>())
         TypeIds.push_back(MI->get<Metadata *>());
-      else
+      else if (MI->is<GlobalTypeMember *>())
         Globals.push_back(MI->get<GlobalTypeMember *>());
+      else
+        ICallBranchFunnels.push_back(MI->get<ICallBranchFunnel *>());
     }
 
-    // Order type identifiers by global index for determinism. This ordering is
-    // stable as there is a one-to-one mapping between metadata and indices.
-    std::sort(TypeIds.begin(), TypeIds.end(), [&](Metadata *M1, Metadata *M2) {
-      return TypeIdInfo[M1].Index < TypeIdInfo[M2].Index;
+    // Order type identifiers by unique ID for determinism. This ordering is
+    // stable as there is a one-to-one mapping between metadata and unique IDs.
+    llvm::sort(TypeIds, [&](Metadata *M1, Metadata *M2) {
+      return TypeIdInfo[M1].UniqueId < TypeIdInfo[M2].UniqueId;
     });
 
+    // Same for the branch funnels.
+    llvm::sort(ICallBranchFunnels,
+               [&](ICallBranchFunnel *F1, ICallBranchFunnel *F2) {
+                 return F1->UniqueId < F2->UniqueId;
+               });
+
     // Build bitsets for this disjoint set.
-    buildBitSetsFromDisjointSet(TypeIds, Globals);
+    buildBitSetsFromDisjointSet(TypeIds, Globals, ICallBranchFunnels);
   }
 
   allocateByteArrays();
+
+  // Parse alias data to replace stand-in function declarations for aliases
+  // with an alias to the intended target.
+  if (ExportSummary) {
+    if (NamedMDNode *AliasesMD = M.getNamedMetadata("aliases")) {
+      for (auto AliasMD : AliasesMD->operands()) {
+        assert(AliasMD->getNumOperands() >= 4);
+        StringRef AliasName =
+            cast<MDString>(AliasMD->getOperand(0))->getString();
+        StringRef Aliasee = cast<MDString>(AliasMD->getOperand(1))->getString();
+
+        if (!ExportedFunctions.count(Aliasee) ||
+            ExportedFunctions[Aliasee].Linkage != CFL_Definition ||
+            !M.getNamedAlias(Aliasee))
+          continue;
+
+        GlobalValue::VisibilityTypes Visibility =
+            static_cast<GlobalValue::VisibilityTypes>(
+                cast<ConstantAsMetadata>(AliasMD->getOperand(2))
+                    ->getValue()
+                    ->getUniqueInteger()
+                    .getZExtValue());
+        bool Weak =
+            static_cast<bool>(cast<ConstantAsMetadata>(AliasMD->getOperand(3))
+                                  ->getValue()
+                                  ->getUniqueInteger()
+                                  .getZExtValue());
+
+        auto *Alias = GlobalAlias::create("", M.getNamedAlias(Aliasee));
+        Alias->setVisibility(Visibility);
+        if (Weak)
+          Alias->setLinkage(GlobalValue::WeakAnyLinkage);
+
+        if (auto *F = M.getFunction(AliasName)) {
+          Alias->takeName(F);
+          F->replaceAllUsesWith(Alias);
+          F->eraseFromParent();
+        } else {
+          Alias->setName(AliasName);
+        }
+      }
+    }
+  }
+
+  // Emit .symver directives for exported functions, if they exist.
+  if (ExportSummary) {
+    if (NamedMDNode *SymversMD = M.getNamedMetadata("symvers")) {
+      for (auto Symver : SymversMD->operands()) {
+        assert(Symver->getNumOperands() >= 2);
+        StringRef SymbolName =
+            cast<MDString>(Symver->getOperand(0))->getString();
+        StringRef Alias = cast<MDString>(Symver->getOperand(1))->getString();
+
+        if (!ExportedFunctions.count(SymbolName))
+          continue;
+
+        M.appendModuleInlineAsm(
+            (llvm::Twine(".symver ") + SymbolName + ", " + Alias).str());
+      }
+    }
+  }
 
   return true;
 }
 
 PreservedAnalyses LowerTypeTestsPass::run(Module &M,
                                           ModuleAnalysisManager &AM) {
-  bool Changed = LowerTypeTestsModule(M, /*ExportSummary=*/nullptr,
-                                      /*ImportSummary=*/nullptr)
-                     .lower();
+  bool Changed = LowerTypeTestsModule(M, ExportSummary, ImportSummary).lower();
   if (!Changed)
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();

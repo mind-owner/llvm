@@ -1,19 +1,18 @@
 //===-- HexagonMCExpr.cpp - Hexagon specific MC expression classes
 //----------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "HexagonMCExpr.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbolELF.h"
 #include "llvm/MC/MCValue.h"
-#include "llvm/Object/ELF.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
@@ -94,9 +93,9 @@ void HexagonMCExpr::setMustNotExtend(bool Val) {
 }
 bool HexagonMCExpr::mustNotExtend() const { return MustNotExtend; }
 
-bool HexagonMCExpr::s23_2_reloc() const { return S23_2_reloc; }
-void HexagonMCExpr::setS23_2_reloc(bool Val) {
-  S23_2_reloc = Val;
+bool HexagonMCExpr::s27_2_reloc() const { return S27_2_reloc; }
+void HexagonMCExpr::setS27_2_reloc(bool Val) {
+  S27_2_reloc = Val;
 }
 
 bool HexagonMCExpr::classof(MCExpr const *E) {
@@ -104,7 +103,7 @@ bool HexagonMCExpr::classof(MCExpr const *E) {
 }
 
 HexagonMCExpr::HexagonMCExpr(MCExpr const *Expr)
-    : Expr(Expr), MustNotExtend(false), MustExtend(false), S23_2_reloc(false),
+    : Expr(Expr), MustNotExtend(false), MustExtend(false), S27_2_reloc(false),
       SignMismatch(false) {}
 
 void HexagonMCExpr::printImpl(raw_ostream &OS, const MCAsmInfo *MAI) const {

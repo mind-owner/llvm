@@ -1,15 +1,30 @@
 from __future__ import absolute_import
+import difflib
+import errno
+import functools
+import io
+import itertools
+import getopt
+import locale
 import os, signal, subprocess, sys
 import re
+import stat
 import platform
+import shutil
 import tempfile
 import threading
+
+import io
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
 
 from lit.ShCommands import GlobItem
 import lit.ShUtil as ShUtil
 import lit.Test as Test
 import lit.util
-from lit.util import to_bytes, to_string
+from lit.util import to_bytes, to_string, to_unicode
 from lit.BooleanExpression import BooleanExpression
 
 class InternalShellError(Exception):
@@ -24,6 +39,18 @@ kUseCloseFDs = not kIsWindows
 
 # Use temporary files to replace /dev/null on Windows.
 kAvoidDevNull = kIsWindows
+kDevNull = "/dev/null"
+
+# A regex that matches %dbg(ARG), which lit inserts at the beginning of each
+# run command pipeline such that ARG specifies the pipeline's source line
+# number.  lit later expands each %dbg(ARG) to a command that behaves as a null
+# command in the target shell so that the line number is seen in lit's verbose
+# mode.
+#
+# This regex captures ARG.  ARG must not contain a right parenthesis, which
+# terminates %dbg.  ARG must not contain quotes, in which ARG might be enclosed
+# during expansion.
+kPdbgRegex = '%dbg\\(([^)\'"]*)\\)'
 
 class ShellEnvironment(object):
 
@@ -144,7 +171,7 @@ def executeShCmd(cmd, shenv, results, timeout=0):
 
 def expand_glob(arg, cwd):
     if isinstance(arg, GlobItem):
-        return arg.resolve(cwd)
+        return sorted(arg.resolve(cwd))
     return [arg]
 
 def expand_glob_expressions(args, cwd):
@@ -209,17 +236,537 @@ def quote_windows_command(seq):
 
     return ''.join(result)
 
-# cmd is export or env
-def updateEnv(env, cmd):
-    arg_idx = 1
-    for arg_idx, arg in enumerate(cmd.args[1:]):
+# args are from 'export' or 'env' command.
+# Returns copy of args without those commands or their arguments.
+def updateEnv(env, args):
+    arg_idx_next = len(args)
+    unset_next_env_var = False
+    for arg_idx, arg in enumerate(args[1:]):
+        # Support for the -u flag (unsetting) for env command
+        # e.g., env -u FOO -u BAR will remove both FOO and BAR
+        # from the environment.
+        if arg == '-u':
+            unset_next_env_var = True
+            continue
+        if unset_next_env_var:
+            unset_next_env_var = False
+            if arg in env.env:
+                del env.env[arg]
+            continue
+
         # Partition the string into KEY=VALUE.
         key, eq, val = arg.partition('=')
         # Stop if there was no equals.
         if eq == '':
+            arg_idx_next = arg_idx + 1
             break
         env.env[key] = val
-    cmd.args = cmd.args[arg_idx+1:]
+    return args[arg_idx_next:]
+
+def executeBuiltinEcho(cmd, shenv):
+    """Interpret a redirected echo command"""
+    opened_files = []
+    stdin, stdout, stderr = processRedirects(cmd, subprocess.PIPE, shenv,
+                                             opened_files)
+    if stdin != subprocess.PIPE or stderr != subprocess.PIPE:
+        raise InternalShellError(
+                cmd, "stdin and stderr redirects not supported for echo")
+
+    # Some tests have un-redirected echo commands to help debug test failures.
+    # Buffer our output and return it to the caller.
+    is_redirected = True
+    encode = lambda x : x
+    if stdout == subprocess.PIPE:
+        is_redirected = False
+        stdout = StringIO()
+    elif kIsWindows:
+        # Reopen stdout in binary mode to avoid CRLF translation. The versions
+        # of echo we are replacing on Windows all emit plain LF, and the LLVM
+        # tests now depend on this.
+        # When we open as binary, however, this also means that we have to write
+        # 'bytes' objects to stdout instead of 'str' objects.
+        encode = lit.util.to_bytes
+        stdout = open(stdout.name, stdout.mode + 'b')
+        opened_files.append((None, None, stdout, None))
+
+    # Implement echo flags. We only support -e and -n, and not yet in
+    # combination. We have to ignore unknown flags, because `echo "-D FOO"`
+    # prints the dash.
+    args = cmd.args[1:]
+    interpret_escapes = False
+    write_newline = True
+    while len(args) >= 1 and args[0] in ('-e', '-n'):
+        flag = args[0]
+        args = args[1:]
+        if flag == '-e':
+            interpret_escapes = True
+        elif flag == '-n':
+            write_newline = False
+
+    def maybeUnescape(arg):
+        if not interpret_escapes:
+            return arg
+
+        arg = lit.util.to_bytes(arg)
+        codec = 'string_escape' if sys.version_info < (3,0) else 'unicode_escape'
+        return arg.decode(codec)
+
+    if args:
+        for arg in args[:-1]:
+            stdout.write(encode(maybeUnescape(arg)))
+            stdout.write(encode(' '))
+        stdout.write(encode(maybeUnescape(args[-1])))
+    if write_newline:
+        stdout.write(encode('\n'))
+
+    for (name, mode, f, path) in opened_files:
+        f.close()
+
+    if not is_redirected:
+        return stdout.getvalue()
+    return ""
+
+def executeBuiltinMkdir(cmd, cmd_shenv):
+    """executeBuiltinMkdir - Create new directories."""
+    args = expand_glob_expressions(cmd.args, cmd_shenv.cwd)[1:]
+    try:
+        opts, args = getopt.gnu_getopt(args, 'p')
+    except getopt.GetoptError as err:
+        raise InternalShellError(cmd, "Unsupported: 'mkdir':  %s" % str(err))
+
+    parent = False
+    for o, a in opts:
+        if o == "-p":
+            parent = True
+        else:
+            assert False, "unhandled option"
+
+    if len(args) == 0:
+        raise InternalShellError(cmd, "Error: 'mkdir' is missing an operand")
+
+    stderr = StringIO()
+    exitCode = 0
+    for dir in args:
+        cwd = cmd_shenv.cwd
+        dir = to_unicode(dir) if kIsWindows else to_bytes(dir)
+        cwd = to_unicode(cwd) if kIsWindows else to_bytes(cwd)
+        if not os.path.isabs(dir):
+            dir = os.path.realpath(os.path.join(cwd, dir))
+        if parent:
+            lit.util.mkdir_p(dir)
+        else:
+            try:
+                lit.util.mkdir(dir)
+            except OSError as err:
+                stderr.write("Error: 'mkdir' command failed, %s\n" % str(err))
+                exitCode = 1
+    return ShellCommandResult(cmd, "", stderr.getvalue(), exitCode, False)
+
+def executeBuiltinDiff(cmd, cmd_shenv):
+    """executeBuiltinDiff - Compare files line by line."""
+    args = expand_glob_expressions(cmd.args, cmd_shenv.cwd)[1:]
+    try:
+        opts, args = getopt.gnu_getopt(args, "wbuU:r", ["strip-trailing-cr"])
+    except getopt.GetoptError as err:
+        raise InternalShellError(cmd, "Unsupported: 'diff':  %s" % str(err))
+
+    filelines, filepaths, dir_trees = ([] for i in range(3))
+    ignore_all_space = False
+    ignore_space_change = False
+    unified_diff = False
+    num_context_lines = 3
+    recursive_diff = False
+    strip_trailing_cr = False
+    for o, a in opts:
+        if o == "-w":
+            ignore_all_space = True
+        elif o == "-b":
+            ignore_space_change = True
+        elif o == "-u":
+            unified_diff = True
+        elif o.startswith("-U"):
+            unified_diff = True
+            try:
+                num_context_lines = int(a)
+                if num_context_lines < 0:
+                    raise ValueException
+            except:
+                raise InternalShellError(cmd,
+                                         "Error: invalid '-U' argument: {}\n"
+                                         .format(a))
+        elif o == "-r":
+            recursive_diff = True
+        elif o == "--strip-trailing-cr":
+            strip_trailing_cr = True
+        else:
+            assert False, "unhandled option"
+
+    if len(args) != 2:
+        raise InternalShellError(cmd, "Error:  missing or extra operand")
+
+    def getDirTree(path, basedir=""):
+        # Tree is a tuple of form (dirname, child_trees).
+        # An empty dir has child_trees = [], a file has child_trees = None.
+        child_trees = []
+        for dirname, child_dirs, files in os.walk(os.path.join(basedir, path)):
+            for child_dir in child_dirs:
+                child_trees.append(getDirTree(child_dir, dirname))
+            for filename in files:
+                child_trees.append((filename, None))
+            return path, sorted(child_trees)
+
+    def compareTwoFiles(filepaths):
+        filelines = []
+        for file in filepaths:
+            with open(file, 'rb') as file_bin:
+                filelines.append(file_bin.readlines())
+
+        try:
+            return compareTwoTextFiles(filepaths, filelines,
+                                       locale.getpreferredencoding(False))
+        except UnicodeDecodeError:
+            try:
+                return compareTwoTextFiles(filepaths, filelines, "utf-8")
+            except:
+                return compareTwoBinaryFiles(filepaths, filelines)
+
+    def compareTwoBinaryFiles(filepaths, filelines):
+        exitCode = 0
+        if hasattr(difflib, 'diff_bytes'):
+            # python 3.5 or newer
+            diffs = difflib.diff_bytes(difflib.unified_diff, filelines[0],
+                                       filelines[1], filepaths[0].encode(),
+                                       filepaths[1].encode(),
+                                       n = num_context_lines)
+            diffs = [diff.decode(errors="backslashreplace") for diff in diffs]
+        else:
+            # python 2.7
+            func = difflib.unified_diff if unified_diff else difflib.context_diff
+            diffs = func(filelines[0], filelines[1], filepaths[0], filepaths[1],
+                         n = num_context_lines)
+
+        for diff in diffs:
+            stdout.write(to_string(diff))
+            exitCode = 1
+        return exitCode
+
+    def compareTwoTextFiles(filepaths, filelines_bin, encoding):
+        filelines = []
+        for lines_bin in filelines_bin:
+            lines = []
+            for line_bin in lines_bin:
+                line = line_bin.decode(encoding=encoding)
+                lines.append(line)
+            filelines.append(lines)
+
+        exitCode = 0
+        def compose2(f, g):
+            return lambda x: f(g(x))
+
+        f = lambda x: x
+        if strip_trailing_cr:
+            f = compose2(lambda line: line.replace('\r\n', '\n'), f)
+        if ignore_all_space or ignore_space_change:
+            ignoreSpace = lambda line, separator: separator.join(line.split())
+            ignoreAllSpaceOrSpaceChange = functools.partial(ignoreSpace, separator='' if ignore_all_space else ' ')
+            f = compose2(ignoreAllSpaceOrSpaceChange, f)
+
+        for idx, lines in enumerate(filelines):
+            filelines[idx]= [f(line) for line in lines]
+
+        func = difflib.unified_diff if unified_diff else difflib.context_diff
+        for diff in func(filelines[0], filelines[1], filepaths[0], filepaths[1],
+                         n = num_context_lines):
+            stdout.write(to_string(diff))
+            exitCode = 1
+        return exitCode
+
+    def printDirVsFile(dir_path, file_path):
+        if os.path.getsize(file_path):
+            msg = "File %s is a directory while file %s is a regular file"
+        else:
+            msg = "File %s is a directory while file %s is a regular empty file"
+        stdout.write(msg % (dir_path, file_path) + "\n")
+
+    def printFileVsDir(file_path, dir_path):
+        if os.path.getsize(file_path):
+            msg = "File %s is a regular file while file %s is a directory"
+        else:
+            msg = "File %s is a regular empty file while file %s is a directory"
+        stdout.write(msg % (file_path, dir_path) + "\n")
+
+    def printOnlyIn(basedir, path, name):
+        stdout.write("Only in %s: %s\n" % (os.path.join(basedir, path), name))
+
+    def compareDirTrees(dir_trees, base_paths=["", ""]):
+        # Dirnames of the trees are not checked, it's caller's responsibility,
+        # as top-level dirnames are always different. Base paths are important
+        # for doing os.walk, but we don't put it into tree's dirname in order
+        # to speed up string comparison below and while sorting in getDirTree.
+        left_tree, right_tree = dir_trees[0], dir_trees[1]
+        left_base, right_base = base_paths[0], base_paths[1]
+
+        # Compare two files or report file vs. directory mismatch.
+        if left_tree[1] is None and right_tree[1] is None:
+            return compareTwoFiles([os.path.join(left_base, left_tree[0]),
+                                    os.path.join(right_base, right_tree[0])])
+
+        if left_tree[1] is None and right_tree[1] is not None:
+            printFileVsDir(os.path.join(left_base, left_tree[0]),
+                           os.path.join(right_base, right_tree[0]))
+            return 1
+
+        if left_tree[1] is not None and right_tree[1] is None:
+            printDirVsFile(os.path.join(left_base, left_tree[0]),
+                           os.path.join(right_base, right_tree[0]))
+            return 1
+
+        # Compare two directories via recursive use of compareDirTrees.
+        exitCode = 0
+        left_names = [node[0] for node in left_tree[1]]
+        right_names = [node[0] for node in right_tree[1]]
+        l, r = 0, 0
+        while l < len(left_names) and r < len(right_names):
+            # Names are sorted in getDirTree, rely on that order.
+            if left_names[l] < right_names[r]:
+                exitCode = 1
+                printOnlyIn(left_base, left_tree[0], left_names[l])
+                l += 1
+            elif left_names[l] > right_names[r]:
+                exitCode = 1
+                printOnlyIn(right_base, right_tree[0], right_names[r])
+                r += 1
+            else:
+                exitCode |= compareDirTrees([left_tree[1][l], right_tree[1][r]],
+                                            [os.path.join(left_base, left_tree[0]),
+                                            os.path.join(right_base, right_tree[0])])
+                l += 1
+                r += 1
+
+        # At least one of the trees has ended. Report names from the other tree.
+        while l < len(left_names):
+            exitCode = 1
+            printOnlyIn(left_base, left_tree[0], left_names[l])
+            l += 1
+        while r < len(right_names):
+            exitCode = 1
+            printOnlyIn(right_base, right_tree[0], right_names[r])
+            r += 1
+        return exitCode
+
+    stderr = StringIO()
+    stdout = StringIO()
+    exitCode = 0
+    try:
+        for file in args:
+            if not os.path.isabs(file):
+                file = os.path.realpath(os.path.join(cmd_shenv.cwd, file))
+    
+            if recursive_diff:
+                dir_trees.append(getDirTree(file))
+            else:
+                filepaths.append(file)
+
+        if not recursive_diff:
+            exitCode = compareTwoFiles(filepaths)
+        else:
+            exitCode = compareDirTrees(dir_trees)
+
+    except IOError as err:
+        stderr.write("Error: 'diff' command failed, %s\n" % str(err))
+        exitCode = 1
+
+    return ShellCommandResult(cmd, stdout.getvalue(), stderr.getvalue(), exitCode, False)
+
+def executeBuiltinRm(cmd, cmd_shenv):
+    """executeBuiltinRm - Removes (deletes) files or directories."""
+    args = expand_glob_expressions(cmd.args, cmd_shenv.cwd)[1:]
+    try:
+        opts, args = getopt.gnu_getopt(args, "frR", ["--recursive"])
+    except getopt.GetoptError as err:
+        raise InternalShellError(cmd, "Unsupported: 'rm':  %s" % str(err))
+
+    force = False
+    recursive = False
+    for o, a in opts:
+        if o == "-f":
+            force = True
+        elif o in ("-r", "-R", "--recursive"):
+            recursive = True
+        else:
+            assert False, "unhandled option"
+
+    if len(args) == 0:
+        raise InternalShellError(cmd, "Error: 'rm' is missing an operand")
+
+    def on_rm_error(func, path, exc_info):
+        # path contains the path of the file that couldn't be removed
+        # let's just assume that it's read-only and remove it.
+        os.chmod(path, stat.S_IMODE( os.stat(path).st_mode) | stat.S_IWRITE)
+        os.remove(path)
+
+    stderr = StringIO()
+    exitCode = 0
+    for path in args:
+        cwd = cmd_shenv.cwd
+        path = to_unicode(path) if kIsWindows else to_bytes(path)
+        cwd = to_unicode(cwd) if kIsWindows else to_bytes(cwd)
+        if not os.path.isabs(path):
+            path = os.path.realpath(os.path.join(cwd, path))
+        if force and not os.path.exists(path):
+            continue
+        try:
+            if os.path.isdir(path):
+                if not recursive:
+                    stderr.write("Error: %s is a directory\n" % path)
+                    exitCode = 1
+                if platform.system() == 'Windows':
+                    # NOTE: use ctypes to access `SHFileOperationsW` on Windows to
+                    # use the NT style path to get access to long file paths which
+                    # cannot be removed otherwise.
+                    from ctypes.wintypes import BOOL, HWND, LPCWSTR, UINT, WORD
+                    from ctypes import addressof, byref, c_void_p, create_unicode_buffer
+                    from ctypes import Structure
+                    from ctypes import windll, WinError, POINTER
+
+                    class SHFILEOPSTRUCTW(Structure):
+                        _fields_ = [
+                                ('hWnd', HWND),
+                                ('wFunc', UINT),
+                                ('pFrom', LPCWSTR),
+                                ('pTo', LPCWSTR),
+                                ('fFlags', WORD),
+                                ('fAnyOperationsAborted', BOOL),
+                                ('hNameMappings', c_void_p),
+                                ('lpszProgressTitle', LPCWSTR),
+                        ]
+
+                    FO_MOVE, FO_COPY, FO_DELETE, FO_RENAME = range(1, 5)
+
+                    FOF_SILENT = 4
+                    FOF_NOCONFIRMATION = 16
+                    FOF_NOCONFIRMMKDIR = 512
+                    FOF_NOERRORUI = 1024
+
+                    FOF_NO_UI = FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR
+
+                    SHFileOperationW = windll.shell32.SHFileOperationW
+                    SHFileOperationW.argtypes = [POINTER(SHFILEOPSTRUCTW)]
+
+                    path = os.path.abspath(path)
+
+                    pFrom = create_unicode_buffer(path, len(path) + 2)
+                    pFrom[len(path)] = pFrom[len(path) + 1] = '\0'
+                    operation = SHFILEOPSTRUCTW(wFunc=UINT(FO_DELETE),
+                                                pFrom=LPCWSTR(addressof(pFrom)),
+                                                fFlags=FOF_NO_UI)
+                    result = SHFileOperationW(byref(operation))
+                    if result:
+                        raise WinError(result)
+                else:
+                    shutil.rmtree(path, onerror = on_rm_error if force else None)
+            else:
+                if force and not os.access(path, os.W_OK):
+                    os.chmod(path,
+                             stat.S_IMODE(os.stat(path).st_mode) | stat.S_IWRITE)
+                os.remove(path)
+        except OSError as err:
+            stderr.write("Error: 'rm' command failed, %s" % str(err))
+            exitCode = 1
+    return ShellCommandResult(cmd, "", stderr.getvalue(), exitCode, False)
+
+def processRedirects(cmd, stdin_source, cmd_shenv, opened_files):
+    """Return the standard fds for cmd after applying redirects
+
+    Returns the three standard file descriptors for the new child process.  Each
+    fd may be an open, writable file object or a sentinel value from the
+    subprocess module.
+    """
+
+    # Apply the redirections, we use (N,) as a sentinel to indicate stdin,
+    # stdout, stderr for N equal to 0, 1, or 2 respectively. Redirects to or
+    # from a file are represented with a list [file, mode, file-object]
+    # where file-object is initially None.
+    redirects = [(0,), (1,), (2,)]
+    for (op, filename) in cmd.redirects:
+        if op == ('>',2):
+            redirects[2] = [filename, 'w', None]
+        elif op == ('>>',2):
+            redirects[2] = [filename, 'a', None]
+        elif op == ('>&',2) and filename in '012':
+            redirects[2] = redirects[int(filename)]
+        elif op == ('>&',) or op == ('&>',):
+            redirects[1] = redirects[2] = [filename, 'w', None]
+        elif op == ('>',):
+            redirects[1] = [filename, 'w', None]
+        elif op == ('>>',):
+            redirects[1] = [filename, 'a', None]
+        elif op == ('<',):
+            redirects[0] = [filename, 'r', None]
+        else:
+            raise InternalShellError(cmd, "Unsupported redirect: %r" % ((op, filename),))
+
+    # Open file descriptors in a second pass.
+    std_fds = [None, None, None]
+    for (index, r) in enumerate(redirects):
+        # Handle the sentinel values for defaults up front.
+        if isinstance(r, tuple):
+            if r == (0,):
+                fd = stdin_source
+            elif r == (1,):
+                if index == 0:
+                    raise InternalShellError(cmd, "Unsupported redirect for stdin")
+                elif index == 1:
+                    fd = subprocess.PIPE
+                else:
+                    fd = subprocess.STDOUT
+            elif r == (2,):
+                if index != 2:
+                    raise InternalShellError(cmd, "Unsupported redirect on stdout")
+                fd = subprocess.PIPE
+            else:
+                raise InternalShellError(cmd, "Bad redirect")
+            std_fds[index] = fd
+            continue
+
+        (filename, mode, fd) = r
+
+        # Check if we already have an open fd. This can happen if stdout and
+        # stderr go to the same place.
+        if fd is not None:
+            std_fds[index] = fd
+            continue
+
+        redir_filename = None
+        name = expand_glob(filename, cmd_shenv.cwd)
+        if len(name) != 1:
+           raise InternalShellError(cmd, "Unsupported: glob in "
+                                    "redirect expanded to multiple files")
+        name = name[0]
+        if kAvoidDevNull and name == kDevNull:
+            fd = tempfile.TemporaryFile(mode=mode)
+        elif kIsWindows and name == '/dev/tty':
+            # Simulate /dev/tty on Windows.
+            # "CON" is a special filename for the console.
+            fd = open("CON", mode)
+        else:
+            # Make sure relative paths are relative to the cwd.
+            redir_filename = os.path.join(cmd_shenv.cwd, name)
+            redir_filename = to_unicode(redir_filename) \
+                    if kIsWindows else to_bytes(redir_filename)
+            fd = open(redir_filename, mode)
+        # Workaround a Win32 and/or subprocess bug when appending.
+        #
+        # FIXME: Actually, this is probably an instance of PR6753.
+        if mode == 'a':
+            fd.seek(0, 2)
+        # Mutate the underlying redirect list so that we can redirect stdout
+        # and stderr to the same place without opening the file twice.
+        r[2] = fd
+        opened_files.append((filename, mode, fd) + (redir_filename,))
+        std_fds[index] = fd
+
+    return std_fds
 
 def _executeShCmd(cmd, shenv, results, timeoutHelper):
     if timeoutHelper.timeoutReached():
@@ -269,98 +816,82 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         # following Popen calls will fail instead.
         return 0
 
+    # Handle "echo" as a builtin if it is not part of a pipeline. This greatly
+    # speeds up tests that construct input files by repeatedly echo-appending to
+    # a file.
+    # FIXME: Standardize on the builtin echo implementation. We can use a
+    # temporary file to sidestep blocking pipe write issues.
+    if cmd.commands[0].args[0] == 'echo' and len(cmd.commands) == 1:
+        output = executeBuiltinEcho(cmd.commands[0], shenv)
+        results.append(ShellCommandResult(cmd.commands[0], output, "", 0,
+                                          False))
+        return 0
+
     if cmd.commands[0].args[0] == 'export':
         if len(cmd.commands) != 1:
             raise ValueError("'export' cannot be part of a pipeline")
         if len(cmd.commands[0].args) != 2:
             raise ValueError("'export' supports only one argument")
-        updateEnv(shenv, cmd.commands[0])
+        updateEnv(shenv, cmd.commands[0].args)
         return 0
 
+    if cmd.commands[0].args[0] == 'mkdir':
+        if len(cmd.commands) != 1:
+            raise InternalShellError(cmd.commands[0], "Unsupported: 'mkdir' "
+                                     "cannot be part of a pipeline")
+        cmdResult = executeBuiltinMkdir(cmd.commands[0], shenv)
+        results.append(cmdResult)
+        return cmdResult.exitCode
+
+    if cmd.commands[0].args[0] == 'diff':
+        if len(cmd.commands) != 1:
+            raise InternalShellError(cmd.commands[0], "Unsupported: 'diff' "
+                                     "cannot be part of a pipeline")
+        cmdResult = executeBuiltinDiff(cmd.commands[0], shenv)
+        results.append(cmdResult)
+        return cmdResult.exitCode
+
+    if cmd.commands[0].args[0] == 'rm':
+        if len(cmd.commands) != 1:
+            raise InternalShellError(cmd.commands[0], "Unsupported: 'rm' "
+                                     "cannot be part of a pipeline")
+        cmdResult = executeBuiltinRm(cmd.commands[0], shenv)
+        results.append(cmdResult)
+        return cmdResult.exitCode
+
+    if cmd.commands[0].args[0] == ':':
+        if len(cmd.commands) != 1:
+            raise InternalShellError(cmd.commands[0], "Unsupported: ':' "
+                                     "cannot be part of a pipeline")
+        results.append(ShellCommandResult(cmd.commands[0], '', '', 0, False))
+        return 0;
+
     procs = []
-    input = subprocess.PIPE
+    default_stdin = subprocess.PIPE
     stderrTempFiles = []
     opened_files = []
     named_temp_files = []
+    builtin_commands = set(['cat'])
+    builtin_commands_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "builtin_commands")
     # To avoid deadlock, we use a single stderr stream for piped
     # output. This is null until we have seen some output using
     # stderr.
     for i,j in enumerate(cmd.commands):
         # Reference the global environment by default.
         cmd_shenv = shenv
+        args = list(j.args)
         if j.args[0] == 'env':
             # Create a copy of the global environment and modify it for this one
             # command. There might be multiple envs in a pipeline:
             #   env FOO=1 llc < %s | env BAR=2 llvm-mc | FileCheck %s
             cmd_shenv = ShellEnvironment(shenv.cwd, shenv.env)
-            updateEnv(cmd_shenv, j)
+            args = updateEnv(cmd_shenv, j.args)
+            if not args:
+                raise InternalShellError(j,
+                                         "Error: 'env' requires a subcommand")
 
-        # Apply the redirections, we use (N,) as a sentinel to indicate stdin,
-        # stdout, stderr for N equal to 0, 1, or 2 respectively. Redirects to or
-        # from a file are represented with a list [file, mode, file-object]
-        # where file-object is initially None.
-        redirects = [(0,), (1,), (2,)]
-        for r in j.redirects:
-            if r[0] == ('>',2):
-                redirects[2] = [r[1], 'w', None]
-            elif r[0] == ('>>',2):
-                redirects[2] = [r[1], 'a', None]
-            elif r[0] == ('>&',2) and r[1] in '012':
-                redirects[2] = redirects[int(r[1])]
-            elif r[0] == ('>&',) or r[0] == ('&>',):
-                redirects[1] = redirects[2] = [r[1], 'w', None]
-            elif r[0] == ('>',):
-                redirects[1] = [r[1], 'w', None]
-            elif r[0] == ('>>',):
-                redirects[1] = [r[1], 'a', None]
-            elif r[0] == ('<',):
-                redirects[0] = [r[1], 'r', None]
-            else:
-                raise InternalShellError(j,"Unsupported redirect: %r" % (r,))
-
-        # Map from the final redirections to something subprocess can handle.
-        final_redirects = []
-        for index,r in enumerate(redirects):
-            if r == (0,):
-                result = input
-            elif r == (1,):
-                if index == 0:
-                    raise InternalShellError(j,"Unsupported redirect for stdin")
-                elif index == 1:
-                    result = subprocess.PIPE
-                else:
-                    result = subprocess.STDOUT
-            elif r == (2,):
-                if index != 2:
-                    raise InternalShellError(j,"Unsupported redirect on stdout")
-                result = subprocess.PIPE
-            else:
-                if r[2] is None:
-                    redir_filename = None
-                    name = expand_glob(r[0], cmd_shenv.cwd)
-                    if len(name) != 1:
-                       raise InternalShellError(j,"Unsupported: glob in redirect expanded to multiple files")
-                    name = name[0]
-                    if kAvoidDevNull and name == '/dev/null':
-                        r[2] = tempfile.TemporaryFile(mode=r[1])
-                    elif kIsWindows and name == '/dev/tty':
-                        # Simulate /dev/tty on Windows.
-                        # "CON" is a special filename for the console.
-                        r[2] = open("CON", r[1])
-                    else:
-                        # Make sure relative paths are relative to the cwd.
-                        redir_filename = os.path.join(cmd_shenv.cwd, name)
-                        r[2] = open(redir_filename, r[1])
-                    # Workaround a Win32 and/or subprocess bug when appending.
-                    #
-                    # FIXME: Actually, this is probably an instance of PR6753.
-                    if r[1] == 'a':
-                        r[2].seek(0, 2)
-                    opened_files.append(tuple(r) + (redir_filename,))
-                result = r[2]
-            final_redirects.append(result)
-
-        stdin, stdout, stderr = final_redirects
+        stdin, stdout, stderr = processRedirects(j, default_stdin, cmd_shenv,
+                                                 opened_files)
 
         # If stderr wants to come from stdout, but stdout isn't a pipe, then put
         # stderr on a pipe and treat it as stdout.
@@ -379,29 +910,39 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
                 stderrTempFiles.append((i, stderr))
 
         # Resolve the executable path ourselves.
-        args = list(j.args)
         executable = None
-        # For paths relative to cwd, use the cwd of the shell environment.
-        if args[0].startswith('.'):
-            exe_in_cwd = os.path.join(cmd_shenv.cwd, args[0])
-            if os.path.isfile(exe_in_cwd):
-                executable = exe_in_cwd
-        if not executable:
-            executable = lit.util.which(args[0], cmd_shenv.env['PATH'])
-        if not executable:
-            raise InternalShellError(j, '%r: command not found' % j.args[0])
+        is_builtin_cmd = args[0] in builtin_commands;
+        if not is_builtin_cmd:
+            # For paths relative to cwd, use the cwd of the shell environment.
+            if args[0].startswith('.'):
+                exe_in_cwd = os.path.join(cmd_shenv.cwd, args[0])
+                if os.path.isfile(exe_in_cwd):
+                    executable = exe_in_cwd
+            if not executable:
+                executable = lit.util.which(args[0], cmd_shenv.env['PATH'])
+            if not executable:
+                raise InternalShellError(j, '%r: command not found' % args[0])
 
         # Replace uses of /dev/null with temporary files.
         if kAvoidDevNull:
+            # In Python 2.x, basestring is the base class for all string (including unicode)
+            # In Python 3.x, basestring no longer exist and str is always unicode
+            try:
+                str_type = basestring
+            except NameError:
+                str_type = str
             for i,arg in enumerate(args):
-                if arg == "/dev/null":
+                if isinstance(arg, str_type) and kDevNull in arg:
                     f = tempfile.NamedTemporaryFile(delete=False)
                     f.close()
                     named_temp_files.append(f.name)
-                    args[i] = f.name
+                    args[i] = arg.replace(kDevNull, f.name)
 
         # Expand all glob expressions
         args = expand_glob_expressions(args, cmd_shenv.cwd)
+        if is_builtin_cmd:
+            args.insert(0, sys.executable)
+            args[1] = os.path.join(builtin_commands_dir ,args[1] + ".py")
 
         # On Windows, do our own command line quoting for better compatibility
         # with some core utility distributions.
@@ -428,11 +969,11 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
         # Update the current stdin source.
         if stdout == subprocess.PIPE:
-            input = procs[-1].stdout
+            default_stdin = procs[-1].stdout
         elif stderrIsStdout:
-            input = procs[-1].stderr
+            default_stdin = procs[-1].stderr
         else:
-            input = subprocess.PIPE
+            default_stdin = subprocess.PIPE
 
     # Explicitly close any redirected files. We need to do this now because we
     # need to release any handles we may have on the temporary files (important
@@ -460,11 +1001,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
     for i,f in stderrTempFiles:
         f.seek(0, 0)
         procData[i] = (procData[i][0], f.read())
-
-    def to_string(bytes):
-        if isinstance(bytes, str):
-            return bytes
-        return bytes.encode('utf-8')
+        f.close()
 
     exitCode = None
     for i,(out,err) in enumerate(procData):
@@ -506,13 +1043,9 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
             cmd.commands[i], out, err, res, timeoutHelper.timeoutReached(),
             output_files))
         if cmd.pipe_err:
-            # Python treats the exit code as a signed char.
-            if exitCode is None:
+            # Take the last failing exit code from the pipeline.
+            if not exitCode or res != 0:
                 exitCode = res
-            elif res < 0:
-                exitCode = min(exitCode, res)
-            else:
-                exitCode = max(exitCode, res)
         else:
             exitCode = res
 
@@ -530,7 +1063,8 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
 def executeScriptInternal(test, litConfig, tmpBase, commands, cwd):
     cmds = []
-    for ln in commands:
+    for i, ln in enumerate(commands):
+        ln = commands[i] = re.sub(kPdbgRegex, ": '\\1'; ", ln)
         try:
             cmds.append(ShUtil.ShParser(ln, litConfig.isWindows,
                                         test.config.pipefail).parse())
@@ -595,7 +1129,7 @@ def executeScriptInternal(test, litConfig, tmpBase, commands, cwd):
                 codeStr = str(result.exitCode)
             out += "error: command failed with exit status: %s\n" % (
                 codeStr,)
-        if litConfig.maxIndividualTestTime > 0:
+        if litConfig.maxIndividualTestTime > 0 and result.timeoutReached:
             out += 'error: command reached timeout: %s\n' % (
                 str(result.timeoutReached),)
 
@@ -610,16 +1144,32 @@ def executeScript(test, litConfig, tmpBase, commands, cwd):
 
     # Write script file
     mode = 'w'
+    open_kwargs = {}
     if litConfig.isWindows and not isWin32CMDEXE:
-      mode += 'b'  # Avoid CRLFs when writing bash scripts.
-    f = open(script, mode)
+        mode += 'b'  # Avoid CRLFs when writing bash scripts.
+    elif sys.version_info > (3,0):
+        open_kwargs['encoding'] = 'utf-8'
+    f = open(script, mode, **open_kwargs)
     if isWin32CMDEXE:
-        f.write('\nif %ERRORLEVEL% NEQ 0 EXIT\n'.join(commands))
+        for i, ln in enumerate(commands):
+            commands[i] = re.sub(kPdbgRegex, "echo '\\1' > nul && ", ln)
+        if litConfig.echo_all_commands:
+            f.write('@echo on\n')
+        else:
+            f.write('@echo off\n')
+        f.write('\n@if %ERRORLEVEL% NEQ 0 EXIT\n'.join(commands))
     else:
+        for i, ln in enumerate(commands):
+            commands[i] = re.sub(kPdbgRegex, ": '\\1'; ", ln)
         if test.config.pipefail:
-            f.write('set -o pipefail;')
-        f.write('{ ' + '; } &&\n{ '.join(commands) + '; }')
-    f.write('\n')
+            f.write(b'set -o pipefail;' if mode == 'wb' else 'set -o pipefail;')
+        if litConfig.echo_all_commands:
+            f.write(b'set -x;' if mode == 'wb' else 'set -x;')
+        if sys.version_info > (3,0) and mode == 'wb':
+            f.write(bytes('{ ' + '; } &&\n{ '.join(commands) + '; }', 'utf-8'))
+        else:
+            f.write('{ ' + '; } &&\n{ '.join(commands) + '; }')
+    f.write(b'\n' if mode == 'wb' else '\n')
     f.close()
 
     if isWin32CMDEXE:
@@ -688,9 +1238,13 @@ def parseIntegratedTestScriptCommands(source_path, keywords):
             # command. Note that we take care to return regular strings in
             # Python 2, to avoid other code having to differentiate between the
             # str and unicode types.
+            #
+            # Opening the file in binary mode prevented Windows \r newline
+            # characters from being converted to Unix \n newlines, so manually
+            # strip those from the yielded lines.
             keyword,ln = match.groups()
             yield (line_number, to_string(keyword.decode('utf-8')),
-                   to_string(ln.decode('utf-8')))
+                   to_string(ln.decode('utf-8').rstrip('\r')))
     finally:
         f.close()
 
@@ -702,6 +1256,13 @@ def getTempPaths(test):
     tmpDir = os.path.join(execdir, 'Output')
     tmpBase = os.path.join(tmpDir, execbase)
     return tmpDir, tmpBase
+
+def colonNormalizePath(path):
+    if kIsWindows:
+        return re.sub(r'^(.):', r'\1', path.replace('\\', '/'))
+    else:
+        assert path[0] == '/'
+        return path[1:]
 
 def getDefaultSubstitutions(test, tmpDir, tmpBase, normalize_slashes=False):
     sourcepath = test.getSourcePath()
@@ -738,23 +1299,15 @@ def getDefaultSubstitutions(test, tmpDir, tmpBase, normalize_slashes=False):
             ('%/T', tmpDir.replace('\\', '/')),
             ])
 
-    # "%:[STpst]" are paths without colons.
-    if kIsWindows:
-        substitutions.extend([
-                ('%:s', re.sub(r'^(.):', r'\1', sourcepath)),
-                ('%:S', re.sub(r'^(.):', r'\1', sourcedir)),
-                ('%:p', re.sub(r'^(.):', r'\1', sourcedir)),
-                ('%:t', re.sub(r'^(.):', r'\1', tmpBase) + '.tmp'),
-                ('%:T', re.sub(r'^(.):', r'\1', tmpDir)),
-                ])
-    else:
-        substitutions.extend([
-                ('%:s', sourcepath),
-                ('%:S', sourcedir),
-                ('%:p', sourcedir),
-                ('%:t', tmpBase + '.tmp'),
-                ('%:T', tmpDir),
-                ])
+    # "%:[STpst]" are normalized paths without colons and without a leading
+    # slash.
+    substitutions.extend([
+            ('%:s', colonNormalizePath(sourcepath)),
+            ('%:S', colonNormalizePath(sourcedir)),
+            ('%:p', colonNormalizePath(sourcedir)),
+            ('%:t', colonNormalizePath(tmpBase + '.tmp')),
+            ('%:T', colonNormalizePath(tmpDir)),
+            ])
     return substitutions
 
 def applySubstitutions(script, substitutions):
@@ -843,7 +1396,9 @@ class IntegratedTestKeywordParser(object):
         self.parser = parser
 
         if kind == ParserKind.COMMAND:
-            self.parser = self._handleCommand
+            self.parser = lambda line_number, line, output: \
+                                 self._handleCommand(line_number, line, output,
+                                                     self.keyword)
         elif kind == ParserKind.LIST:
             self.parser = self._handleList
         elif kind == ParserKind.BOOLEAN_EXPR:
@@ -874,25 +1429,33 @@ class IntegratedTestKeywordParser(object):
         return (not line.strip() or output)
 
     @staticmethod
-    def _handleCommand(line_number, line, output):
+    def _handleCommand(line_number, line, output, keyword):
         """A helper for parsing COMMAND type keywords"""
         # Trim trailing whitespace.
         line = line.rstrip()
         # Substitute line number expressions
-        line = re.sub('%\(line\)', str(line_number), line)
+        line = re.sub(r'%\(line\)', str(line_number), line)
 
         def replace_line_number(match):
             if match.group(1) == '+':
                 return str(line_number + int(match.group(2)))
             if match.group(1) == '-':
                 return str(line_number - int(match.group(2)))
-        line = re.sub('%\(line *([\+-]) *(\d+)\)', replace_line_number, line)
+        line = re.sub(r'%\(line *([\+-]) *(\d+)\)', replace_line_number, line)
         # Collapse lines with trailing '\\'.
         if output and output[-1][-1] == '\\':
             output[-1] = output[-1][:-1] + line
         else:
             if output is None:
                 output = []
+            pdbg = "%dbg({keyword} at line {line_number})".format(
+                keyword=keyword,
+                line_number=line_number)
+            assert re.match(kPdbgRegex + "$", pdbg), \
+                   "kPdbgRegex expected to match actual %dbg usage"
+            line = "{pdbg} {real_command}".format(
+                pdbg=pdbg,
+                real_command=line)
             output.append(line)
         return output
 
@@ -907,13 +1470,17 @@ class IntegratedTestKeywordParser(object):
     @staticmethod
     def _handleBooleanExpr(line_number, line, output):
         """A parser for BOOLEAN_EXPR type keywords"""
+        parts = [s.strip() for s in line.split(',') if s.strip() != '']
+        if output and output[-1][-1] == '\\':
+            output[-1] = output[-1][:-1] + parts[0]
+            del parts[0]
         if output is None:
             output = []
-        output.extend([s.strip() for s in line.split(',')])
+        output.extend(parts)
         # Evaluate each expression to verify syntax.
         # We don't want any results, just the raised ValueError.
         for s in output:
-            if s != '*':
+            if s != '*' and not s.endswith('\\'):
                 BooleanExpression.evaluate(s, [])
         return output
 
@@ -992,6 +1559,15 @@ def parseIntegratedTestScript(test, additional_parsers=[],
         return lit.Test.Result(Test.UNRESOLVED,
                                "Test has unterminated run lines (with '\\')")
 
+    # Check boolean expressions for unterminated lines.
+    for key in keyword_parsers:
+        kp = keyword_parsers[key]
+        if kp.kind != ParserKind.BOOLEAN_EXPR:
+            continue
+        value = kp.getValue()
+        if value and value[-1][-1] == '\\':
+            raise ValueError("Test has unterminated %s lines (with '\\')" % key)
+
     # Enforce REQUIRES:
     missing_required_features = test.getMissingRequiredFeatures()
     if missing_required_features:
@@ -1060,7 +1636,7 @@ def _runShTest(test, litConfig, useExternalSh, script, tmpBase):
 def executeShTest(test, litConfig, useExternalSh,
                   extra_substitutions=[]):
     if test.config.unsupported:
-        return (Test.UNSUPPORTED, 'Test is unsupported')
+        return lit.Test.Result(Test.UNSUPPORTED, 'Test is unsupported')
 
     script = parseIntegratedTestScript(test)
     if isinstance(script, lit.Test.Result):

@@ -1,6 +1,6 @@
-; RUN: llc -march=amdgcn -mcpu=verde -verify-machineinstrs < %s | FileCheck -check-prefix=SI -check-prefix=GCN -check-prefix=FUNC %s
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=amdgcn -mcpu=verde -verify-machineinstrs < %s | FileCheck -allow-deprecated-dag-overlap -check-prefix=SI -check-prefix=GCN -check-prefix=FUNC %s
 ; XUN: llc -march=amdgcn -mcpu=tonga -mattr=-flat-for-global -verify-machineinstrs < %s | FileCheck -check-prefix=VI -check-prefix=GCN -check-prefix=FUNC %s
-; RUN: llc -march=r600 -mcpu=redwood < %s | FileCheck -check-prefix=EG -check-prefix=FUNC %s
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=r600 -mcpu=redwood < %s | FileCheck -allow-deprecated-dag-overlap -check-prefix=EG -check-prefix=FUNC %s
 
 declare i32 @llvm.r600.read.tidig.x() #0
 
@@ -189,11 +189,11 @@ define amdgpu_kernel void @lshr_v4i64(<4 x i64> addrspace(1)* %out, <4 x i64> ad
 
 ; Make sure load width gets reduced to i32 load.
 ; GCN-LABEL: {{^}}s_lshr_32_i64:
-; GCN-DAG: s_load_dword [[HI_A:s[0-9]+]], s{{\[[0-9]+:[0-9]+\]}}, 0xc{{$}}
+; GCN-DAG: s_load_dword [[HI_A:s[0-9]+]], s{{\[[0-9]+:[0-9]+\]}}, 0x14{{$}}
 ; GCN-DAG: v_mov_b32_e32 v[[VHI:[0-9]+]], 0{{$}}
 ; GCN-DAG: v_mov_b32_e32 v[[VLO:[0-9]+]], [[HI_A]]
 ; GCN: buffer_store_dwordx2 v{{\[}}[[VLO]]:[[VHI]]{{\]}}
-define amdgpu_kernel void @s_lshr_32_i64(i64 addrspace(1)* %out, i64 %a) {
+define amdgpu_kernel void @s_lshr_32_i64(i64 addrspace(1)* %out, [8 x i32], i64 %a) {
   %result = lshr i64 %a, 32
   store i64 %result, i64 addrspace(1)* %out
   ret void
@@ -201,7 +201,8 @@ define amdgpu_kernel void @s_lshr_32_i64(i64 addrspace(1)* %out, i64 %a) {
 
 ; GCN-LABEL: {{^}}v_lshr_32_i64:
 ; GCN-DAG: buffer_load_dword v[[HI_A:[0-9]+]], v{{\[[0-9]+:[0-9]+\]}}, s{{\[[0-9]+:[0-9]+\]}}, 0 addr64 offset:4
-; GCN-DAG: v_mov_b32_e32 v[[VHI:[0-9]+]], 0{{$}}
+; GCN-DAG: v_mov_b32_e32 v[[VHI1:[0-9]+]], 0{{$}}
+; GCN-DAG: v_mov_b32_e32 v[[VHI:[0-9]+]], v[[VHI1]]{{$}}
 ; GCN: buffer_store_dwordx2 v{{\[}}[[HI_A]]:[[VHI]]{{\]}}
 define amdgpu_kernel void @v_lshr_32_i64(i64 addrspace(1)* %out, i64 addrspace(1)* %in) {
   %tid = call i32 @llvm.r600.read.tidig.x() #0

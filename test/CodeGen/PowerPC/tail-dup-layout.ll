@@ -1,4 +1,7 @@
-; RUN: llc -O2 < %s | FileCheck %s
+; RUN: llc -O2 -ppc-reduce-cr-logicals -o - %s | FileCheck \
+; RUN:   --check-prefix=CHECK --check-prefix=CHECK-O2 %s
+; RUN: llc -O3 -ppc-reduce-cr-logicals -o - %s | FileCheck \
+; RUN:   --check-prefix=CHECK --check-prefix=CHECK-O3 %s
 target datalayout = "e-m:e-i64:64-n32:64"
 target triple = "powerpc64le-grtev4-linux-gnu"
 
@@ -22,27 +25,27 @@ target triple = "powerpc64le-grtev4-linux-gnu"
 ;CHECK-LABEL: straight_test:
 ; test1 may have been merged with entry
 ;CHECK: mr [[TAGREG:[0-9]+]], 3
-;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 1
+;CHECK: andi. {{[0-9]+}}, [[TAGREG:[0-9]+]], 1
 ;CHECK-NEXT: bc 12, 1, .[[OPT1LABEL:[_0-9A-Za-z]+]]
 ;CHECK-NEXT: # %test2
-;CHECK-NEXT: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 30, 30
+;CHECK-NEXT: andi. {{[0-9]+}}, [[TAGREG]], 2
 ;CHECK-NEXT: bne 0, .[[OPT2LABEL:[_0-9A-Za-z]+]]
 ;CHECK-NEXT: .[[TEST3LABEL:[_0-9A-Za-z]+]]: # %test3
-;CHECK-NEXT: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 29, 29
+;CHECK-NEXT: andi. {{[0-9]+}}, [[TAGREG]], 4
 ;CHECK-NEXT: bne 0, .[[OPT3LABEL:[_0-9A-Za-z]+]]
 ;CHECK-NEXT: .[[TEST4LABEL:[_0-9A-Za-z]+]]: # %test4
-;CHECK-NEXT: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 28, 28
+;CHECK-NEXT: andi. {{[0-9]+}}, [[TAGREG]], 8
 ;CHECK-NEXT: bne 0, .[[OPT4LABEL:[_0-9A-Za-z]+]]
 ;CHECK-NEXT: .[[EXITLABEL:[_0-9A-Za-z]+]]: # %exit
 ;CHECK: blr
 ;CHECK-NEXT: .[[OPT1LABEL]]:
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 30, 30
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 2
 ;CHECK-NEXT: beq 0, .[[TEST3LABEL]]
 ;CHECK-NEXT: .[[OPT2LABEL]]:
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 29, 29
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 4
 ;CHECK-NEXT: beq 0, .[[TEST4LABEL]]
 ;CHECK-NEXT: .[[OPT3LABEL]]:
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 28, 28
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 8
 ;CHECK-NEXT: beq 0, .[[EXITLABEL]]
 ;CHECK-NEXT: .[[OPT4LABEL]]:
 ;CHECK: b .[[EXITLABEL]]
@@ -99,11 +102,9 @@ exit:
 ; test1
 ; test2
 ; test3
-; test4
 ; optional1
 ; optional2
 ; optional3
-; optional4
 ; exit
 ; even for 50/50 branches.
 ; Tail duplication puts test n+1 at the end of optional n
@@ -118,18 +119,18 @@ exit:
 ;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 1
 ;CHECK-NEXT: bc 12, 1, .[[OPT1LABEL:[_0-9A-Za-z]+]]
 ;CHECK-NEXT: # %test2
-;CHECK-NEXT: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 30, 30
+;CHECK-NEXT: andi. {{[0-9]+}}, [[TAGREG]], 2
 ;CHECK-NEXT: bne 0, .[[OPT2LABEL:[_0-9A-Za-z]+]]
 ;CHECK-NEXT: .[[TEST3LABEL:[_0-9A-Za-z]+]]: # %test3
-;CHECK-NEXT: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 29, 29
+;CHECK-NEXT: andi. {{[0-9]+}}, [[TAGREG]], 4
 ;CHECK-NEXT: bne 0, .[[OPT3LABEL:[_0-9A-Za-z]+]]
 ;CHECK-NEXT: .[[EXITLABEL:[_0-9A-Za-z]+]]: # %exit
 ;CHECK: blr
 ;CHECK-NEXT: .[[OPT1LABEL]]:
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 30, 30
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 2
 ;CHECK-NEXT: beq 0, .[[TEST3LABEL]]
 ;CHECK-NEXT: .[[OPT2LABEL]]:
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 29, 29
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 4
 ;CHECK-NEXT: beq 0, .[[EXITLABEL]]
 ;CHECK-NEXT: .[[OPT3LABEL]]:
 ;CHECK: b .[[EXITLABEL]]
@@ -163,6 +164,98 @@ exit:
 }
 
 ; Intended layout:
+; The chain-of-triangles based duplicating produces the layout when 3
+; instructions are allowed for tail-duplication.
+; test1
+; test2
+; test3
+; optional1
+; optional2
+; optional3
+; exit
+;
+; Otherwise it produces the layout:
+; test1
+; optional1
+; test2
+; optional2
+; test3
+; optional3
+; exit
+
+;CHECK-LABEL: straight_test_3_instr_test:
+; test1 may have been merged with entry
+;CHECK: mr [[TAGREG:[0-9]+]], 3
+;CHECK: clrlwi {{[0-9]+}}, [[TAGREG]], 30
+;CHECK-NEXT: cmplwi {{[0-9]+}}, 2
+
+;CHECK-O3-NEXT: bne 0, .[[OPT1LABEL:[_0-9A-Za-z]+]]
+;CHECK-O3-NEXT: # %test2
+;CHECK-O3-NEXT: rlwinm {{[0-9]+}}, [[TAGREG]], 0, 28, 29
+;CHECK-O3-NEXT: cmplwi {{[0-9]+}}, 8
+;CHECK-O3-NEXT: bne 0, .[[OPT2LABEL:[_0-9A-Za-z]+]]
+;CHECK-O3-NEXT: .[[TEST3LABEL:[_0-9A-Za-z]+]]: # %test3
+;CHECK-O3-NEXT: rlwinm {{[0-9]+}}, [[TAGREG]], 0, 26, 27
+;CHECK-O3-NEXT: cmplwi {{[0-9]+}}, 32
+;CHECK-O3-NEXT: bne 0, .[[OPT3LABEL:[_0-9A-Za-z]+]]
+;CHECK-O3-NEXT: .[[EXITLABEL:[_0-9A-Za-z]+]]: # %exit
+;CHECK-O3: blr
+;CHECK-O3-NEXT: .[[OPT1LABEL]]:
+;CHECK-O3: rlwinm {{[0-9]+}}, [[TAGREG]], 0, 28, 29
+;CHECK-O3-NEXT: cmplwi {{[0-9]+}}, 8
+;CHECK-O3-NEXT: beq 0, .[[TEST3LABEL]]
+;CHECK-O3-NEXT: .[[OPT2LABEL]]:
+;CHECK-O3: rlwinm {{[0-9]+}}, [[TAGREG]], 0, 26, 27
+;CHECK-O3-NEXT: cmplwi {{[0-9]+}}, 32
+;CHECK-O3-NEXT: beq 0, .[[EXITLABEL]]
+;CHECK-O3-NEXT: .[[OPT3LABEL]]:
+;CHECK-O3: b .[[EXITLABEL]]
+
+;CHECK-O2-NEXT: beq 0, .[[TEST2LABEL:[_0-9A-Za-z]+]]
+;CHECK-O2-NEXT: # %optional1
+;CHECK-O2: .[[TEST2LABEL]]: # %test2
+;CHECK-O2-NEXT: rlwinm {{[0-9]+}}, [[TAGREG]], 0, 28, 29
+;CHECK-O2-NEXT: cmplwi {{[0-9]+}}, 8
+;CHECK-O2-NEXT: beq 0, .[[TEST3LABEL:[_0-9A-Za-z]+]]
+;CHECK-O2-NEXT: # %optional2
+;CHECK-O2: .[[TEST3LABEL]]: # %test3
+;CHECK-O2-NEXT: rlwinm {{[0-9]+}}, [[TAGREG]], 0, 26, 27
+;CHECK-O2-NEXT: cmplwi {{[0-9]+}}, 32
+;CHECK-O2-NEXT: beq 0, .[[EXITLABEL:[_0-9A-Za-z]+]]
+;CHECK-O2-NEXT: # %optional3
+;CHECK-O2: .[[EXITLABEL:[_0-9A-Za-z]+]]: # %exit
+;CHECK-O2: blr
+
+
+define void @straight_test_3_instr_test(i32 %tag) {
+entry:
+  br label %test1
+test1:
+  %tagbit1 = and i32 %tag, 3
+  %tagbit1eq0 = icmp eq i32 %tagbit1, 2
+  br i1 %tagbit1eq0, label %test2, label %optional1, !prof !2
+optional1:
+  call void @a()
+  br label %test2
+test2:
+  %tagbit2 = and i32 %tag, 12
+  %tagbit2eq0 = icmp eq i32 %tagbit2, 8
+  br i1 %tagbit2eq0, label %test3, label %optional2, !prof !2
+optional2:
+  call void @b()
+  br label %test3
+test3:
+  %tagbit3 = and i32 %tag, 48
+  %tagbit3eq0 = icmp eq i32 %tagbit3, 32
+  br i1 %tagbit3eq0, label %exit, label %optional3, !prof !1
+optional3:
+  call void @c()
+  br label %exit
+exit:
+  ret void
+}
+
+; Intended layout:
 ; The chain-based outlining produces the layout
 ; entry
 ; --- Begin loop ---
@@ -185,29 +278,30 @@ exit:
 ;CHECK: add [[TAGPTRREG:[0-9]+]], 3, 4
 ;CHECK: .[[LATCHLABEL:[._0-9A-Za-z]+]]: # %for.latch
 ;CHECK: addi
-;CHECK: .[[CHECKLABEL:[._0-9A-Za-z]+]]: # %for.check
+;CHECK-O2: .[[CHECKLABEL:[._0-9A-Za-z]+]]: # %for.check
 ;CHECK: lwz [[TAGREG:[0-9]+]], 0([[TAGPTRREG]])
-;CHECK: # %test1
+;CHECK-O3: .[[CHECKLABEL:[._0-9A-Za-z]+]]: # %for.check
+;CHECK: # %bb.{{[0-9]+}}: # %test1
 ;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 1
 ;CHECK-NEXT: bc 12, 1, .[[OPT1LABEL:[._0-9A-Za-z]+]]
 ;CHECK-NEXT: # %test2
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 30, 30
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 2
 ;CHECK-NEXT: bne 0, .[[OPT2LABEL:[._0-9A-Za-z]+]]
 ;CHECK-NEXT: .[[TEST3LABEL:[._0-9A-Za-z]+]]: # %test3
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 29, 29
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 4
 ;CHECK-NEXT: bne 0, .[[OPT3LABEL:[._0-9A-Za-z]+]]
 ;CHECK-NEXT: .[[TEST4LABEL:[._0-9A-Za-z]+]]: # %{{(test4|optional3)}}
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 28, 28
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 8
 ;CHECK-NEXT: beq 0, .[[LATCHLABEL]]
 ;CHECK-NEXT: b .[[OPT4LABEL:[._0-9A-Za-z]+]]
 ;CHECK: [[OPT1LABEL]]
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 30, 30
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 2
 ;CHECK-NEXT: beq 0, .[[TEST3LABEL]]
 ;CHECK-NEXT: .[[OPT2LABEL]]
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 29, 29
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 4
 ;CHECK-NEXT: beq 0, .[[TEST4LABEL]]
 ;CHECK-NEXT: .[[OPT3LABEL]]
-;CHECK: rlwinm. {{[0-9]+}}, [[TAGREG]], 0, 28, 28
+;CHECK: andi. {{[0-9]+}}, [[TAGREG]], 8
 ;CHECK-NEXT: beq 0, .[[LATCHLABEL]]
 ;CHECK: [[OPT4LABEL]]:
 ;CHECK: b .[[LATCHLABEL]]
@@ -275,18 +369,18 @@ exit:
 ; code is independent of the outlining code, which works by choosing the
 ; "unavoidable" blocks.
 ; CHECK-LABEL: avoidable_test:
-; CHECK: # %entry
+; CHECK: # %bb.{{[0-9]+}}: # %entry
 ; CHECK: andi.
-; CHECK: # %test2
+; CHECK: # %bb.{{[0-9]+}}: # %test2
 ; Make sure then2 falls through from test2
 ; CHECK-NOT: # %{{[-_a-zA-Z0-9]+}}
-; CHECK: # %then2
-; CHECK: rlwinm. {{[0-9]+}}, {{[0-9]+}}, 0, 29, 29
+; CHECK: # %bb.{{[0-9]+}}: # %then2
+; CHECK: andi. {{[0-9]+}}, {{[0-9]+}}, 4
 ; CHECK: # %else1
 ; CHECK: bl a
 ; CHECK: bl a
 ; Make sure then2 was copied into else1
-; CHECK: rlwinm. {{[0-9]+}}, {{[0-9]+}}, 0, 29, 29
+; CHECK: andi. {{[0-9]+}}, {{[0-9]+}}, 4
 ; CHECK: # %end1
 ; CHECK: bl d
 ; CHECK: # %else2
@@ -329,8 +423,8 @@ end1:
 ; The f;g->h;i trellis should be resolved as f->i;g->h.
 ; The h;i->j;ret trellis contains a triangle edge, and should be resolved as
 ; h->j->ret
-; CHECK: # %entry
-; CHECK: # %c10
+; CHECK: # %bb.{{[0-9]+}}: # %entry
+; CHECK: # %bb.{{[0-9]+}}: # %c10
 ; CHECK: # %e9
 ; CHECK: # %g10
 ; CHECK: # %h10
@@ -413,8 +507,8 @@ ret:
 ; checking, it's profitable to duplicate G into F. The weights here are not
 ; really important. They are there to help make the test stable.
 ; CHECK-LABEL: trellis_then_dup_test
-; CHECK: # %entry
-; CHECK: # %b
+; CHECK: # %bb.{{[0-9]+}}: # %entry
+; CHECK: # %bb.{{[0-9]+}}: # %b
 ; CHECK: # %d
 ; CHECK: # %g
 ; CHECK: # %ret1
@@ -477,8 +571,8 @@ ret:
 ; Verify that we did not mis-identify triangle trellises if it is not
 ; really a triangle.
 ; CHECK-LABEL: trellis_no_triangle
-; CHECK: # %entry
-; CHECK: # %b
+; CHECK: # %bb.{{[0-9]+}}: # %entry
+; CHECK: # %bb.{{[0-9]+}}: # %b
 ; CHECK: # %d
 ; CHECK: # %ret
 ; CHECK: # %c

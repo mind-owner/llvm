@@ -2,7 +2,6 @@
 ; the debug metadata for the thin link.
 ; RUN: opt -thinlto-bc -thin-link-bitcode-file=%t.thinlink.bc -o %t.bc %s
 ; RUN: llvm-dis -o - %t.bc | FileCheck %s
-; RUN: llvm-dis -o - %t.thinlink.bc | FileCheck --check-prefix=NODEBUG %s
 ; RUN: llvm-bcanalyzer -dump %t.bc | FileCheck --check-prefix=BCA %s
 
 ; Make sure the combined index files produced by both the normal and the
@@ -28,6 +27,8 @@
 
 ; BCA: <GLOBALVAL_SUMMARY_BLOCK
 
+target datalayout = "e-m:o-i64:64-f80:128-n8:16:32:64-S128"
+
 ; CHECK: @g = global i8 42
 @g = global i8 42
 
@@ -35,10 +36,3 @@
 define void @f() {
   ret void
 }
-
-; CHECK: !llvm.dbg.cu
-; NODEBUG-NOT: !llvm.dbg.cu
-!llvm.dbg.cu = !{}
-
-!1 = !{i32 2, !"Debug Info Version", i32 3}
-!llvm.module.flags = !{!1}

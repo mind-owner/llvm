@@ -1,20 +1,18 @@
 //===-- HexagonAsmBackend.cpp - Hexagon Assembler Backend -----------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-#include "Hexagon.h"
 #include "HexagonFixupKinds.h"
 #include "MCTargetDesc/HexagonBaseInfo.h"
 #include "MCTargetDesc/HexagonMCChecker.h"
 #include "MCTargetDesc/HexagonMCCodeEmitter.h"
-#include "MCTargetDesc/HexagonMCTargetDesc.h"
 #include "MCTargetDesc/HexagonMCInstrInfo.h"
 #include "MCTargetDesc/HexagonMCShuffler.h"
+#include "MCTargetDesc/HexagonMCTargetDesc.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmLayout.h"
 #include "llvm/MC/MCAssembler.h"
@@ -51,21 +49,24 @@ class HexagonAsmBackend : public MCAsmBackend {
     SmallVector<MCFixup, 4> Fixups;
     SmallString<256> Code;
     raw_svector_ostream VecOS(Code);
-    E.encodeInstruction(HMB, VecOS, Fixups, RF.getSubtargetInfo());
+    E.encodeInstruction(HMB, VecOS, Fixups, *RF.getSubtargetInfo());
 
     // Update the fragment.
     RF.setInst(HMB);
     RF.getContents() = Code;
     RF.getFixups() = Fixups;
   }
+
 public:
   HexagonAsmBackend(const Target &T, const Triple &TT, uint8_t OSABI,
-      StringRef CPU) :
-      OSABI(OSABI), CPU(CPU), MCII(T.createMCInstrInfo()),
-      RelaxTarget(new MCInst *), Extender(nullptr) {}
+                    StringRef CPU)
+      : MCAsmBackend(support::little), OSABI(OSABI), CPU(CPU),
+        MCII(T.createMCInstrInfo()), RelaxTarget(new MCInst *),
+        Extender(nullptr) {}
 
-  MCObjectWriter *createObjectWriter(raw_pwrite_stream &OS) const override {
-    return createHexagonELFObjectWriter(OS, OSABI, CPU);
+  std::unique_ptr<MCObjectTargetWriter>
+  createObjectTargetWriter() const override {
+    return createHexagonELFObjectWriter(OSABI, CPU);
   }
 
   void setExtender(MCContext &Context) const {
@@ -183,7 +184,11 @@ public:
       { "fixup_Hexagon_IE_GOT_11_X",    0,      32,     0 },
       { "fixup_Hexagon_TPREL_32_6_X",   0,      32,     0 },
       { "fixup_Hexagon_TPREL_16_X",     0,      32,     0 },
-      { "fixup_Hexagon_TPREL_11_X",     0,      32,     0 }
+      { "fixup_Hexagon_TPREL_11_X",     0,      32,     0 },
+      { "fixup_Hexagon_GD_PLT_B22_PCREL_X",0,     32,     MCFixupKindInfo::FKF_IsPCRel },
+      { "fixup_Hexagon_GD_PLT_B32_PCREL_X",0,     32,     MCFixupKindInfo::FKF_IsPCRel },
+      { "fixup_Hexagon_LD_PLT_B22_PCREL_X",0,     32,     MCFixupKindInfo::FKF_IsPCRel },
+      { "fixup_Hexagon_LD_PLT_B32_PCREL_X",0,     32,     MCFixupKindInfo::FKF_IsPCRel }
     };
 
     if (Kind < FirstTargetFixupKind)
@@ -194,16 +199,9 @@ public:
     return Infos[Kind - FirstTargetFixupKind];
   }
 
-  /// processFixupValue - Target hook to adjust the literal value of a fixup
-  /// if necessary. IsResolved signals whether the caller believes a relocation
-  /// is needed; the target can modify the value. The default does nothing.
-  void processFixupValue(const MCAssembler &Asm, const MCAsmLayout &Layout,
-                         const MCFixup &Fixup, const MCFragment *DF,
-                         const MCValue &Target, uint64_t &Value,
-                         bool &IsResolved) override {
-    MCFixupKind Kind = Fixup.getKind();
-
-    switch((unsigned)Kind) {
+  bool shouldForceRelocation(const MCAssembler &Asm, const MCFixup &Fixup,
+                             const MCValue &Target) override {
+    switch(Fixup.getTargetKind()) {
       default:
         llvm_unreachable("Unknown Fixup Kind!");
 
@@ -290,9 +288,13 @@ public:
       case fixup_Hexagon_32_PCREL:
       case fixup_Hexagon_6_PCREL_X:
       case fixup_Hexagon_23_REG:
+      case fixup_Hexagon_27_REG:
+      case fixup_Hexagon_GD_PLT_B22_PCREL_X:
+      case fixup_Hexagon_GD_PLT_B32_PCREL_X:
+      case fixup_Hexagon_LD_PLT_B22_PCREL_X:
+      case fixup_Hexagon_LD_PLT_B32_PCREL_X:
         // These relocations should always have a relocation recorded
-        IsResolved = false;
-        return;
+        return true;
 
       case fixup_Hexagon_B22_PCREL:
         //IsResolved = false;
@@ -309,7 +311,7 @@ public:
       case fixup_Hexagon_B7_PCREL:
       case fixup_Hexagon_B7_PCREL_X:
         if (DisableFixup)
-          IsResolved = false;
+          return true;
         break;
 
       case FK_Data_1:
@@ -318,8 +320,9 @@ public:
       case FK_PCRel_4:
       case fixup_Hexagon_32:
         // Leave these relocations alone as they are used for EH.
-        return;
+        return false;
     }
+    return false;
   }
 
   /// getFixupKindNumBytes - The number of bytes the fixup may change.
@@ -346,6 +349,8 @@ public:
       case fixup_Hexagon_B9_PCREL_X:
       case fixup_Hexagon_B7_PCREL:
       case fixup_Hexagon_B7_PCREL_X:
+      case fixup_Hexagon_GD_PLT_B32_PCREL_X:
+      case fixup_Hexagon_LD_PLT_B32_PCREL_X:
         return 4;
     }
   }
@@ -373,6 +378,8 @@ public:
         break;
 
       case fixup_Hexagon_B32_PCREL_X:
+      case fixup_Hexagon_GD_PLT_B32_PCREL_X:
+      case fixup_Hexagon_LD_PLT_B32_PCREL_X:
         Value >>= 6;
         break;
     }
@@ -401,9 +408,10 @@ public:
   /// ApplyFixup - Apply the \arg Value for given \arg Fixup into the provided
   /// data fragment, at the offset specified by the fixup and following the
   /// fixup kind as appropriate.
-  void applyFixup(const MCFixup &Fixup, char *Data, unsigned DataSize,
-                  uint64_t FixupValue, bool IsPCRel,
-                  MCContext &Ctx) const override {
+  void applyFixup(const MCAssembler &Asm, const MCFixup &Fixup,
+                  const MCValue &Target, MutableArrayRef<char> Data,
+                  uint64_t FixupValue, bool IsResolved,
+                  const MCSubtargetInfo *STI) const override {
 
     // When FixupValue is 0 the relocation is external and there
     // is nothing for us to do.
@@ -418,8 +426,8 @@ public:
     // to a real offset before we can use it.
     uint32_t Offset = Fixup.getOffset();
     unsigned NumBytes = getFixupKindNumBytes(Kind);
-    assert(Offset + NumBytes <= DataSize && "Invalid fixup offset!");
-    char *InstAddr = Data + Offset;
+    assert(Offset + NumBytes <= Data.size() && "Invalid fixup offset!");
+    char *InstAddr = Data.data() + Offset;
 
     Value = adjustFixupValue(Kind, FixupValue);
     if(!Value)
@@ -433,6 +441,7 @@ public:
       case fixup_Hexagon_B7_PCREL:
         if (!(isIntN(7, sValue)))
           HandleFixupError(7, 2, (int64_t)FixupValue, "B7_PCREL");
+        LLVM_FALLTHROUGH;
       case fixup_Hexagon_B7_PCREL_X:
         InstMask = 0x00001f18;  // Word32_B7
         Reloc = (((Value >> 2) & 0x1f) << 8) |    // Value 6-2 = Target 12-8
@@ -442,6 +451,7 @@ public:
       case fixup_Hexagon_B9_PCREL:
         if (!(isIntN(9, sValue)))
           HandleFixupError(9, 2, (int64_t)FixupValue, "B9_PCREL");
+        LLVM_FALLTHROUGH;
       case fixup_Hexagon_B9_PCREL_X:
         InstMask = 0x003000fe;  // Word32_B9
         Reloc = (((Value >> 7) & 0x3) << 20) |    // Value 8-7 = Target 21-20
@@ -453,6 +463,7 @@ public:
       case fixup_Hexagon_B13_PCREL:
         if (!(isIntN(13, sValue)))
           HandleFixupError(13, 2, (int64_t)FixupValue, "B13_PCREL");
+        LLVM_FALLTHROUGH;
       case fixup_Hexagon_B13_PCREL_X:
         InstMask = 0x00202ffe;  // Word32_B13
         Reloc = (((Value >> 12) & 0x1) << 21) |    // Value 12   = Target 21
@@ -463,6 +474,7 @@ public:
       case fixup_Hexagon_B15_PCREL:
         if (!(isIntN(15, sValue)))
           HandleFixupError(15, 2, (int64_t)FixupValue, "B15_PCREL");
+        LLVM_FALLTHROUGH;
       case fixup_Hexagon_B15_PCREL_X:
         InstMask = 0x00df20fe;  // Word32_B15
         Reloc = (((Value >> 13) & 0x3) << 22) |    // Value 14-13 = Target 23-22
@@ -474,6 +486,7 @@ public:
       case fixup_Hexagon_B22_PCREL:
         if (!(isIntN(22, sValue)))
           HandleFixupError(22, 2, (int64_t)FixupValue, "B22_PCREL");
+        LLVM_FALLTHROUGH;
       case fixup_Hexagon_B22_PCREL_X:
         InstMask = 0x01ff3ffe;  // Word32_B22
         Reloc = (((Value >> 13) & 0x1ff) << 16) |  // Value 21-13 = Target 24-16
@@ -495,17 +508,15 @@ public:
         break;
     }
 
-    DEBUG(dbgs() << "Name=" << getFixupKindInfo(Kind).Name << "(" <<
-          (unsigned)Kind << ")\n");
-    DEBUG(uint32_t OldData = 0;
-          for (unsigned i = 0; i < NumBytes; i++)
-            OldData |= (InstAddr[i] << (i * 8)) & (0xff << (i * 8));
-          dbgs() << "\tBValue=0x"; dbgs().write_hex(Value) <<
-            ": AValue=0x"; dbgs().write_hex(FixupValue) <<
-            ": Offset=" << Offset <<
-            ": Size=" << DataSize <<
-            ": OInst=0x"; dbgs().write_hex(OldData) <<
-            ": Reloc=0x"; dbgs().write_hex(Reloc););
+    LLVM_DEBUG(dbgs() << "Name=" << getFixupKindInfo(Kind).Name << "("
+                      << (unsigned)Kind << ")\n");
+    LLVM_DEBUG(
+        uint32_t OldData = 0; for (unsigned i = 0; i < NumBytes; i++) OldData |=
+                              (InstAddr[i] << (i * 8)) & (0xff << (i * 8));
+        dbgs() << "\tBValue=0x"; dbgs().write_hex(Value) << ": AValue=0x";
+        dbgs().write_hex(FixupValue)
+        << ": Offset=" << Offset << ": Size=" << Data.size() << ": OInst=0x";
+        dbgs().write_hex(OldData) << ": Reloc=0x"; dbgs().write_hex(Reloc););
 
     // For each byte of the fragment that the fixup touches, mask in the
     // bits from the fixup value. The Value has been "split up" into the
@@ -515,10 +526,10 @@ public:
       InstAddr[i] |= uint8_t(Reloc >> (i * 8)) & 0xff;     // Apply new reloc
     }
 
-    DEBUG(uint32_t NewData = 0;
-          for (unsigned i = 0; i < NumBytes; i++)
-            NewData |= (InstAddr[i] << (i * 8)) & (0xff << (i * 8));
-          dbgs() << ": NInst=0x"; dbgs().write_hex(NewData) << "\n";);
+    LLVM_DEBUG(uint32_t NewData = 0;
+               for (unsigned i = 0; i < NumBytes; i++) NewData |=
+               (InstAddr[i] << (i * 8)) & (0xff << (i * 8));
+               dbgs() << ": NInst=0x"; dbgs().write_hex(NewData) << "\n";);
   }
 
   bool isInstRelaxable(MCInst const &HMI) const {
@@ -547,7 +558,8 @@ public:
   /// relaxation.
   ///
   /// \param Inst - The instruction to test.
-  bool mayNeedRelaxation(MCInst const &Inst) const override {
+  bool mayNeedRelaxation(MCInst const &Inst,
+                         const MCSubtargetInfo &STI) const override {
     return true;
   }
 
@@ -556,7 +568,8 @@ public:
   bool fixupNeedsRelaxationAdvanced(const MCFixup &Fixup, bool Resolved,
                                     uint64_t Value,
                                     const MCRelaxableFragment *DF,
-                                    const MCAsmLayout &Layout) const override {
+                                    const MCAsmLayout &Layout,
+                                    const bool WasForced) const override {
     MCInst const &MCB = DF->getInst();
     assert(HexagonMCInstrInfo::isBundle(MCB));
 
@@ -568,7 +581,7 @@ public:
       return false;
     // If we cannot resolve the fixup value, it requires relaxation.
     if (!Resolved) {
-      switch ((unsigned)Fixup.getKind()) {
+      switch (Fixup.getTargetKind()) {
       case fixup_Hexagon_B22_PCREL:
         // GetFixupCount assumes B22 won't relax
         LLVM_FALLTHROUGH;
@@ -640,7 +653,8 @@ public:
     assert(HexagonMCInstrInfo::isBundle(Inst) &&
            "Hexagon relaxInstruction only works on bundles");
 
-    Res = HexagonMCInstrInfo::createBundle();
+    Res.setOpcode(Hexagon::BUNDLE);
+    Res.addOperand(MCOperand::createImm(Inst.getOperand(0).getImm()));
     // Copy the results into the bundle.
     bool Update = false;
     for (auto &I : HexagonMCInstrInfo::bundleInstructions(Inst)) {
@@ -666,17 +680,17 @@ public:
     assert(Update && "Didn't find relaxation target");
   }
 
-  bool writeNopData(uint64_t Count,
-                    MCObjectWriter * OW) const override {
+  bool writeNopData(raw_ostream &OS, uint64_t Count) const override {
     static const uint32_t Nopcode  = 0x7f000000, // Hard-coded NOP.
                           ParseIn  = 0x00004000, // In packet parse-bits.
                           ParseEnd = 0x0000c000; // End of packet parse-bits.
 
     while(Count % HEXAGON_INSTR_SIZE) {
-      DEBUG(dbgs() << "Alignment not a multiple of the instruction size:" <<
-          Count % HEXAGON_INSTR_SIZE << "/" << HEXAGON_INSTR_SIZE << "\n");
+      LLVM_DEBUG(dbgs() << "Alignment not a multiple of the instruction size:"
+                        << Count % HEXAGON_INSTR_SIZE << "/"
+                        << HEXAGON_INSTR_SIZE << "\n");
       --Count;
-      OW->write8(0);
+      OS << '\0';
     }
 
     while(Count) {
@@ -684,7 +698,7 @@ public:
       // Close the packet whenever a multiple of the maximum packet size remains
       uint32_t ParseBits = (Count % (HEXAGON_PACKET_SIZE * HEXAGON_INSTR_SIZE))?
                            ParseIn: ParseEnd;
-      OW->write32(Nopcode | ParseBits);
+      support::endian::write<uint32_t>(OS, Nopcode | ParseBits, Endian);
     }
     return true;
   }
@@ -711,22 +725,24 @@ public:
               break;
             }
             case MCFragment::FT_Relaxable: {
+              MCContext &Context = Asm.getContext();
               auto &RF = cast<MCRelaxableFragment>(*K);
               auto &Inst = const_cast<MCInst &>(RF.getInst());
               while (Size > 0 && HexagonMCInstrInfo::bundleSize(Inst) < 4) {
-                MCInst *Nop = new (Asm.getContext()) MCInst;
+                MCInst *Nop = new (Context) MCInst;
                 Nop->setOpcode(Hexagon::A2_nop);
                 Inst.addOperand(MCOperand::createInst(Nop));
                 Size -= 4;
                 if (!HexagonMCChecker(
-                           *MCII, RF.getSubtargetInfo(), Inst, Inst,
-                           *Asm.getContext().getRegisterInfo()).check()) {
+                         Context, *MCII, *RF.getSubtargetInfo(), Inst,
+                         *Context.getRegisterInfo(), false)
+                         .check()) {
                   Inst.erase(Inst.end() - 1);
                   Size = 0;
                 }
               }
-              bool Error = HexagonMCShuffle(true, *MCII, RF.getSubtargetInfo(),
-                                            Inst);
+              bool Error = HexagonMCShuffle(Context, true, *MCII,
+                                            *RF.getSubtargetInfo(), Inst);
               //assert(!Error);
               (void)Error;
               ReplaceInstruction(Asm.getEmitter(), RF, Inst);
@@ -747,11 +763,12 @@ public:
 
 // MCAsmBackend
 MCAsmBackend *llvm::createHexagonAsmBackend(Target const &T,
-                                      MCRegisterInfo const & /*MRI*/,
-                                      const Triple &TT, StringRef CPU,
-                                      const MCTargetOptions &Options) {
+                                            const MCSubtargetInfo &STI,
+                                            MCRegisterInfo const & /*MRI*/,
+                                            const MCTargetOptions &Options) {
+  const Triple &TT = STI.getTargetTriple();
   uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(TT.getOS());
 
-  StringRef CPUString = Hexagon_MC::selectHexagonCPU(TT, CPU);
+  StringRef CPUString = Hexagon_MC::selectHexagonCPU(STI.getCPU());
   return new HexagonAsmBackend(T, TT, OSABI, CPUString);
 }

@@ -1,9 +1,8 @@
 //===-- SystemZMCCodeEmitter.cpp - Convert SystemZ code to machine code ---===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -77,6 +76,9 @@ private:
   uint64_t getBDXAddr20Encoding(const MCInst &MI, unsigned OpNum,
                                 SmallVectorImpl<MCFixup> &Fixups,
                                 const MCSubtargetInfo &STI) const;
+  uint64_t getBDLAddr12Len4Encoding(const MCInst &MI, unsigned OpNum,
+                                    SmallVectorImpl<MCFixup> &Fixups,
+                                    const MCSubtargetInfo &STI) const;
   uint64_t getBDLAddr12Len8Encoding(const MCInst &MI, unsigned OpNum,
                                     SmallVectorImpl<MCFixup> &Fixups,
                                     const MCSubtargetInfo &STI) const;
@@ -141,9 +143,10 @@ private:
   }
 
 private:
-  uint64_t computeAvailableFeatures(const FeatureBitset &FB) const;
-  void verifyInstructionPredicates(const MCInst &MI,
-                                   uint64_t AvailableFeatures) const;
+  FeatureBitset computeAvailableFeatures(const FeatureBitset &FB) const;
+  void
+  verifyInstructionPredicates(const MCInst &MI,
+                              const FeatureBitset &AvailableFeatures) const;
 };
 
 } // end anonymous namespace
@@ -217,6 +220,17 @@ getBDXAddr20Encoding(const MCInst &MI, unsigned OpNum,
   assert(isUInt<4>(Base) && isInt<20>(Disp) && isUInt<4>(Index));
   return (Index << 24) | (Base << 20) | ((Disp & 0xfff) << 8)
     | ((Disp & 0xff000) >> 12);
+}
+
+uint64_t SystemZMCCodeEmitter::
+getBDLAddr12Len4Encoding(const MCInst &MI, unsigned OpNum,
+                         SmallVectorImpl<MCFixup> &Fixups,
+                         const MCSubtargetInfo &STI) const {
+  uint64_t Base = getMachineOpValue(MI, MI.getOperand(OpNum), Fixups, STI);
+  uint64_t Disp = getMachineOpValue(MI, MI.getOperand(OpNum + 1), Fixups, STI);
+  uint64_t Len  = getMachineOpValue(MI, MI.getOperand(OpNum + 2), Fixups, STI) - 1;
+  assert(isUInt<4>(Base) && isUInt<12>(Disp) && isUInt<4>(Len));
+  return (Len << 16) | (Base << 12) | Disp;
 }
 
 uint64_t SystemZMCCodeEmitter::

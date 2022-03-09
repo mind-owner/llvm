@@ -1,4 +1,6 @@
-; RUN: llc < %s -filetype=obj | llvm-readobj - -codeview | FileCheck %s
+; RUN: llc < %s -filetype=obj | llvm-readobj - --codeview | FileCheck %s
+; RUN: llc < %s | llvm-mc -filetype=obj --triple=x86_64-windows | llvm-readobj - --codeview | FileCheck %s
+; RUN: llc < %s | FileCheck %s --check-prefix=ASM
 
 ; C++ source to regenerate:
 ; $ cat t.cpp
@@ -69,7 +71,6 @@
 ; CHECK:   Pointer (0x1004) {
 ; CHECK:     TypeLeafKind: LF_POINTER (0x1002)
 ; CHECK:     PointeeType: const int (0x1003)
-; CHECK:     PointerAttributes: 0x1000C
 ; CHECK:     PtrType: Near64 (0xC)
 ; CHECK:     PtrMode: Pointer (0x0)
 ; CHECK:     IsFlat: 0
@@ -92,7 +93,6 @@
 ; CHECK:   Pointer (0x1006) {
 ; CHECK:     TypeLeafKind: LF_POINTER (0x1002)
 ; CHECK:     PointeeType: int (0x74)
-; CHECK:     PointerAttributes: 0x804C
 ; CHECK:     PtrType: Near64 (0xC)
 ; CHECK:     PtrMode: PointerToDataMember (0x2)
 ; CHECK:     IsFlat: 0
@@ -105,11 +105,10 @@
 ; CHECK:   Pointer (0x1007) {
 ; CHECK:     TypeLeafKind: LF_POINTER (0x1002)
 ; CHECK:     PointeeType: A (0x1005)
-; CHECK:     PointerAttributes: 0x1000C
 ; CHECK:     PtrType: Near64 (0xC)
 ; CHECK:     PtrMode: Pointer (0x0)
 ; CHECK:     IsFlat: 0
-; CHECK:     IsConst: 0
+; CHECK:     IsConst: 1
 ; CHECK:     IsVolatile: 0
 ; CHECK:     IsUnaligned: 0
 ; CHECK:   }
@@ -123,7 +122,7 @@
 ; CHECK:     TypeLeafKind: LF_MFUNCTION (0x1009)
 ; CHECK:     ReturnType: void (0x3)
 ; CHECK:     ClassType: A (0x1005)
-; CHECK:     ThisType: A* (0x1007)
+; CHECK:     ThisType: A* const (0x1007)
 ; CHECK:     CallingConvention: NearC (0x0)
 ; CHECK:     FunctionOptions [ (0x0)
 ; CHECK:     ]
@@ -170,7 +169,6 @@
 ; CHECK:   Pointer (0x100E) {
 ; CHECK:     TypeLeafKind: LF_POINTER (0x1002)
 ; CHECK:     PointeeType: void A::() (0x1009)
-; CHECK:     PointerAttributes: 0x1006C
 ; CHECK:     PtrType: Near64 (0xC)
 ; CHECK:     PtrMode: PointerToMemberFunction (0x3)
 ; CHECK:     IsFlat: 0
@@ -190,7 +188,6 @@
 ; CHECK:   Pointer (0x1010) {
 ; CHECK:     TypeLeafKind: LF_POINTER (0x1002)
 ; CHECK:     PointeeType: const void (0x100F)
-; CHECK:     PointerAttributes: 0x1000C
 ; CHECK:     PtrType: Near64 (0xC)
 ; CHECK:     PtrMode: Pointer (0x0)
 ; CHECK:     IsFlat: 0
@@ -218,7 +215,7 @@
 ; CHECK: CodeViewDebugInfo [
 ; CHECK:   Subsection [
 ; CHECK:     SubSectionType: Symbols (0xF1)
-; CHECK:     ProcStart {
+; CHECK:     {{.*}}Proc{{.*}}Sym {
 ; CHECK:       DbgStart: 0x0
 ; CHECK:       DbgEnd: 0x0
 ; CHECK:       FunctionType: f (0x1002)
@@ -229,68 +226,68 @@
 ; CHECK:       DisplayName: f
 ; CHECK:       LinkageName: ?f@@YAXMN_J@Z
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: float (0x40)
 ; CHECK:       Flags [ (0x1)
 ; CHECK:         IsParameter (0x1)
 ; CHECK:       ]
 ; CHECK:       VarName: p1
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: double (0x41)
 ; CHECK:       Flags [ (0x1)
 ; CHECK:         IsParameter (0x1)
 ; CHECK:       ]
 ; CHECK:       VarName: p2
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: __int64 (0x13)
 ; CHECK:       Flags [ (0x1)
 ; CHECK:         IsParameter (0x1)
 ; CHECK:       ]
 ; CHECK:       VarName: p3
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: int (0x74)
 ; CHECK:       VarName: v1
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: int* (0x674)
 ; CHECK:       VarName: v2
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: const int* (0x1004)
 ; CHECK:       VarName: v21
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: void* (0x603)
 ; CHECK:       VarName: v3
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: int A::* (0x1006)
 ; CHECK:       VarName: v4
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: void A::() A::* (0x100E)
 ; CHECK:       VarName: v5
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: long (0x12)
 ; CHECK:       VarName: l1
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: long (0x12)
 ; CHECK:       VarName: l2
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: unsigned long (0x22)
 ; CHECK:       VarName: l3
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: unsigned long (0x22)
 ; CHECK:       VarName: l4
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: const void* (0x1010)
 ; CHECK:       VarName: v6
 ; CHECK:     }
@@ -298,48 +295,48 @@
 ; CHECK:     }
 ; CHECK:   ]
 ; CHECK:   Subsection [
-; CHECK:     ProcStart {
+; CHECK:     {{.*}}Proc{{.*}}Sym {
 ; CHECK:       Type: CharTypes (0x1012)
 ; CHECK:       DisplayName: CharTypes
 ; CHECK:       LinkageName: ?CharTypes@@YAXXZ
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: wchar_t (0x71)
 ; CHECK:       Flags [ (0x0)
 ; CHECK:       ]
 ; CHECK:       VarName: w
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: unsigned short (0x21)
 ; CHECK:       Flags [ (0x0)
 ; CHECK:       ]
 ; CHECK:       VarName: us
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: char (0x70)
 ; CHECK:       Flags [ (0x0)
 ; CHECK:       ]
 ; CHECK:       VarName: c
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: unsigned char (0x20)
 ; CHECK:       Flags [ (0x0)
 ; CHECK:       ]
 ; CHECK:       VarName: uc
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: signed char (0x10)
 ; CHECK:       Flags [ (0x0)
 ; CHECK:       ]
 ; CHECK:       VarName: sc
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: char16_t (0x7A)
 ; CHECK:       Flags [ (0x0)
 ; CHECK:       ]
 ; CHECK:       VarName: c16
 ; CHECK:     }
-; CHECK:     Local {
+; CHECK:     LocalSym {
 ; CHECK:       Type: char32_t (0x7B)
 ; CHECK:       Flags [ (0x0)
 ; CHECK:       ]
@@ -349,6 +346,182 @@
 ; CHECK:     }
 ; CHECK:   ]
 ; CHECK: ]
+
+; ASM: .section	.debug$T,"dr"
+; ASM: .p2align	2
+; ASM: .long	4                       # Debug section magic
+; ASM: # ArgList (0x1000)
+; ASM: .short	0x12                    # Record length
+; ASM: .short	0x1201                  # Record kind: LF_ARGLIST
+; ASM: .long	0x3                     # NumArgs
+; ASM: .long	0x40                    # Argument: float
+; ASM: .long	0x41                    # Argument: double
+; ASM: .long	0x13                    # Argument: __int64
+; ASM: # Procedure (0x1001)
+; ASM: .short	0xe                     # Record length
+; ASM: .short	0x1008                  # Record kind: LF_PROCEDURE
+; ASM: .long	0x3                     # ReturnType: void
+; ASM: .byte	0x0                     # CallingConvention: NearC
+; ASM: .byte	0x0                     # FunctionOptions
+; ASM: .short	0x3                     # NumParameters
+; ASM: .long	0x1000                  # ArgListType: (float, double, __int64)
+; ASM: # FuncId (0x1002)
+; ASM: .short	0xe                     # Record length
+; ASM: .short	0x1601                  # Record kind: LF_FUNC_ID
+; ASM: .long	0x0                     # ParentScope
+; ASM: .long	0x1001                  # FunctionType: void (float, double, __int64)
+; ASM: .asciz	"f"                     # Name
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # Modifier (0x1003)
+; ASM: .short	0xa                     # Record length
+; ASM: .short	0x1001                  # Record kind: LF_MODIFIER
+; ASM: .long	0x74                    # ModifiedType: int
+; ASM: .short	0x1                     # Modifiers ( Const (0x1) )
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # Pointer (0x1004)
+; ASM: .short	0xa                     # Record length
+; ASM: .short	0x1002                  # Record kind: LF_POINTER
+; ASM: .long	0x1003                  # PointeeType: const int
+; ASM: .long	0x1000c                 # Attrs: [ Type: Near64, Mode: Pointer, SizeOf: 8 ]
+; ASM: # Struct (0x1005)
+; ASM: .short	0x16                    # Record length
+; ASM: .short	0x1505                  # Record kind: LF_STRUCTURE
+; ASM: .short	0x0                     # MemberCount
+; ASM: .short	0x80                    # Properties ( ForwardReference (0x80) )
+; ASM: .long	0x0                     # FieldList
+; ASM: .long	0x0                     # DerivedFrom
+; ASM: .long	0x0                     # VShape
+; ASM: .short	0x0                     # SizeOf
+; ASM: .asciz	"A"                     # Name
+; ASM: # Pointer (0x1006)
+; ASM: .short	0x12                    # Record length
+; ASM: .short	0x1002                  # Record kind: LF_POINTER
+; ASM: .long	0x74                    # PointeeType: int
+; ASM: .long	0x804c                  # Attrs: [ Type: Near64, Mode: PointerToDataMember, SizeOf: 4 ]
+; ASM: .long	0x1005                  # ClassType: A
+; ASM: .short	0x4                     # Representation: GeneralData
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # Pointer (0x1007)
+; ASM: .short	0xa                     # Record length
+; ASM: .short	0x1002                  # Record kind: LF_POINTER
+; ASM: .long	0x1005                  # PointeeType: A
+; ASM: .long	0x1040c                 # Attrs: [ Type: Near64, Mode: Pointer, SizeOf: 8, isConst ]
+; ASM: # ArgList (0x1008)
+; ASM: .short	0x6                     # Record length
+; ASM: .short	0x1201                  # Record kind: LF_ARGLIST
+; ASM: .long	0x0                     # NumArgs
+; ASM: # MemberFunction (0x1009)
+; ASM: .short	0x1a                    # Record length
+; ASM: .short	0x1009                  # Record kind: LF_MFUNCTION
+; ASM: .long	0x3                     # ReturnType: void
+; ASM: .long	0x1005                  # ClassType: A
+; ASM: .long	0x1007                  # ThisType: A* const
+; ASM: .byte	0x0                     # CallingConvention: NearC
+; ASM: .byte	0x0                     # FunctionOptions
+; ASM: .short	0x0                     # NumParameters
+; ASM: .long	0x1008                  # ArgListType: ()
+; ASM: .long	0x0                     # ThisAdjustment
+; ASM: # FieldList (0x100A)
+; ASM: .short	0x1e                    # Record length
+; ASM: .short	0x1203                  # Record kind: LF_FIELDLIST
+; ASM: .short	0x150d                  # Member kind: DataMember ( LF_MEMBER )
+; ASM: .short	0x3                     # Attrs: Public
+; ASM: .long	0x74                    # Type: int
+; ASM: .short	0x0                     # FieldOffset
+; ASM: .asciz	"a"                     # Name
+; ASM: .short	0x1511                  # Member kind: OneMethod ( LF_ONEMETHOD )
+; ASM: .short	0x3                     # Attrs: Public
+; ASM: .long	0x1009                  # Type: void A::()
+; ASM: .asciz	"A::f"                  # Name
+; ASM: .byte	243
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # Struct (0x100B)
+; ASM: .short	0x16                    # Record length
+; ASM: .short	0x1505                  # Record kind: LF_STRUCTURE
+; ASM: .short	0x2                     # MemberCount
+; ASM: .short	0x0                     # Properties
+; ASM: .long	0x100a                  # FieldList: <field list>
+; ASM: .long	0x0                     # DerivedFrom
+; ASM: .long	0x0                     # VShape
+; ASM: .short	0x4                     # SizeOf
+; ASM: .asciz	"A"                     # Name
+; ASM: # StringId (0x100C)
+; ASM: .short	0x1e                    # Record length
+; ASM: .short	0x1605                  # Record kind: LF_STRING_ID
+; ASM: .long	0x0                     # Id
+; ASM: .asciz	"D:\\src\\llvm\\build\\t.cpp" # StringData
+; ASM: # UdtSourceLine (0x100D)
+; ASM: .short	0xe                     # Record length
+; ASM: .short	0x1606                  # Record kind: LF_UDT_SRC_LINE
+; ASM: .long	0x100b                  # UDT: A
+; ASM: .long	0x100c                  # SourceFile: D:\src\llvm\build\t.cpp
+; ASM: .long	0x1                     # LineNumber
+; ASM: # Pointer (0x100E)
+; ASM: .short	0x12                    # Record length
+; ASM: .short	0x1002                  # Record kind: LF_POINTER
+; ASM: .long	0x1009                  # PointeeType: void A::()
+; ASM: .long	0x1006c                 # Attrs: [ Type: Near64, Mode: PointerToMemberFunction, SizeOf: 8 ]
+; ASM: .long	0x1005                  # ClassType: A
+; ASM: .short	0x8                     # Representation: GeneralFunction
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # Modifier (0x100F)
+; ASM: .short	0xa                     # Record length
+; ASM: .short	0x1001                  # Record kind: LF_MODIFIER
+; ASM: .long	0x3                     # ModifiedType: void
+; ASM: .short	0x1                     # Modifiers ( Const (0x1) )
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # Pointer (0x1010)
+; ASM: .short	0xa                     # Record length
+; ASM: .short	0x1002                  # Record kind: LF_POINTER
+; ASM: .long	0x100f                  # PointeeType: const void
+; ASM: .long	0x1000c                 # Attrs: [ Type: Near64, Mode: Pointer, SizeOf: 8 ]
+; ASM: # Procedure (0x1011)
+; ASM: .short	0xe                     # Record length
+; ASM: .short	0x1008                  # Record kind: LF_PROCEDURE
+; ASM: .long	0x3                     # ReturnType: void
+; ASM: .byte	0x0                     # CallingConvention: NearC
+; ASM: .byte	0x0                     # FunctionOptions
+; ASM: .short	0x0                     # NumParameters
+; ASM: .long	0x1008                  # ArgListType: ()
+; ASM: # FuncId (0x1012)
+; ASM: .short	0x16                    # Record length
+; ASM: .short	0x1601                  # Record kind: LF_FUNC_ID
+; ASM: .long	0x0                     # ParentScope
+; ASM: .long	0x1011                  # FunctionType: void ()
+; ASM: .asciz	"CharTypes"             # Name
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # StringId (0x1013)
+; ASM: .short	0x1a                    # Record length
+; ASM: .short	0x1605                  # Record kind: LF_STRING_ID
+; ASM: .long	0x0                     # Id
+; ASM: .asciz	"D:\\src\\llvm\\build"  # StringData
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # StringId (0x1014)
+; ASM: .short	0xe                     # Record length
+; ASM: .short	0x1605                  # Record kind: LF_STRING_ID
+; ASM: .long	0x0                     # Id
+; ASM: .asciz	"t.cpp"                 # StringData
+; ASM: .byte	242
+; ASM: .byte	241
+; ASM: # BuildInfo (0x1015)
+; ASM: .short	0x1a                    # Record length
+; ASM: .short	0x1603                  # Record kind: LF_BUILDINFO
+; ASM: .short	0x5                     # NumArgs
+; ASM: .long	0x1013                  # Argument: D:\src\llvm\build
+; ASM: .long	0x0                     # Argument
+; ASM: .long	0x1014                  # Argument: t.cpp
+; ASM: .long	0x0                     # Argument
+; ASM: .long	0x0                     # Argument
+; ASM: .byte	242
+; ASM: .byte	241
 
 ; ModuleID = 't.cpp'
 source_filename = "t.cpp"
@@ -460,7 +633,7 @@ attributes #3 = { nounwind uwtable "disable-tail-calls"="false" "less-precise-fp
 !4 = !{i32 2, !"Debug Info Version", i32 3}
 !5 = !{i32 1, !"PIC Level", i32 2}
 !6 = !{!"clang version 3.9.0 "}
-!7 = distinct !DISubprogram(name: "f", linkageName: "\01?f@@YAXMN_J@Z", scope: !1, file: !1, line: 6, type: !8, isLocal: false, isDefinition: true, scopeLine: 6, flags: DIFlagPrototyped, isOptimized: false, unit: !0, variables: !2)
+!7 = distinct !DISubprogram(name: "f", linkageName: "\01?f@@YAXMN_J@Z", scope: !1, file: !1, line: 6, type: !8, isLocal: false, isDefinition: true, scopeLine: 6, flags: DIFlagPrototyped, isOptimized: false, unit: !0, retainedNodes: !2)
 !8 = !DISubroutineType(types: !9)
 !9 = !{null, !10, !11, !12}
 !10 = !DIBasicType(name: "float", size: 32, align: 32, encoding: DW_ATE_float)
@@ -525,7 +698,7 @@ attributes #3 = { nounwind uwtable "disable-tail-calls"="false" "less-precise-fp
 !69 = !DILocation(line: 18, column: 11, scope: !7)
 !70 = !DILocation(line: 18, column: 3, scope: !7)
 !71 = !DILocation(line: 19, column: 1, scope: !7)
-!72 = distinct !DISubprogram(name: "CharTypes", linkageName: "\01?CharTypes@@YAXXZ", scope: !1, file: !1, line: 20, type: !73, isLocal: false, isDefinition: true, scopeLine: 20, flags: DIFlagPrototyped, isOptimized: false, unit: !0, variables: !2)
+!72 = distinct !DISubprogram(name: "CharTypes", linkageName: "\01?CharTypes@@YAXXZ", scope: !1, file: !1, line: 20, type: !73, isLocal: false, isDefinition: true, scopeLine: 20, flags: DIFlagPrototyped, isOptimized: false, unit: !0, retainedNodes: !2)
 !73 = !DISubroutineType(types: !74)
 !74 = !{null}
 !75 = !DILocalVariable(name: "w", scope: !72, file: !1, line: 21, type: !76)

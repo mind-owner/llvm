@@ -1,14 +1,13 @@
 //===- PredicateInfo.h - Build PredicateInfo ----------------------*-C++-*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// \brief  This file implements the PredicateInfo analysis, which creates an Extended
+///  This file implements the PredicateInfo analysis, which creates an Extended
 /// SSA form for operations used in branch comparisons and llvm.assume
 /// comparisons.
 ///
@@ -31,7 +30,7 @@
 /// %cmp = icmp eq i32, %x, 50
 /// br i1 %cmp, label %true, label %false
 /// true:
-/// %x.0 = call @llvm.ssa_copy.i32(i32 %x)
+/// %x.0 = call \@llvm.ssa_copy.i32(i32 %x)
 /// ret i32 %x.0
 /// false:
 /// ret i32 1
@@ -54,11 +53,13 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/OrderedInstructions.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
@@ -69,6 +70,7 @@
 #include "llvm/IR/Use.h"
 #include "llvm/IR/User.h"
 #include "llvm/IR/Value.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Pass.h"
 #include "llvm/PassAnalysisSupport.h"
 #include "llvm/Support/Casting.h"
@@ -89,7 +91,6 @@ class Instruction;
 class MemoryAccess;
 class LLVMContext;
 class raw_ostream;
-class OrderedBasicBlock;
 
 enum PredicateType { PT_Branch, PT_Assume, PT_Switch };
 
@@ -114,8 +115,9 @@ protected:
 class PredicateWithCondition : public PredicateBase {
 public:
   Value *Condition;
-  static inline bool classof(const PredicateBase *PB) {
-    return PB->Type == PT_Assume || PB->Type == PT_Branch || PB->Type == PT_Switch;
+  static bool classof(const PredicateBase *PB) {
+    return PB->Type == PT_Assume || PB->Type == PT_Branch ||
+           PB->Type == PT_Switch;
   }
 
 protected:
@@ -133,7 +135,7 @@ public:
       : PredicateWithCondition(PT_Assume, Op, Condition),
         AssumeInst(AssumeInst) {}
   PredicateAssume() = delete;
-  static inline bool classof(const PredicateBase *PB) {
+  static bool classof(const PredicateBase *PB) {
     return PB->Type == PT_Assume;
   }
 };
@@ -146,7 +148,7 @@ public:
   BasicBlock *From;
   BasicBlock *To;
   PredicateWithEdge() = delete;
-  static inline bool classof(const PredicateBase *PB) {
+  static bool classof(const PredicateBase *PB) {
     return PB->Type == PT_Branch || PB->Type == PT_Switch;
   }
 
@@ -166,7 +168,7 @@ public:
       : PredicateWithEdge(PT_Branch, Op, BranchBB, SplitBB, Condition),
         TrueEdge(TakenEdge) {}
   PredicateBranch() = delete;
-  static inline bool classof(const PredicateBase *PB) {
+  static bool classof(const PredicateBase *PB) {
     return PB->Type == PT_Branch;
   }
 };
@@ -182,7 +184,7 @@ public:
                           SI->getCondition()),
         CaseValue(CaseValue), Switch(SI) {}
   PredicateSwitch() = delete;
-  static inline bool classof(const PredicateBase *PB) {
+  static bool classof(const PredicateBase *PB) {
     return PB->Type == PT_Switch;
   }
 };
@@ -192,7 +194,7 @@ namespace PredicateInfoClasses {
 struct ValueDFS;
 }
 
-/// \brief Encapsulates PredicateInfo, including all data associated with memory
+/// Encapsulates PredicateInfo, including all data associated with memory
 /// accesses.
 class PredicateInfo {
 private:
@@ -227,10 +229,10 @@ protected:
 
 private:
   void buildPredicateInfo();
-  void processAssume(IntrinsicInst *, BasicBlock *, SmallPtrSetImpl<Value *> &);
-  void processBranch(BranchInst *, BasicBlock *, SmallPtrSetImpl<Value *> &);
-  void processSwitch(SwitchInst *, BasicBlock *, SmallPtrSetImpl<Value *> &);
-  void renameUses(SmallPtrSetImpl<Value *> &);
+  void processAssume(IntrinsicInst *, BasicBlock *, SmallVectorImpl<Value *> &);
+  void processBranch(BranchInst *, BasicBlock *, SmallVectorImpl<Value *> &);
+  void processSwitch(SwitchInst *, BasicBlock *, SmallVectorImpl<Value *> &);
+  void renameUses(SmallVectorImpl<Value *> &);
   using ValueDFS = PredicateInfoClasses::ValueDFS;
   typedef SmallVectorImpl<ValueDFS> ValueDFSStack;
   void convertUsesToDFSOrdered(Value *, SmallVectorImpl<ValueDFS> &);
@@ -238,12 +240,13 @@ private:
   bool stackIsInScope(const ValueDFSStack &, const ValueDFS &) const;
   void popStackUntilDFSScope(ValueDFSStack &, const ValueDFS &);
   ValueInfo &getOrCreateValueInfo(Value *);
-  void addInfoFor(SmallPtrSetImpl<Value *> &OpsToRename, Value *Op,
+  void addInfoFor(SmallVectorImpl<Value *> &OpsToRename, Value *Op,
                   PredicateBase *PB);
   const ValueInfo &getValueInfo(Value *) const;
   Function &F;
   DominatorTree &DT;
   AssumptionCache &AC;
+  OrderedInstructions OI;
   // This maps from copy operands to Predicate Info. Note that it does not own
   // the Predicate Info, they belong to the ValueInfo structs in the ValueInfos
   // vector.
@@ -256,11 +259,11 @@ private:
   // 0 is not a valid Value Info index, you can use DenseMap::lookup and tell
   // whether it returned a valid result.
   DenseMap<Value *, unsigned int> ValueInfoNums;
-  // OrderedBasicBlocks used during sorting uses
-  DenseMap<const BasicBlock *, std::unique_ptr<OrderedBasicBlock>> OBBMap;
   // The set of edges along which we can only handle phi uses, due to critical
   // edges.
   DenseSet<std::pair<BasicBlock *, BasicBlock *>> EdgeUsesOnly;
+  // The set of ssa_copy declarations we created with our custom mangling.
+  SmallSet<AssertingVH<Function>, 20> CreatedDeclarations;
 };
 
 // This pass does eager building and then printing of PredicateInfo. It is used
@@ -275,7 +278,7 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 };
 
-/// \brief Printer pass for \c PredicateInfo.
+/// Printer pass for \c PredicateInfo.
 class PredicateInfoPrinterPass
     : public PassInfoMixin<PredicateInfoPrinterPass> {
   raw_ostream &OS;
@@ -285,7 +288,7 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
 
-/// \brief Verifier pass for \c PredicateInfo.
+/// Verifier pass for \c PredicateInfo.
 struct PredicateInfoVerifierPass : PassInfoMixin<PredicateInfoVerifierPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };

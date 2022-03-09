@@ -1,9 +1,8 @@
-//===-- ARMFastISel.cpp - ARM FastISel implementation ---------------------===//
+//===- ARMFastISel.cpp - ARM FastISel implementation ----------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -23,24 +22,29 @@
 #include "ARMSubtarget.h"
 #include "MCTargetDesc/ARMAddressingModes.h"
 #include "MCTargetDesc/ARMBaseInfo.h"
+#include "Utils/ARMBaseInfo.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/FastISel.h"
 #include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/ISDOpcodes.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
-#include "llvm/CodeGen/MachineValueType.h"
 #include "llvm/CodeGen/RuntimeLibcalls.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetLowering.h"
+#include "llvm/CodeGen/TargetOpcodes.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/ValueTypes.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
@@ -58,6 +62,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
@@ -68,9 +73,8 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MachineValueType.h"
 #include "llvm/Support/MathExtras.h"
-#include "llvm/Target/TargetInstrInfo.h"
-#include "llvm/Target/TargetLowering.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include <cassert>
@@ -82,7 +86,7 @@ using namespace llvm;
 namespace {
 
   // All possible address modes, plus some.
-  typedef struct Address {
+  struct Address {
     enum {
       RegBase,
       FrameIndexBase
@@ -99,7 +103,7 @@ namespace {
     Address() {
       Base.Reg = 0;
     }
-  } Address;
+  };
 
 class ARMFastISel final : public FastISel {
   /// Subtarget - Keep a pointer to the ARMSubtarget around so that we can
@@ -187,8 +191,8 @@ class ARMFastISel final : public FastISel {
     bool isTypeLegal(Type *Ty, MVT &VT);
     bool isLoadTypeLegal(Type *Ty, MVT &VT);
     bool ARMEmitCmp(const Value *Src1Value, const Value *Src2Value,
-                    bool isZExt, bool isEquality);
-    bool ARMEmitLoad(MVT VT, unsigned &ResultReg, Address &Addr,
+                    bool isZExt);
+    bool ARMEmitLoad(MVT VT, Register &ResultReg, Address &Addr,
                      unsigned Alignment = 0, bool isZExt = true,
                      bool allocReg = true);
     bool ARMEmitStore(MVT VT, unsigned SrcReg, Address &Addr,
@@ -215,15 +219,15 @@ class ARMFastISel final : public FastISel {
                                   bool Return,
                                   bool isVarArg);
     bool ProcessCallArgs(SmallVectorImpl<Value*> &Args,
-                         SmallVectorImpl<unsigned> &ArgRegs,
+                         SmallVectorImpl<Register> &ArgRegs,
                          SmallVectorImpl<MVT> &ArgVTs,
                          SmallVectorImpl<ISD::ArgFlagsTy> &ArgFlags,
-                         SmallVectorImpl<unsigned> &RegArgs,
+                         SmallVectorImpl<Register> &RegArgs,
                          CallingConv::ID CC,
                          unsigned &NumBytes,
                          bool isVarArg);
     unsigned getLibcallReg(const Twine &Name);
-    bool FinishCall(MVT RetVT, SmallVectorImpl<unsigned> &UsedRegs,
+    bool FinishCall(MVT RetVT, SmallVectorImpl<Register> &UsedRegs,
                     const Instruction *I, CallingConv::ID CC,
                     unsigned &NumBytes, bool isVarArg);
     bool ARMEmitLibcall(const Instruction *I, RTLIB::Libcall Call);
@@ -240,8 +244,6 @@ class ARMFastISel final : public FastISel {
 
 } // end anonymous namespace
 
-#include "ARMGenCallingConv.inc"
-
 // DefinesOptionalPredicate - This is different from DefinesPredicate in that
 // we don't care about implicit defs here, just places we'll need to add a
 // default CCReg argument. Sets CPSR if we're setting CPSR instead of CCR.
@@ -250,8 +252,7 @@ bool ARMFastISel::DefinesOptionalPredicate(MachineInstr *MI, bool *CPSR) {
     return false;
 
   // Look to see if our OptionalDef is defining CPSR or CCR.
-  for (unsigned i = 0, e = MI->getNumOperands(); i != e; ++i) {
-    const MachineOperand &MO = MI->getOperand(i);
+  for (const MachineOperand &MO : MI->operands()) {
     if (!MO.isReg() || !MO.isDef()) continue;
     if (MO.getReg() == ARM::CPSR)
       *CPSR = true;
@@ -267,8 +268,8 @@ bool ARMFastISel::isARMNEONPred(const MachineInstr *MI) {
        AFI->isThumb2Function())
     return MI->isPredicable();
 
-  for (unsigned i = 0, e = MCID.getNumOperands(); i != e; ++i)
-    if (MCID.OpInfo[i].isPredicate())
+  for (const MCOperandInfo &opInfo : MCID.operands())
+    if (opInfo.isPredicate())
       return true;
 
   return false;
@@ -300,7 +301,7 @@ ARMFastISel::AddOptionalDefs(const MachineInstrBuilder &MIB) {
 unsigned ARMFastISel::fastEmitInst_r(unsigned MachineInstOpcode,
                                      const TargetRegisterClass *RC,
                                      unsigned Op0, bool Op0IsKill) {
-  unsigned ResultReg = createResultReg(RC);
+  Register ResultReg = createResultReg(RC);
   const MCInstrDesc &II = TII.get(MachineInstOpcode);
 
   // Make sure the input operand is sufficiently constrained to be legal
@@ -440,7 +441,7 @@ unsigned ARMFastISel::ARMMaterializeFP(const ConstantFP *CFP, MVT VT) {
   }
 
   // Require VFP2 for loading fp constants.
-  if (!Subtarget->hasVFP2()) return false;
+  if (!Subtarget->hasVFP2Base()) return false;
 
   // MachineConstantPool wants an explicit alignment.
   unsigned Align = DL.getPrefTypeAlignment(CFP->getType());
@@ -496,7 +497,7 @@ unsigned ARMFastISel::ARMMaterializeInt(const Constant *C, MVT VT) {
   }
 
   unsigned ResultReg = 0;
-  if (Subtarget->useMovt(*FuncInfo.MF))
+  if (Subtarget->useMovt())
     ResultReg = fastEmit_i(VT, VT, ISD::Constant, CI->getZExtValue());
 
   if (ResultReg)
@@ -554,7 +555,7 @@ unsigned ARMFastISel::ARMMaterializeGV(const GlobalValue *GV, MVT VT) {
   bool IsPositionIndependent = isPositionIndependent();
   // Use movw+movt when possible, it avoids constant pool entries.
   // Non-darwin targets only support static movt relocations in FastISel.
-  if (Subtarget->useMovt(*FuncInfo.MF) &&
+  if (Subtarget->useMovt() &&
       (Subtarget->isTargetMachO() || !IsPositionIndependent)) {
     unsigned Opc;
     unsigned char TF = 0;
@@ -912,7 +913,7 @@ void ARMFastISel::AddLoadStoreOperands(MVT VT, Address &Addr,
   AddOptionalDefs(MIB);
 }
 
-bool ARMFastISel::ARMEmitLoad(MVT VT, unsigned &ResultReg, Address &Addr,
+bool ARMFastISel::ARMEmitLoad(MVT VT, Register &ResultReg, Address &Addr,
                               unsigned Alignment, bool isZExt, bool allocReg) {
   unsigned Opc;
   bool useAM3 = false;
@@ -968,7 +969,7 @@ bool ARMFastISel::ARMEmitLoad(MVT VT, unsigned &ResultReg, Address &Addr,
       RC = isThumb2 ? &ARM::rGPRRegClass : &ARM::GPRnopcRegClass;
       break;
     case MVT::f32:
-      if (!Subtarget->hasVFP2()) return false;
+      if (!Subtarget->hasVFP2Base()) return false;
       // Unaligned loads need special handling. Floats require word-alignment.
       if (Alignment && Alignment < 4) {
         needVMOV = true;
@@ -981,7 +982,8 @@ bool ARMFastISel::ARMEmitLoad(MVT VT, unsigned &ResultReg, Address &Addr,
       }
       break;
     case MVT::f64:
-      if (!Subtarget->hasVFP2()) return false;
+      // Can load and store double precision even without FeatureFP64
+      if (!Subtarget->hasVFP2Base()) return false;
       // FIXME: Unaligned loads need special handling.  Doublewords require
       // word-alignment.
       if (Alignment && Alignment < 4)
@@ -1043,7 +1045,7 @@ bool ARMFastISel::SelectLoad(const Instruction *I) {
   Address Addr;
   if (!ARMComputeAddress(I->getOperand(0), Addr)) return false;
 
-  unsigned ResultReg;
+  Register ResultReg;
   if (!ARMEmitLoad(VT, ResultReg, Addr, cast<LoadInst>(I)->getAlignment()))
     return false;
   updateValueMap(I, ResultReg);
@@ -1106,7 +1108,7 @@ bool ARMFastISel::ARMEmitStore(MVT VT, unsigned SrcReg, Address &Addr,
       }
       break;
     case MVT::f32:
-      if (!Subtarget->hasVFP2()) return false;
+      if (!Subtarget->hasVFP2Base()) return false;
       // Unaligned stores need special handling. Floats require word-alignment.
       if (Alignment && Alignment < 4) {
         unsigned MoveReg = createResultReg(TLI.getRegClassFor(MVT::i32));
@@ -1121,7 +1123,8 @@ bool ARMFastISel::ARMEmitStore(MVT VT, unsigned SrcReg, Address &Addr,
       }
       break;
     case MVT::f64:
-      if (!Subtarget->hasVFP2()) return false;
+      // Can load and store double precision even without FeatureFP64
+      if (!Subtarget->hasVFP2Base()) return false;
       // FIXME: Unaligned stores need special handling.  Doublewords require
       // word-alignment.
       if (Alignment && Alignment < 4)
@@ -1256,8 +1259,7 @@ bool ARMFastISel::SelectBranch(const Instruction *I) {
       if (ARMPred == ARMCC::AL) return false;
 
       // Emit the compare.
-      if (!ARMEmitCmp(CI->getOperand(0), CI->getOperand(1), CI->isUnsigned(),
-                      CI->isEquality()))
+      if (!ARMEmitCmp(CI->getOperand(0), CI->getOperand(1), CI->isUnsigned()))
         return false;
 
       unsigned BrOpc = isThumb2 ? ARM::t2Bcc : ARM::Bcc;
@@ -1333,6 +1335,8 @@ bool ARMFastISel::SelectIndirectBr(const Instruction *I) {
   if (AddrReg == 0) return false;
 
   unsigned Opc = isThumb2 ? ARM::tBRIND : ARM::BX;
+  assert(isThumb2 || Subtarget->hasV4TOps());
+
   AddOptionalDefs(BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
                           TII.get(Opc)).addReg(AddrReg));
 
@@ -1344,16 +1348,16 @@ bool ARMFastISel::SelectIndirectBr(const Instruction *I) {
 }
 
 bool ARMFastISel::ARMEmitCmp(const Value *Src1Value, const Value *Src2Value,
-                             bool isZExt, bool isEquality) {
+                             bool isZExt) {
   Type *Ty = Src1Value->getType();
   EVT SrcEVT = TLI.getValueType(DL, Ty, true);
   if (!SrcEVT.isSimple()) return false;
   MVT SrcVT = SrcEVT.getSimpleVT();
 
-  if (Ty->isFloatTy() && !Subtarget->hasVFP2())
+  if (Ty->isFloatTy() && !Subtarget->hasVFP2Base())
     return false;
 
-  if (Ty->isDoubleTy() && (!Subtarget->hasVFP2() || Subtarget->isFPOnlySP()))
+  if (Ty->isDoubleTy() && (!Subtarget->hasVFP2Base() || !Subtarget->hasFP64()))
     return false;
 
   // Check to see if the 2nd operand is a constant that we can encode directly
@@ -1392,25 +1396,17 @@ bool ARMFastISel::ARMEmitCmp(const Value *Src1Value, const Value *Src2Value,
     // TODO: Verify compares.
     case MVT::f32:
       isICmp = false;
-      // Equality comparisons shouldn't raise Invalid on uordered inputs.
-      if (isEquality)
-        CmpOpc = UseImm ? ARM::VCMPZS : ARM::VCMPS;
-      else
-        CmpOpc = UseImm ? ARM::VCMPEZS : ARM::VCMPES;
+      CmpOpc = UseImm ? ARM::VCMPZS : ARM::VCMPS;
       break;
     case MVT::f64:
       isICmp = false;
-      // Equality comparisons shouldn't raise Invalid on uordered inputs.
-      if (isEquality)
-        CmpOpc = UseImm ? ARM::VCMPZD : ARM::VCMPD;
-      else
-      CmpOpc = UseImm ? ARM::VCMPEZD : ARM::VCMPED;
+      CmpOpc = UseImm ? ARM::VCMPZD : ARM::VCMPD;
       break;
     case MVT::i1:
     case MVT::i8:
     case MVT::i16:
       needsExt = true;
-    // Intentional fall-through.
+      LLVM_FALLTHROUGH;
     case MVT::i32:
       if (isThumb2) {
         if (!UseImm)
@@ -1480,8 +1476,7 @@ bool ARMFastISel::SelectCmp(const Instruction *I) {
   if (ARMPred == ARMCC::AL) return false;
 
   // Emit the compare.
-  if (!ARMEmitCmp(CI->getOperand(0), CI->getOperand(1), CI->isUnsigned(),
-                  CI->isEquality()))
+  if (!ARMEmitCmp(CI->getOperand(0), CI->getOperand(1), CI->isUnsigned()))
     return false;
 
   // Now set a register based on the comparison. Explicitly set the predicates
@@ -1503,7 +1498,7 @@ bool ARMFastISel::SelectCmp(const Instruction *I) {
 
 bool ARMFastISel::SelectFPExt(const Instruction *I) {
   // Make sure we have VFP and that we're extending float to double.
-  if (!Subtarget->hasVFP2() || Subtarget->isFPOnlySP()) return false;
+  if (!Subtarget->hasVFP2Base() || !Subtarget->hasFP64()) return false;
 
   Value *V = I->getOperand(0);
   if (!I->getType()->isDoubleTy() ||
@@ -1522,7 +1517,7 @@ bool ARMFastISel::SelectFPExt(const Instruction *I) {
 
 bool ARMFastISel::SelectFPTrunc(const Instruction *I) {
   // Make sure we have VFP and that we're truncating double to float.
-  if (!Subtarget->hasVFP2() || Subtarget->isFPOnlySP()) return false;
+  if (!Subtarget->hasVFP2Base() || !Subtarget->hasFP64()) return false;
 
   Value *V = I->getOperand(0);
   if (!(I->getType()->isFloatTy() &&
@@ -1541,7 +1536,7 @@ bool ARMFastISel::SelectFPTrunc(const Instruction *I) {
 
 bool ARMFastISel::SelectIToFP(const Instruction *I, bool isSigned) {
   // Make sure we have VFP.
-  if (!Subtarget->hasVFP2()) return false;
+  if (!Subtarget->hasVFP2Base()) return false;
 
   MVT DstVT;
   Type *Ty = I->getType();
@@ -1573,7 +1568,7 @@ bool ARMFastISel::SelectIToFP(const Instruction *I, bool isSigned) {
 
   unsigned Opc;
   if (Ty->isFloatTy()) Opc = isSigned ? ARM::VSITOS : ARM::VUITOS;
-  else if (Ty->isDoubleTy() && !Subtarget->isFPOnlySP())
+  else if (Ty->isDoubleTy() && Subtarget->hasFP64())
     Opc = isSigned ? ARM::VSITOD : ARM::VUITOD;
   else return false;
 
@@ -1586,7 +1581,7 @@ bool ARMFastISel::SelectIToFP(const Instruction *I, bool isSigned) {
 
 bool ARMFastISel::SelectFPToI(const Instruction *I, bool isSigned) {
   // Make sure we have VFP.
-  if (!Subtarget->hasVFP2()) return false;
+  if (!Subtarget->hasVFP2Base()) return false;
 
   MVT DstVT;
   Type *RetTy = I->getType();
@@ -1599,7 +1594,7 @@ bool ARMFastISel::SelectFPToI(const Instruction *I, bool isSigned) {
   unsigned Opc;
   Type *OpTy = I->getOperand(0)->getType();
   if (OpTy->isFloatTy()) Opc = isSigned ? ARM::VTOSIZS : ARM::VTOUIZS;
-  else if (OpTy->isDoubleTy() && !Subtarget->isFPOnlySP())
+  else if (OpTy->isDoubleTy() && Subtarget->hasFP64())
     Opc = isSigned ? ARM::VTOSIZD : ARM::VTOUIZD;
   else return false;
 
@@ -1702,7 +1697,8 @@ bool ARMFastISel::SelectDiv(const Instruction *I, bool isSigned) {
   // If we have integer div support we should have selected this automagically.
   // In case we have a real miss go ahead and return false and we'll pick
   // it up later.
-  if (Subtarget->hasDivide()) return false;
+  if (Subtarget->hasDivideInThumbMode())
+    return false;
 
   // Otherwise emit a libcall.
   RTLIB::Libcall LC = RTLIB::UNKNOWN_LIBCALL;
@@ -1804,9 +1800,9 @@ bool ARMFastISel::SelectBinaryFPOp(const Instruction *I, unsigned ISDOpcode) {
   // if we have them.
   // FIXME: It'd be nice to use NEON instructions.
   Type *Ty = I->getType();
-  if (Ty->isFloatTy() && !Subtarget->hasVFP2())
+  if (Ty->isFloatTy() && !Subtarget->hasVFP2Base())
     return false;
-  if (Ty->isDoubleTy() && (!Subtarget->hasVFP2() || Subtarget->isFPOnlySP()))
+  if (Ty->isDoubleTy() && (!Subtarget->hasVFP2Base() || !Subtarget->hasFP64()))
     return false;
 
   unsigned Opc;
@@ -1846,9 +1842,9 @@ CCAssignFn *ARMFastISel::CCAssignFnForCall(CallingConv::ID CC,
                                            bool isVarArg) {
   switch (CC) {
   default:
-    llvm_unreachable("Unsupported calling convention");
+    report_fatal_error("Unsupported calling convention");
   case CallingConv::Fast:
-    if (Subtarget->hasVFP2() && !isVarArg) {
+    if (Subtarget->hasVFP2Base() && !isVarArg) {
       if (!Subtarget->isAAPCS_ABI())
         return (Return ? RetFastCC_ARM_APCS : FastCC_ARM_APCS);
       // For AAPCS ABI targets, just use VFP variant of the calling convention.
@@ -1859,7 +1855,7 @@ CCAssignFn *ARMFastISel::CCAssignFnForCall(CallingConv::ID CC,
   case CallingConv::CXX_FAST_TLS:
     // Use target triple & subtarget features to do actual dispatch.
     if (Subtarget->isAAPCS_ABI()) {
-      if (Subtarget->hasVFP2() &&
+      if (Subtarget->hasVFP2Base() &&
           TM.Options.FloatABIType == FloatABI::Hard && !isVarArg)
         return (Return ? RetCC_ARM_AAPCS_VFP: CC_ARM_AAPCS_VFP);
       else
@@ -1880,17 +1876,17 @@ CCAssignFn *ARMFastISel::CCAssignFnForCall(CallingConv::ID CC,
     return (Return ? RetCC_ARM_APCS: CC_ARM_APCS);
   case CallingConv::GHC:
     if (Return)
-      llvm_unreachable("Can't return in GHC call convention");
+      report_fatal_error("Can't return in GHC call convention");
     else
       return CC_ARM_APCS_GHC;
   }
 }
 
 bool ARMFastISel::ProcessCallArgs(SmallVectorImpl<Value*> &Args,
-                                  SmallVectorImpl<unsigned> &ArgRegs,
+                                  SmallVectorImpl<Register> &ArgRegs,
                                   SmallVectorImpl<MVT> &ArgVTs,
                                   SmallVectorImpl<ISD::ArgFlagsTy> &ArgFlags,
-                                  SmallVectorImpl<unsigned> &RegArgs,
+                                  SmallVectorImpl<Register> &RegArgs,
                                   CallingConv::ID CC,
                                   unsigned &NumBytes,
                                   bool isVarArg) {
@@ -1928,11 +1924,11 @@ bool ARMFastISel::ProcessCallArgs(SmallVectorImpl<Value*> &Args,
       case MVT::i32:
         break;
       case MVT::f32:
-        if (!Subtarget->hasVFP2())
+        if (!Subtarget->hasVFP2Base())
           return false;
         break;
       case MVT::f64:
-        if (!Subtarget->hasVFP2())
+        if (!Subtarget->hasVFP2Base())
           return false;
         break;
       }
@@ -1948,13 +1944,13 @@ bool ARMFastISel::ProcessCallArgs(SmallVectorImpl<Value*> &Args,
   unsigned AdjStackDown = TII.getCallFrameSetupOpcode();
   AddOptionalDefs(BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
                           TII.get(AdjStackDown))
-                  .addImm(NumBytes));
+                  .addImm(NumBytes).addImm(0));
 
   // Process the args.
   for (unsigned i = 0, e = ArgLocs.size(); i != e; ++i) {
     CCValAssign &VA = ArgLocs[i];
     const Value *ArgVal = Args[VA.getValNo()];
-    unsigned Arg = ArgRegs[VA.getValNo()];
+    Register Arg = ArgRegs[VA.getValNo()];
     MVT ArgVT = ArgVTs[VA.getValNo()];
 
     assert((!ArgVT.isVector() && ArgVT.getSizeInBits() <= 64) &&
@@ -1971,7 +1967,7 @@ bool ARMFastISel::ProcessCallArgs(SmallVectorImpl<Value*> &Args,
         break;
       }
       case CCValAssign::AExt:
-        // Intentional fall-through.  Handle AExt and ZExt.
+      // Intentional fall-through.  Handle AExt and ZExt.
       case CCValAssign::ZExt: {
         MVT DestVT = VA.getLocVT();
         Arg = ARMEmitIntExt(ArgVT, Arg, DestVT, /*isZExt*/true);
@@ -2000,6 +1996,7 @@ bool ARMFastISel::ProcessCallArgs(SmallVectorImpl<Value*> &Args,
       assert(VA.getLocVT() == MVT::f64 &&
              "Custom lowering for v2f64 args not available");
 
+      // FIXME: ArgLocs[++i] may extend beyond ArgLocs.size()
       CCValAssign &NextVA = ArgLocs[++i];
 
       assert(VA.isRegLoc() && NextVA.isRegLoc() &&
@@ -2032,7 +2029,7 @@ bool ARMFastISel::ProcessCallArgs(SmallVectorImpl<Value*> &Args,
   return true;
 }
 
-bool ARMFastISel::FinishCall(MVT RetVT, SmallVectorImpl<unsigned> &UsedRegs,
+bool ARMFastISel::FinishCall(MVT RetVT, SmallVectorImpl<Register> &UsedRegs,
                              const Instruction *I, CallingConv::ID CC,
                              unsigned &NumBytes, bool isVarArg) {
   // Issue CALLSEQ_END
@@ -2053,7 +2050,7 @@ bool ARMFastISel::FinishCall(MVT RetVT, SmallVectorImpl<unsigned> &UsedRegs,
       // double fp reg we want.
       MVT DestVT = RVLocs[0].getValVT();
       const TargetRegisterClass* DstRC = TLI.getRegClassFor(DestVT);
-      unsigned ResultReg = createResultReg(DstRC);
+      Register ResultReg = createResultReg(DstRC);
       AddOptionalDefs(BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
                               TII.get(ARM::VMOVDRR), ResultReg)
                       .addReg(RVLocs[0].getLocReg())
@@ -2074,7 +2071,7 @@ bool ARMFastISel::FinishCall(MVT RetVT, SmallVectorImpl<unsigned> &UsedRegs,
 
       const TargetRegisterClass* DstRC = TLI.getRegClassFor(CopyVT);
 
-      unsigned ResultReg = createResultReg(DstRC);
+      Register ResultReg = createResultReg(DstRC);
       BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
               TII.get(TargetOpcode::COPY),
               ResultReg).addReg(RVLocs[0].getLocReg());
@@ -2108,7 +2105,7 @@ bool ARMFastISel::SelectRet(const Instruction *I) {
   CallingConv::ID CC = F.getCallingConv();
   if (Ret->getNumOperands() > 0) {
     SmallVector<ISD::OutputArg, 4> Outs;
-    GetReturnInfo(F.getReturnType(), F.getAttributes(), Outs, TLI, DL);
+    GetReturnInfo(CC, F.getReturnType(), F.getAttributes(), Outs, TLI, DL);
 
     // Analyze operands of the call, assigning locations to each operand.
     SmallVector<CCValAssign, 16> ValLocs;
@@ -2155,7 +2152,7 @@ bool ARMFastISel::SelectRet(const Instruction *I) {
     }
 
     // Make the copy.
-    unsigned DstReg = VA.getLocReg();
+    Register DstReg = VA.getLocReg();
     const TargetRegisterClass* SrcRC = MRI.getRegClass(SrcReg);
     // Avoid a cross-class copy. This is very unlikely.
     if (!SrcRC->contains(DstReg))
@@ -2167,12 +2164,11 @@ bool ARMFastISel::SelectRet(const Instruction *I) {
     RetRegs.push_back(VA.getLocReg());
   }
 
-  unsigned RetOpc = isThumb2 ? ARM::tBX_RET : ARM::BX_RET;
   MachineInstrBuilder MIB = BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
-                                    TII.get(RetOpc));
+                                    TII.get(Subtarget->getReturnOpcode()));
   AddOptionalDefs(MIB);
-  for (unsigned i = 0, e = RetRegs.size(); i != e; ++i)
-    MIB.addReg(RetRegs[i], RegState::Implicit);
+  for (unsigned R : RetRegs)
+    MIB.addReg(R, RegState::Implicit);
   return true;
 }
 
@@ -2225,15 +2221,14 @@ bool ARMFastISel::ARMEmitLibcall(const Instruction *I, RTLIB::Libcall Call) {
 
   // Set up the argument vectors.
   SmallVector<Value*, 8> Args;
-  SmallVector<unsigned, 8> ArgRegs;
+  SmallVector<Register, 8> ArgRegs;
   SmallVector<MVT, 8> ArgVTs;
   SmallVector<ISD::ArgFlagsTy, 8> ArgFlags;
   Args.reserve(I->getNumOperands());
   ArgRegs.reserve(I->getNumOperands());
   ArgVTs.reserve(I->getNumOperands());
   ArgFlags.reserve(I->getNumOperands());
-  for (unsigned i = 0; i < I->getNumOperands(); ++i) {
-    Value *Op = I->getOperand(i);
+  for (Value *Op :  I->operands()) {
     unsigned Arg = getRegForValue(Op);
     if (Arg == 0) return false;
 
@@ -2242,8 +2237,7 @@ bool ARMFastISel::ARMEmitLibcall(const Instruction *I, RTLIB::Libcall Call) {
     if (!isTypeLegal(ArgTy, ArgVT)) return false;
 
     ISD::ArgFlagsTy Flags;
-    unsigned OriginalAlignment = DL.getABITypeAlignment(ArgTy);
-    Flags.setOrigAlign(OriginalAlignment);
+    Flags.setOrigAlign(Align(DL.getABITypeAlignment(ArgTy)));
 
     Args.push_back(Op);
     ArgRegs.push_back(Arg);
@@ -2252,13 +2246,13 @@ bool ARMFastISel::ARMEmitLibcall(const Instruction *I, RTLIB::Libcall Call) {
   }
 
   // Handle the arguments now that we've gotten them.
-  SmallVector<unsigned, 4> RegArgs;
+  SmallVector<Register, 4> RegArgs;
   unsigned NumBytes;
   if (!ProcessCallArgs(Args, ArgRegs, ArgVTs, ArgFlags,
                        RegArgs, CC, NumBytes, false))
     return false;
 
-  unsigned CalleeReg = 0;
+  Register CalleeReg;
   if (Subtarget->genLongCalls()) {
     CalleeReg = getLibcallReg(TLI.getLibcallName(Call));
     if (CalleeReg == 0) return false;
@@ -2277,15 +2271,15 @@ bool ARMFastISel::ARMEmitLibcall(const Instruction *I, RTLIB::Libcall Call) {
     MIB.addExternalSymbol(TLI.getLibcallName(Call));
 
   // Add implicit physical register uses to the call.
-  for (unsigned i = 0, e = RegArgs.size(); i != e; ++i)
-    MIB.addReg(RegArgs[i], RegState::Implicit);
+  for (Register R : RegArgs)
+    MIB.addReg(R, RegState::Implicit);
 
   // Add a register mask with the call-preserved registers.
   // Proper defs for return values will be added by setPhysRegsDeadExcept().
   MIB.addRegMask(TRI.getCallPreservedMask(*FuncInfo.MF, CC));
 
   // Finish off the call including any return values.
-  SmallVector<unsigned, 4> UsedRegs;
+  SmallVector<Register, 4> UsedRegs;
   if (!FinishCall(RetVT, UsedRegs, I, CC, NumBytes, false)) return false;
 
   // Set all unused physreg defs as dead.
@@ -2335,7 +2329,7 @@ bool ARMFastISel::SelectCall(const Instruction *I,
 
   // Set up the argument vectors.
   SmallVector<Value*, 8> Args;
-  SmallVector<unsigned, 8> ArgRegs;
+  SmallVector<Register, 8> ArgRegs;
   SmallVector<MVT, 8> ArgVTs;
   SmallVector<ISD::ArgFlagsTy, 8> ArgFlags;
   unsigned arg_size = CS.arg_size();
@@ -2346,24 +2340,24 @@ bool ARMFastISel::SelectCall(const Instruction *I,
   for (ImmutableCallSite::arg_iterator i = CS.arg_begin(), e = CS.arg_end();
        i != e; ++i) {
     // If we're lowering a memory intrinsic instead of a regular call, skip the
-    // last two arguments, which shouldn't be passed to the underlying function.
-    if (IntrMemName && e-i <= 2)
+    // last argument, which shouldn't be passed to the underlying function.
+    if (IntrMemName && e - i <= 1)
       break;
 
     ISD::ArgFlagsTy Flags;
-    unsigned AttrInd = i - CS.arg_begin() + 1;
-    if (CS.paramHasAttr(AttrInd, Attribute::SExt))
+    unsigned ArgIdx = i - CS.arg_begin();
+    if (CS.paramHasAttr(ArgIdx, Attribute::SExt))
       Flags.setSExt();
-    if (CS.paramHasAttr(AttrInd, Attribute::ZExt))
+    if (CS.paramHasAttr(ArgIdx, Attribute::ZExt))
       Flags.setZExt();
 
     // FIXME: Only handle *easy* calls for now.
-    if (CS.paramHasAttr(AttrInd, Attribute::InReg) ||
-        CS.paramHasAttr(AttrInd, Attribute::StructRet) ||
-        CS.paramHasAttr(AttrInd, Attribute::SwiftSelf) ||
-        CS.paramHasAttr(AttrInd, Attribute::SwiftError) ||
-        CS.paramHasAttr(AttrInd, Attribute::Nest) ||
-        CS.paramHasAttr(AttrInd, Attribute::ByVal))
+    if (CS.paramHasAttr(ArgIdx, Attribute::InReg) ||
+        CS.paramHasAttr(ArgIdx, Attribute::StructRet) ||
+        CS.paramHasAttr(ArgIdx, Attribute::SwiftSelf) ||
+        CS.paramHasAttr(ArgIdx, Attribute::SwiftError) ||
+        CS.paramHasAttr(ArgIdx, Attribute::Nest) ||
+        CS.paramHasAttr(ArgIdx, Attribute::ByVal))
       return false;
 
     Type *ArgTy = (*i)->getType();
@@ -2372,12 +2366,11 @@ bool ARMFastISel::SelectCall(const Instruction *I,
         ArgVT != MVT::i1)
       return false;
 
-    unsigned Arg = getRegForValue(*i);
-    if (Arg == 0)
+    Register Arg = getRegForValue(*i);
+    if (!Arg.isValid())
       return false;
 
-    unsigned OriginalAlignment = DL.getABITypeAlignment(ArgTy);
-    Flags.setOrigAlign(OriginalAlignment);
+    Flags.setOrigAlign(Align(DL.getABITypeAlignment(ArgTy)));
 
     Args.push_back(*i);
     ArgRegs.push_back(Arg);
@@ -2386,7 +2379,7 @@ bool ARMFastISel::SelectCall(const Instruction *I,
   }
 
   // Handle the arguments now that we've gotten them.
-  SmallVector<unsigned, 4> RegArgs;
+  SmallVector<Register, 4> RegArgs;
   unsigned NumBytes;
   if (!ProcessCallArgs(Args, ArgRegs, ArgVTs, ArgFlags,
                        RegArgs, CC, NumBytes, isVarArg))
@@ -2396,7 +2389,7 @@ bool ARMFastISel::SelectCall(const Instruction *I,
   const GlobalValue *GV = dyn_cast<GlobalValue>(Callee);
   if (!GV || Subtarget->genLongCalls()) UseReg = true;
 
-  unsigned CalleeReg = 0;
+  Register CalleeReg;
   if (UseReg) {
     if (IntrMemName)
       CalleeReg = getLibcallReg(IntrMemName);
@@ -2422,15 +2415,15 @@ bool ARMFastISel::SelectCall(const Instruction *I,
     MIB.addExternalSymbol(IntrMemName, 0);
 
   // Add implicit physical register uses to the call.
-  for (unsigned i = 0, e = RegArgs.size(); i != e; ++i)
-    MIB.addReg(RegArgs[i], RegState::Implicit);
+  for (Register R : RegArgs)
+    MIB.addReg(R, RegState::Implicit);
 
   // Add a register mask with the call-preserved registers.
   // Proper defs for return values will be added by setPhysRegsDeadExcept().
   MIB.addRegMask(TRI.getCallPreservedMask(*FuncInfo.MF, CC));
 
   // Finish off the call including any return values.
-  SmallVector<unsigned, 4> UsedRegs;
+  SmallVector<Register, 4> UsedRegs;
   if (!FinishCall(RetVT, UsedRegs, I, CC, NumBytes, isVarArg))
     return false;
 
@@ -2471,7 +2464,7 @@ bool ARMFastISel::ARMTryEmitSmallMemCpy(Address Dest, Address Src,
     }
 
     bool RV;
-    unsigned ResultReg;
+    Register ResultReg;
     RV = ARMEmitLoad(VT, ResultReg, Src);
     assert(RV && "Should be able to handle this load.");
     RV = ARMEmitStore(VT, ResultReg, Dest);
@@ -2501,7 +2494,7 @@ bool ARMFastISel::SelectIntrinsicCall(const IntrinsicInst &I) {
 
     const ARMBaseRegisterInfo *RegInfo =
         static_cast<const ARMBaseRegisterInfo *>(Subtarget->getRegisterInfo());
-    unsigned FramePtr = RegInfo->getFrameRegister(*(FuncInfo.MF));
+    Register FramePtr = RegInfo->getFrameRegister(*(FuncInfo.MF));
     unsigned SrcReg = FramePtr;
 
     // Recursively load frame address
@@ -2540,7 +2533,8 @@ bool ARMFastISel::SelectIntrinsicCall(const IntrinsicInst &I) {
         if (!ARMComputeAddress(MTI.getRawDest(), Dest) ||
             !ARMComputeAddress(MTI.getRawSource(), Src))
           return false;
-        unsigned Alignment = MTI.getAlignment();
+        unsigned Alignment = MinAlign(MTI.getDestAlignment(),
+                                      MTI.getSourceAlignment());
         if (ARMTryEmitSmallMemCpy(Dest, Src, Len, Alignment))
           return true;
       }
@@ -2889,13 +2883,11 @@ bool ARMFastISel::fastSelectInstruction(const Instruction *I) {
   return false;
 }
 
-namespace {
-
 // This table describes sign- and zero-extend instructions which can be
 // folded into a preceding load. All of these extends have an immediate
 // (sometimes a mask and sometimes a shift) that's applied after
 // extension.
-const struct FoldableLoadExtendsStruct {
+static const struct FoldableLoadExtendsStruct {
   uint16_t Opc[2];  // ARM, Thumb.
   uint8_t ExpectedImm;
   uint8_t isZExt     : 1;
@@ -2908,9 +2900,7 @@ const struct FoldableLoadExtendsStruct {
   { { ARM::UXTB,  ARM::t2UXTB  },   0, 1, MVT::i8  }
 };
 
-} // end anonymous namespace
-
-/// \brief The specified machine instr operand is a vreg, and that
+/// The specified machine instr operand is a vreg, and that
 /// vreg is being provided by the specified load instruction.  If possible,
 /// try to fold the load as an operand to the instruction, returning true if
 /// successful.
@@ -2931,13 +2921,12 @@ bool ARMFastISel::tryToFoldLoadIntoMI(MachineInstr *MI, unsigned OpNo,
 
   bool Found = false;
   bool isZExt;
-  for (unsigned i = 0, e = array_lengthof(FoldableLoadExtends);
-       i != e; ++i) {
-    if (FoldableLoadExtends[i].Opc[isThumb2] == MI->getOpcode() &&
-        (uint64_t)FoldableLoadExtends[i].ExpectedImm == Imm &&
-        MVT((MVT::SimpleValueType)FoldableLoadExtends[i].ExpectedVT) == VT) {
+  for (const FoldableLoadExtendsStruct &FLE : FoldableLoadExtends) {
+    if (FLE.Opc[isThumb2] == MI->getOpcode() &&
+        (uint64_t)FLE.ExpectedImm == Imm &&
+        MVT((MVT::SimpleValueType)FLE.ExpectedVT) == VT) {
       Found = true;
-      isZExt = FoldableLoadExtends[i].isZExt;
+      isZExt = FLE.isZExt;
     }
   }
   if (!Found) return false;
@@ -2946,10 +2935,11 @@ bool ARMFastISel::tryToFoldLoadIntoMI(MachineInstr *MI, unsigned OpNo,
   Address Addr;
   if (!ARMComputeAddress(LI->getOperand(0), Addr)) return false;
 
-  unsigned ResultReg = MI->getOperand(0).getReg();
+  Register ResultReg = MI->getOperand(0).getReg();
   if (!ARMEmitLoad(VT, ResultReg, Addr, LI->getAlignment(), isZExt, false))
     return false;
-  MI->eraseFromParent();
+  MachineBasicBlock::iterator I(MI);
+  removeDeadCode(I, std::next(I));
   return true;
 }
 
@@ -2957,7 +2947,7 @@ unsigned ARMFastISel::ARMLowerPICELF(const GlobalValue *GV,
                                      unsigned Align, MVT VT) {
   bool UseGOT_PREL = !TM.shouldAssumeDSOLocal(*GV->getParent(), GV);
 
-  LLVMContext *Context = &MF->getFunction()->getContext();
+  LLVMContext *Context = &MF->getFunction().getContext();
   unsigned ARMPCLabelIndex = AFI->createPICLabelUId();
   unsigned PCAdj = Subtarget->isThumb() ? 4 : 8;
   ARMConstantPoolValue *CPV = ARMConstantPoolConstant::Create(
@@ -2968,12 +2958,16 @@ unsigned ARMFastISel::ARMLowerPICELF(const GlobalValue *GV,
   unsigned ConstAlign =
       MF->getDataLayout().getPrefTypeAlignment(Type::getInt32PtrTy(*Context));
   unsigned Idx = MF->getConstantPool()->getConstantPoolIndex(CPV, ConstAlign);
+  MachineMemOperand *CPMMO =
+      MF->getMachineMemOperand(MachinePointerInfo::getConstantPool(*MF),
+                               MachineMemOperand::MOLoad, 4, 4);
 
-  unsigned TempReg = MF->getRegInfo().createVirtualRegister(&ARM::rGPRRegClass);
+  Register TempReg = MF->getRegInfo().createVirtualRegister(&ARM::rGPRRegClass);
   unsigned Opc = isThumb2 ? ARM::t2LDRpci : ARM::LDRcp;
   MachineInstrBuilder MIB =
       BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(Opc), TempReg)
-          .addConstantPoolIndex(Idx);
+          .addConstantPoolIndex(Idx)
+          .addMemOperand(CPMMO);
   if (Opc == ARM::LDRcp)
     MIB.addImm(0);
   MIB.add(predOps(ARMCC::AL));
@@ -2986,6 +2980,7 @@ unsigned ARMFastISel::ARMLowerPICELF(const GlobalValue *GV,
   MIB = BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(Opc), DestReg)
             .addReg(TempReg)
             .addImm(ARMPCLabelIndex);
+
   if (!Subtarget->isThumb())
     MIB.add(predOps(ARMCC::AL));
 
@@ -3024,20 +3019,18 @@ bool ARMFastISel::fastLowerArguments() {
 
   // Only handle simple cases. i.e. Up to 4 i8/i16/i32 scalar arguments
   // which are passed in r0 - r3.
-  unsigned Idx = 1;
-  for (Function::const_arg_iterator I = F->arg_begin(), E = F->arg_end();
-       I != E; ++I, ++Idx) {
-    if (Idx > 4)
+  for (const Argument &Arg : F->args()) {
+    if (Arg.getArgNo() >= 4)
       return false;
 
-    if (F->getAttributes().hasAttribute(Idx, Attribute::InReg) ||
-        F->getAttributes().hasAttribute(Idx, Attribute::StructRet) ||
-        F->getAttributes().hasAttribute(Idx, Attribute::SwiftSelf) ||
-        F->getAttributes().hasAttribute(Idx, Attribute::SwiftError) ||
-        F->getAttributes().hasAttribute(Idx, Attribute::ByVal))
+    if (Arg.hasAttribute(Attribute::InReg) ||
+        Arg.hasAttribute(Attribute::StructRet) ||
+        Arg.hasAttribute(Attribute::SwiftSelf) ||
+        Arg.hasAttribute(Attribute::SwiftError) ||
+        Arg.hasAttribute(Attribute::ByVal))
       return false;
 
-    Type *ArgTy = I->getType();
+    Type *ArgTy = Arg.getType();
     if (ArgTy->isStructTy() || ArgTy->isArrayTy() || ArgTy->isVectorTy())
       return false;
 
@@ -3058,10 +3051,9 @@ bool ARMFastISel::fastLowerArguments() {
   };
 
   const TargetRegisterClass *RC = &ARM::rGPRRegClass;
-  Idx = 0;
-  for (Function::const_arg_iterator I = F->arg_begin(), E = F->arg_end();
-       I != E; ++I, ++Idx) {
-    unsigned SrcReg = GPRArgRegs[Idx];
+  for (const Argument &Arg : F->args()) {
+    unsigned ArgNo = Arg.getArgNo();
+    unsigned SrcReg = GPRArgRegs[ArgNo];
     unsigned DstReg = FuncInfo.MF->addLiveIn(SrcReg, RC);
     // FIXME: Unfortunately it's necessary to emit a copy from the livein copy.
     // Without this, EmitLiveInCopies may eliminate the livein if its only
@@ -3070,7 +3062,7 @@ bool ARMFastISel::fastLowerArguments() {
     BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
             TII.get(TargetOpcode::COPY),
             ResultReg).addReg(DstReg, getKillRegState(true));
-    updateValueMap(&*I, ResultReg);
+    updateValueMap(&Arg, ResultReg);
   }
 
   return true;

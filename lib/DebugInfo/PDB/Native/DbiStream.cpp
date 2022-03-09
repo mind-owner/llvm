@@ -1,18 +1,16 @@
 //===- DbiStream.cpp - PDB Dbi Stream (Stream 3) Access -------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/PDB/Native/DbiStream.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/DebugInfo/MSF/MappedBlockStream.h"
+#include "llvm/DebugInfo/PDB/Native/DbiModuleDescriptor.h"
 #include "llvm/DebugInfo/PDB/Native/ISectionContribVisitor.h"
-#include "llvm/DebugInfo/PDB/Native/InfoStream.h"
-#include "llvm/DebugInfo/PDB/Native/ModInfo.h"
 #include "llvm/DebugInfo/PDB/Native/PDBFile.h"
 #include "llvm/DebugInfo/PDB/Native/RawConstants.h"
 #include "llvm/DebugInfo/PDB/Native/RawError.h"
@@ -46,12 +44,12 @@ static Error loadSectionContribs(FixedStreamArray<ContribType> &Output,
   return Error::success();
 }
 
-DbiStream::DbiStream(PDBFile &File, std::unique_ptr<MappedBlockStream> Stream)
-    : Pdb(File), Stream(std::move(Stream)), Header(nullptr) {}
+DbiStream::DbiStream(std::unique_ptr<BinaryStream> Stream)
+    : Stream(std::move(Stream)), Header(nullptr) {}
 
 DbiStream::~DbiStream() = default;
 
-Error DbiStream::reload() {
+Error DbiStream::reload(PDBFile *Pdb) {
   BinaryStreamReader Reader(*Stream);
 
   if (Stream->getLength() < sizeof(DbiStreamHeader))
@@ -71,14 +69,6 @@ Error DbiStream::reload() {
   if (Header->VersionHeader < PdbDbiV70)
     return make_error<RawError>(raw_error_code::feature_unsupported,
                                 "Unsupported DBI version.");
-
-  auto IS = Pdb.getPDBInfoStream();
-  if (!IS)
-    return IS.takeError();
-
-  if (Header->Age != IS->getAge())
-    return make_error<RawError>(raw_error_code::corrupt_file,
-                                "DBI Age does not match PDB Age.");
 
   if (Stream->getLength() !=
       sizeof(DbiStreamHeader) + Header->ModiSubstreamSize +
@@ -107,46 +97,47 @@ Error DbiStream::reload() {
     return make_error<RawError>(raw_error_code::corrupt_file,
                                 "DBI type server substream not aligned.");
 
-  if (auto EC =
-          Reader.readStreamRef(ModInfoSubstream, Header->ModiSubstreamSize))
-    return EC;
-  if (auto EC = initializeModInfoArray())
+  if (auto EC = Reader.readSubstream(ModiSubstream, Header->ModiSubstreamSize))
     return EC;
 
-  if (auto EC = Reader.readStreamRef(SecContrSubstream,
+  if (auto EC = Reader.readSubstream(SecContrSubstream,
                                      Header->SecContrSubstreamSize))
     return EC;
-  if (auto EC = Reader.readStreamRef(SecMapSubstream, Header->SectionMapSize))
+  if (auto EC = Reader.readSubstream(SecMapSubstream, Header->SectionMapSize))
     return EC;
-  if (auto EC = Reader.readStreamRef(FileInfoSubstream, Header->FileInfoSize))
+  if (auto EC = Reader.readSubstream(FileInfoSubstream, Header->FileInfoSize))
     return EC;
   if (auto EC =
-          Reader.readStreamRef(TypeServerMapSubstream, Header->TypeServerSize))
+          Reader.readSubstream(TypeServerMapSubstream, Header->TypeServerSize))
     return EC;
-  if (auto EC = Reader.readStreamRef(ECSubstream, Header->ECSubstreamSize))
+  if (auto EC = Reader.readSubstream(ECSubstream, Header->ECSubstreamSize))
     return EC;
   if (auto EC = Reader.readArray(
           DbgStreams, Header->OptionalDbgHdrSize / sizeof(ulittle16_t)))
     return EC;
 
+  if (auto EC = Modules.initialize(ModiSubstream.StreamData,
+                                   FileInfoSubstream.StreamData))
+    return EC;
+
   if (auto EC = initializeSectionContributionData())
     return EC;
-  if (auto EC = initializeSectionHeadersData())
+  if (auto EC = initializeSectionHeadersData(Pdb))
     return EC;
   if (auto EC = initializeSectionMapData())
     return EC;
-  if (auto EC = initializeFileInfo())
+  if (auto EC = initializeOldFpoRecords(Pdb))
     return EC;
-  if (auto EC = initializeFpoRecords())
-    return EC;
+  if (auto EC = initializeNewFpoRecords(Pdb))
+     return EC;
 
   if (Reader.bytesRemaining() > 0)
     return make_error<RawError>(raw_error_code::corrupt_file,
                                 "Found unexpected bytes in DBI Stream.");
 
-  if (ECSubstream.getLength() > 0) {
-    BinaryStreamReader ECReader(ECSubstream);
-    if (auto EC = ECNames.load(ECReader))
+  if (!ECSubstream.empty()) {
+    BinaryStreamReader ECReader(ECSubstream.StreamData);
+    if (auto EC = ECNames.reload(ECReader))
       return EC;
   }
 
@@ -207,35 +198,50 @@ PDB_Machine DbiStream::getMachineType() const {
   return static_cast<PDB_Machine>(Machine);
 }
 
-FixedStreamArray<object::coff_section> DbiStream::getSectionHeaders() {
+FixedStreamArray<object::coff_section> DbiStream::getSectionHeaders() const {
   return SectionHeaders;
 }
 
-FixedStreamArray<object::FpoData> DbiStream::getFpoRecords() {
-  return FpoRecords;
+bool DbiStream::hasOldFpoRecords() const { return OldFpoStream != nullptr; }
+
+FixedStreamArray<object::FpoData> DbiStream::getOldFpoRecords() const {
+  return OldFpoRecords;
 }
 
-ArrayRef<ModuleInfoEx> DbiStream::modules() const { return ModuleInfos; }
+bool DbiStream::hasNewFpoRecords() const { return NewFpoStream != nullptr; }
+
+const DebugFrameDataSubsectionRef &DbiStream::getNewFpoRecords() const {
+  return NewFpoRecords;
+}
+
+const DbiModuleList &DbiStream::modules() const { return Modules; }
+
 FixedStreamArray<SecMapEntry> DbiStream::getSectionMap() const {
   return SectionMap;
 }
 
 void DbiStream::visitSectionContributions(
     ISectionContribVisitor &Visitor) const {
-  if (SectionContribVersion == DbiSecContribVer60) {
+  if (!SectionContribs.empty()) {
+    assert(SectionContribVersion == DbiSecContribVer60);
     for (auto &SC : SectionContribs)
       Visitor.visit(SC);
-  } else if (SectionContribVersion == DbiSecContribV2) {
+  } else if (!SectionContribs2.empty()) {
+    assert(SectionContribVersion == DbiSecContribV2);
     for (auto &SC : SectionContribs2)
       Visitor.visit(SC);
   }
 }
 
+Expected<StringRef> DbiStream::getECName(uint32_t NI) const {
+  return ECNames.getStringForID(NI);
+}
+
 Error DbiStream::initializeSectionContributionData() {
-  if (SecContrSubstream.getLength() == 0)
+  if (SecContrSubstream.empty())
     return Error::success();
 
-  BinaryStreamReader SCReader(SecContrSubstream);
+  BinaryStreamReader SCReader(SecContrSubstream.StreamData);
   if (auto EC = SCReader.readEnum(SectionContribVersion))
     return EC;
 
@@ -248,35 +254,16 @@ Error DbiStream::initializeSectionContributionData() {
                               "Unsupported DBI Section Contribution version");
 }
 
-Error DbiStream::initializeModInfoArray() {
-  if (ModInfoSubstream.getLength() == 0)
-    return Error::success();
-
-  // Since each ModInfo in the stream is a variable length, we have to iterate
-  // them to know how many there actually are.
-  BinaryStreamReader Reader(ModInfoSubstream);
-
-  VarStreamArray<ModInfo> ModInfoArray;
-  if (auto EC = Reader.readArray(ModInfoArray, ModInfoSubstream.getLength()))
-    return EC;
-  for (auto &Info : ModInfoArray) {
-    ModuleInfos.emplace_back(Info);
-  }
-
-  return Error::success();
-}
-
 // Initializes this->SectionHeaders.
-Error DbiStream::initializeSectionHeadersData() {
-  if (DbgStreams.size() == 0)
+Error DbiStream::initializeSectionHeadersData(PDBFile *Pdb) {
+  Expected<std::unique_ptr<msf::MappedBlockStream>> ExpectedStream =
+      createIndexedStreamForHeaderType(Pdb, DbgHeaderType::SectionHdr);
+  if (auto EC = ExpectedStream.takeError())
+    return EC;
+
+  auto &SHS = *ExpectedStream;
+  if (!SHS)
     return Error::success();
-
-  uint32_t StreamNum = getDebugStreamIndex(DbgHeaderType::SectionHdr);
-  if (StreamNum >= Pdb.getNumStreams())
-    return make_error<RawError>(raw_error_code::no_stream);
-
-  auto SHS = MappedBlockStream::createIndexedStream(
-      Pdb.getMsfLayout(), Pdb.getMsfBuffer(), StreamNum);
 
   size_t StreamLen = SHS->getLength();
   if (StreamLen % sizeof(object::coff_section))
@@ -294,41 +281,92 @@ Error DbiStream::initializeSectionHeadersData() {
 }
 
 // Initializes this->Fpos.
-Error DbiStream::initializeFpoRecords() {
-  if (DbgStreams.size() == 0)
+Error DbiStream::initializeOldFpoRecords(PDBFile *Pdb) {
+  Expected<std::unique_ptr<msf::MappedBlockStream>> ExpectedStream =
+      createIndexedStreamForHeaderType(Pdb, DbgHeaderType::FPO);
+  if (auto EC = ExpectedStream.takeError())
+    return EC;
+
+  auto &FS = *ExpectedStream;
+  if (!FS)
     return Error::success();
-
-  uint32_t StreamNum = getDebugStreamIndex(DbgHeaderType::NewFPO);
-
-  // This means there is no FPO data.
-  if (StreamNum == kInvalidStreamIndex)
-    return Error::success();
-
-  if (StreamNum >= Pdb.getNumStreams())
-    return make_error<RawError>(raw_error_code::no_stream);
-
-  auto FS = MappedBlockStream::createIndexedStream(
-      Pdb.getMsfLayout(), Pdb.getMsfBuffer(), StreamNum);
 
   size_t StreamLen = FS->getLength();
   if (StreamLen % sizeof(object::FpoData))
     return make_error<RawError>(raw_error_code::corrupt_file,
-                                "Corrupted New FPO stream.");
+                                "Corrupted Old FPO stream.");
 
   size_t NumRecords = StreamLen / sizeof(object::FpoData);
   BinaryStreamReader Reader(*FS);
-  if (auto EC = Reader.readArray(FpoRecords, NumRecords))
+  if (auto EC = Reader.readArray(OldFpoRecords, NumRecords))
     return make_error<RawError>(raw_error_code::corrupt_file,
-                                "Corrupted New FPO stream.");
-  FpoStream = std::move(FS);
+                                "Corrupted Old FPO stream.");
+  OldFpoStream = std::move(FS);
   return Error::success();
 }
 
-Error DbiStream::initializeSectionMapData() {
-  if (SecMapSubstream.getLength() == 0)
+Error DbiStream::initializeNewFpoRecords(PDBFile *Pdb) {
+  Expected<std::unique_ptr<msf::MappedBlockStream>> ExpectedStream =
+      createIndexedStreamForHeaderType(Pdb, DbgHeaderType::NewFPO);
+  if (auto EC = ExpectedStream.takeError())
+    return EC;
+
+  auto &FS = *ExpectedStream;
+  if (!FS)
     return Error::success();
 
-  BinaryStreamReader SMReader(SecMapSubstream);
+  if (auto EC = NewFpoRecords.initialize(*FS))
+    return EC;
+
+  NewFpoStream = std::move(FS);
+  return Error::success();
+}
+
+Expected<std::unique_ptr<msf::MappedBlockStream>>
+DbiStream::createIndexedStreamForHeaderType(PDBFile *Pdb,
+                                            DbgHeaderType Type) const {
+  if (!Pdb)
+    return nullptr;
+
+  if (DbgStreams.empty())
+    return nullptr;
+
+  uint32_t StreamNum = getDebugStreamIndex(Type);
+
+  // This means there is no such stream.
+  if (StreamNum == kInvalidStreamIndex)
+    return nullptr;
+
+  return Pdb->safelyCreateIndexedStream(StreamNum);
+}
+
+BinarySubstreamRef DbiStream::getSectionContributionData() const {
+  return SecContrSubstream;
+}
+
+BinarySubstreamRef DbiStream::getSecMapSubstreamData() const {
+  return SecMapSubstream;
+}
+
+BinarySubstreamRef DbiStream::getModiSubstreamData() const {
+  return ModiSubstream;
+}
+
+BinarySubstreamRef DbiStream::getFileInfoSubstreamData() const {
+  return FileInfoSubstream;
+}
+
+BinarySubstreamRef DbiStream::getTypeServerMapSubstreamData() const {
+  return TypeServerMapSubstream;
+}
+
+BinarySubstreamRef DbiStream::getECSubstreamData() const { return ECSubstream; }
+
+Error DbiStream::initializeSectionMapData() {
+  if (SecMapSubstream.empty())
+    return Error::success();
+
+  BinaryStreamReader SMReader(SecMapSubstream.StreamData);
   const SecMapHeader *Header;
   if (auto EC = SMReader.readObject(Header))
     return EC;
@@ -337,88 +375,9 @@ Error DbiStream::initializeSectionMapData() {
   return Error::success();
 }
 
-Error DbiStream::initializeFileInfo() {
-  if (FileInfoSubstream.getLength() == 0)
-    return Error::success();
-
-  const FileInfoSubstreamHeader *FH;
-  BinaryStreamReader FISR(FileInfoSubstream);
-  if (auto EC = FISR.readObject(FH))
-    return EC;
-
-  // The number of modules in the stream should be the same as reported by
-  // the FileInfoSubstreamHeader.
-  if (FH->NumModules != ModuleInfos.size())
-    return make_error<RawError>(raw_error_code::corrupt_file,
-                                "FileInfo substream count doesn't match DBI.");
-
-  FixedStreamArray<ulittle16_t> ModIndexArray;
-  FixedStreamArray<ulittle16_t> ModFileCountArray;
-
-  // First is an array of `NumModules` module indices.  This is not used for the
-  // same reason that `NumSourceFiles` is not used.  It's an array of uint16's,
-  // but it's possible there are more than 64k source files, which would imply
-  // more than 64k modules (e.g. object files) as well.  So we ignore this
-  // field.
-  if (auto EC = FISR.readArray(ModIndexArray, ModuleInfos.size()))
-    return EC;
-  if (auto EC = FISR.readArray(ModFileCountArray, ModuleInfos.size()))
-    return EC;
-
-  // Compute the real number of source files.
-  uint32_t NumSourceFiles = 0;
-  for (auto Count : ModFileCountArray)
-    NumSourceFiles += Count;
-
-  // This is the array that in the reference implementation corresponds to
-  // `ModInfo::FileLayout::FileNameOffs`, which is commented there as being a
-  // pointer. Due to the mentioned problems of pointers causing difficulty
-  // when reading from the file on 64-bit systems, we continue to ignore that
-  // field in `ModInfo`, and instead build a vector of StringRefs and stores
-  // them in `ModuleInfoEx`.  The value written to and read from the file is
-  // not used anyway, it is only there as a way to store the offsets for the
-  // purposes of later accessing the names at runtime.
-  if (auto EC = FISR.readArray(FileNameOffsets, NumSourceFiles))
-    return EC;
-
-  if (auto EC = FISR.readStreamRef(NamesBuffer))
-    return EC;
-
-  // We go through each ModuleInfo, determine the number N of source files for
-  // that module, and then get the next N offsets from the Offsets array, using
-  // them to get the corresponding N names from the Names buffer and associating
-  // each one with the corresponding module.
-  uint32_t NextFileIndex = 0;
-  for (size_t I = 0; I < ModuleInfos.size(); ++I) {
-    uint32_t NumFiles = ModFileCountArray[I];
-    ModuleInfos[I].SourceFiles.resize(NumFiles);
-    for (size_t J = 0; J < NumFiles; ++J, ++NextFileIndex) {
-      auto ThisName = getFileNameForIndex(NextFileIndex);
-      if (!ThisName)
-        return ThisName.takeError();
-      ModuleInfos[I].SourceFiles[J] = *ThisName;
-    }
-  }
-
-  return Error::success();
-}
-
 uint32_t DbiStream::getDebugStreamIndex(DbgHeaderType Type) const {
   uint16_t T = static_cast<uint16_t>(Type);
   if (T >= DbgStreams.size())
     return kInvalidStreamIndex;
   return DbgStreams[T];
-}
-
-Expected<StringRef> DbiStream::getFileNameForIndex(uint32_t Index) const {
-  BinaryStreamReader Names(NamesBuffer);
-  if (Index >= FileNameOffsets.size())
-    return make_error<RawError>(raw_error_code::index_out_of_bounds);
-
-  uint32_t FileOffset = FileNameOffsets[Index];
-  Names.setOffset(FileOffset);
-  StringRef Name;
-  if (auto EC = Names.readCString(Name))
-    return std::move(EC);
-  return Name;
 }

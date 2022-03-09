@@ -1,102 +1,29 @@
 //===--- HexagonIICHVX.td -------------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-//
-// Though all these itinerary classes exist for V60 onwards, they are being
-// listed here as 'HVXV62Itin' because itinerary class description prior to V62
-// doesn't include operand cycle info. In future, I plan to merge them
-// together and call it 'HVXItin'.
-//
-class HVXV62Itin {
-  list<InstrItinData> HVXV62Itin_list = [
-    InstrItinData<COPROC_VMEM_vtc_long_SLOT01,
-                                   [InstrStage<1, [SLOT0, SLOT1]>],
-                                   [3, 1, 1, 1]>,
-    InstrItinData<COPROC_VX_vtc_long_SLOT23,
-                                   [InstrStage<1, [SLOT2, SLOT3]>],
-                                   [3, 1, 1, 1]>,
-    InstrItinData<COPROC_VX_vtc_SLOT23,
-                                   [InstrStage<1, [SLOT2, SLOT3]>],
-                                   [3, 1, 1, 1]>,
-    InstrItinData<CVI_VA,          [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLANE,CVI_SHIFT,
-                                                   CVI_MPY0, CVI_MPY1]>],
-                                   [1, 1, 1, 1]>,
-    InstrItinData<CVI_VA_DV,       [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLSHF, CVI_MPY01]>],
-                                    [1, 1, 1, 1]>,
-    InstrItinData<CVI_VX_LONG,     [InstrStage<1, [SLOT2, SLOT3], 0>,
-                                    InstrStage<1, [CVI_MPY0, CVI_MPY1]>],
-                                   [1, 1, 1, 1]>,
-    InstrItinData<CVI_VX_LATE,     [InstrStage<1, [SLOT2, SLOT3], 0>,
-                                    InstrStage<1, [CVI_MPY0, CVI_MPY1]>],
-                                   [1, 1, 1, 1]>,
-    InstrItinData<CVI_VX,          [InstrStage<1, [SLOT2, SLOT3], 0>,
-                                    InstrStage<1, [CVI_MPY0, CVI_MPY1]>],
-                                   [1, 1, 1, 1]>,
-    InstrItinData<CVI_VX_DV_LONG,  [InstrStage<1, [SLOT2, SLOT3], 0>,
-                                    InstrStage<1, [CVI_MPY01]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VX_DV,       [InstrStage<1, [SLOT2, SLOT3], 0>,
-                                    InstrStage<1, [CVI_MPY01]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VX_DV_SLOT2, [InstrStage<1, [SLOT2], 0>,
-                                    InstrStage<1, [CVI_MPY01]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VX_DV_SLOT2_LONG_EARLY,
-                                   [InstrStage<1, [SLOT2], 0>,
-                                    InstrStage<1, [CVI_MPY01]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VP,          [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLANE]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VP_LONG,     [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLANE]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VP_VS_EARLY, [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLSHF]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VP_VS_LONG,  [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLSHF]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VP_VS,       [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLSHF]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VP_VS_LONG_EARLY,
-                                   [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLSHF]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VP_DV,       [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLSHF]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VS,          [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_SHIFT]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VINLANESAT,  [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_XLANE, CVI_SHIFT,
-                                                   CVI_MPY0, CVI_MPY1]>],
-                                   [1, 1, 1, 1]>,
-    InstrItinData<CVI_VM_LD,       [InstrStage<1, [SLOT0, SLOT1], 0>,
-                                    InstrStage<1, [CVI_LD], 0>,
-                                    InstrStage<1, [CVI_XLANE, CVI_SHIFT,
-                                                   CVI_MPY0, CVI_MPY1]>],
-                                   [1, 1, 1, 1]>,
-    InstrItinData<CVI_VM_TMP_LD,   [InstrStage<1,[SLOT0, SLOT1], 0>,
-                                    InstrStage<1, [CVI_LD]>],[1, 1, 1, 1, 10]>,
-    InstrItinData<CVI_VM_CUR_LD,   [InstrStage<1,[SLOT0, SLOT1], 0>,
-                                    InstrStage<1, [CVI_LD], 0>,
-                                    InstrStage<1, [CVI_XLANE, CVI_SHIFT,
-                                                   CVI_MPY0, CVI_MPY1]>],
-                                   [1, 1, 1, 1]>,
-    InstrItinData<CVI_VM_VP_LDU,   [InstrStage<1,[SLOT0], 0>,
-                                    InstrStage<1, [SLOT1], 0>,
-                                    InstrStage<1, [CVI_LD], 0>,
-                                    InstrStage<1, [CVI_XLANE]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VM_ST,       [InstrStage<1, [SLOT0], 0>,
-                                    InstrStage<1, [CVI_ST], 0>,
-                                    InstrStage<1, [CVI_XLANE, CVI_SHIFT,
-                                                   CVI_MPY0, CVI_MPY1]>],
-                                   [1, 1, 1, 1]>,
-    InstrItinData<CVI_VM_NEW_ST,   [InstrStage<1,[SLOT0], 0>,
-                                    InstrStage<1, [CVI_ST]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_VM_STU,      [InstrStage<1, [SLOT0], 0>,
-                                    InstrStage<1, [SLOT1], 0>,
-                                    InstrStage<1, [CVI_ST], 0>,
-                                    InstrStage<1, [CVI_XLANE]>], [1, 1, 1, 1]>,
-    InstrItinData<CVI_HIST,        [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
-                                    InstrStage<1, [CVI_ALL]>], [1, 1, 1, 1]>];
+def CVI_GATHER_PSEUDO : InstrItinClass;
+def CVI_VA            : InstrItinClass;
+
+class HVXItin {
+  list<InstrItinData> HVXItin_list = [
+    InstrItinData<CVI_VA,
+      [InstrStage<1, [SLOT0,SLOT1,SLOT2,SLOT3], 0>,
+       InstrStage<1, [CVI_XLANE,CVI_SHIFT, CVI_MPY0, CVI_MPY1]>],
+      [9, 7, 7, 7], [HVX_FWD, HVX_FWD, HVX_FWD]>,
+
+    // Used by gather pseudo-instructions which are expanded into V6_vgather*
+    // and V6_vS32b_new_ai. Even though these instructions use CVI_LD resource,
+    // it's not included below to avoid having more than 4 InstrStages and
+    // thus changing 'MaxResTerms' to 5. Instead, both SLOT0 and SLOT1 are
+    // used, which should be sufficient.
+    InstrItinData <CVI_GATHER_PSEUDO,
+      [InstrStage<1, [SLOT0], 0>,
+       InstrStage<1, [SLOT1], 0>,
+       InstrStage<1, [CVI_ST], 0>,
+       InstrStage<1, [CVI_MPY01, CVI_XLSHF]>]>];
 }

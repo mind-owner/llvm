@@ -1,9 +1,8 @@
 //===- DWARFDebugArangeSet.h ------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -22,19 +21,19 @@ class raw_ostream;
 class DWARFDebugArangeSet {
 public:
   struct Header {
-    // The total length of the entries for that set, not including the length
-    // field itself.
+    /// The total length of the entries for that set, not including the length
+    /// field itself.
     uint32_t Length;
-    // The offset from the beginning of the .debug_info section of the
-    // compilation unit entry referenced by the table.
+    /// The offset from the beginning of the .debug_info section of the
+    /// compilation unit entry referenced by the table.
     uint32_t CuOffset;
-    // The DWARF version number.
+    /// The DWARF version number.
     uint16_t Version;
-    // The size in bytes of an address on the target architecture. For segmented
-    // addressing, this is the size of the offset portion of the address.
+    /// The size in bytes of an address on the target architecture. For segmented
+    /// addressing, this is the size of the offset portion of the address.
     uint8_t AddrSize;
-    // The size in bytes of a segment descriptor on the target architecture.
-    // If the target system uses a flat address space, this value is 0.
+    /// The size in bytes of a segment descriptor on the target architecture.
+    /// If the target system uses a flat address space, this value is 0.
     uint8_t SegSize;
   };
 
@@ -43,13 +42,14 @@ public:
     uint64_t Length;
 
     uint64_t getEndAddress() const { return Address + Length; }
+    void dump(raw_ostream &OS, uint32_t AddressSize) const;
   };
 
 private:
-  typedef std::vector<Descriptor> DescriptorColl;
-  typedef iterator_range<DescriptorColl::const_iterator> desc_iterator_range;
+  using DescriptorColl = std::vector<Descriptor>;
+  using desc_iterator_range = iterator_range<DescriptorColl::const_iterator>;
 
-  uint32_t Offset;
+  uint64_t Offset;
   Header HeaderData;
   DescriptorColl ArangeDescriptors;
 
@@ -57,7 +57,7 @@ public:
   DWARFDebugArangeSet() { clear(); }
 
   void clear();
-  bool extract(DataExtractor data, uint32_t *offset_ptr);
+  bool extract(DataExtractor data, uint64_t *offset_ptr);
   void dump(raw_ostream &OS) const;
 
   uint32_t getCompileUnitDIEOffset() const { return HeaderData.CuOffset; }

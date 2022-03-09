@@ -1,9 +1,8 @@
 //===- llvm/IR/TrackingMDRef.h - Tracking Metadata references ---*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -20,7 +19,7 @@
 
 namespace llvm {
 
-/// \brief Tracking metadata reference.
+/// Tracking metadata reference.
 ///
 /// This class behaves like \a TrackingVH, but for metadata.
 class TrackingMDRef {
@@ -70,7 +69,7 @@ public:
     track();
   }
 
-  /// \brief Check whether this has a trivial destructor.
+  /// Check whether this has a trivial destructor.
   ///
   /// If \c MD isn't replaceable, the destructor will be a no-op.
   bool hasTrivialDestructor() const {
@@ -100,7 +99,7 @@ private:
   }
 };
 
-/// \brief Typed tracking ref.
+/// Typed tracking ref.
 ///
 /// Track refererences of a particular type.  It's useful to use this for \a
 /// MDNode and \a ValueAsMetadata.
@@ -135,35 +134,39 @@ public:
   void reset() { Ref.reset(); }
   void reset(T *MD) { Ref.reset(static_cast<Metadata *>(MD)); }
 
-  /// \brief Check whether this has a trivial destructor.
+  /// Check whether this has a trivial destructor.
   bool hasTrivialDestructor() const { return Ref.hasTrivialDestructor(); }
 };
 
-typedef TypedTrackingMDRef<MDNode> TrackingMDNodeRef;
-typedef TypedTrackingMDRef<ValueAsMetadata> TrackingValueAsMetadataRef;
+using TrackingMDNodeRef = TypedTrackingMDRef<MDNode>;
+using TrackingValueAsMetadataRef = TypedTrackingMDRef<ValueAsMetadata>;
 
 // Expose the underlying metadata to casting.
 template <> struct simplify_type<TrackingMDRef> {
-  typedef Metadata *SimpleType;
+  using SimpleType = Metadata *;
+
   static SimpleType getSimplifiedValue(TrackingMDRef &MD) { return MD.get(); }
 };
 
 template <> struct simplify_type<const TrackingMDRef> {
-  typedef Metadata *SimpleType;
+  using SimpleType = Metadata *;
+
   static SimpleType getSimplifiedValue(const TrackingMDRef &MD) {
     return MD.get();
   }
 };
 
 template <class T> struct simplify_type<TypedTrackingMDRef<T>> {
-  typedef T *SimpleType;
+  using SimpleType = T *;
+
   static SimpleType getSimplifiedValue(TypedTrackingMDRef<T> &MD) {
     return MD.get();
   }
 };
 
 template <class T> struct simplify_type<const TypedTrackingMDRef<T>> {
-  typedef T *SimpleType;
+  using SimpleType = T *;
+
   static SimpleType getSimplifiedValue(const TypedTrackingMDRef<T> &MD) {
     return MD.get();
   }

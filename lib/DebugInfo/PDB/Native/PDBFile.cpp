@@ -1,9 +1,8 @@
 //===- PDBFile.cpp - Low level interface to a PDB file ----------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,9 +14,10 @@
 #include "llvm/DebugInfo/PDB/Native/DbiStream.h"
 #include "llvm/DebugInfo/PDB/Native/GlobalsStream.h"
 #include "llvm/DebugInfo/PDB/Native/InfoStream.h"
+#include "llvm/DebugInfo/PDB/Native/InjectedSourceStream.h"
+#include "llvm/DebugInfo/PDB/Native/PDBStringTable.h"
 #include "llvm/DebugInfo/PDB/Native/PublicsStream.h"
 #include "llvm/DebugInfo/PDB/Native/RawError.h"
-#include "llvm/DebugInfo/PDB/Native/StringTable.h"
 #include "llvm/DebugInfo/PDB/Native/SymbolStream.h"
 #include "llvm/DebugInfo/PDB/Native/TpiStream.h"
 #include "llvm/Support/BinaryStream.h"
@@ -85,6 +85,11 @@ uint32_t PDBFile::getNumStreams() const {
   return ContainerLayout.StreamSizes.size();
 }
 
+uint32_t PDBFile::getMaxStreamSize() const {
+  return *std::max_element(ContainerLayout.StreamSizes.begin(),
+                           ContainerLayout.StreamSizes.end());
+}
+
 uint32_t PDBFile::getStreamByteSize(uint32_t StreamIndex) const {
   return ContainerLayout.StreamSizes[StreamIndex];
 }
@@ -120,7 +125,7 @@ Error PDBFile::parseFileHeaders() {
   if (auto EC = Reader.readObject(SB)) {
     consumeError(std::move(EC));
     return make_error<RawError>(raw_error_code::corrupt_file,
-                                "Does not contain superblock");
+                                "MSF superblock is missing");
   }
 
   if (auto EC = msf::validateSuperBlock(*SB))
@@ -146,11 +151,11 @@ Error PDBFile::parseFileHeaders() {
   // at getBlockSize() intervals, so we have to be compatible.
   // See the function fpmPn() for more information:
   // https://github.com/Microsoft/microsoft-pdb/blob/master/PDB/msf/msf.cpp#L489
-  auto FpmStream = MappedBlockStream::createFpmStream(ContainerLayout, *Buffer);
+  auto FpmStream =
+      MappedBlockStream::createFpmStream(ContainerLayout, *Buffer, Allocator);
   BinaryStreamReader FpmReader(*FpmStream);
   ArrayRef<uint8_t> FpmBytes;
-  if (auto EC = FpmReader.readBytes(FpmBytes,
-                                    msf::getFullFpmByteSize(ContainerLayout)))
+  if (auto EC = FpmReader.readBytes(FpmBytes, FpmReader.bytesRemaining()))
     return EC;
   uint32_t BlocksRemaining = getBlockCount();
   uint32_t BI = 0;
@@ -184,7 +189,8 @@ Error PDBFile::parseStreamData() {
   // is exactly what we are attempting to parse.  By specifying a custom
   // subclass of IPDBStreamData which only accesses the fields that have already
   // been parsed, we can avoid this and reuse MappedBlockStream.
-  auto DS = MappedBlockStream::createDirectoryStream(ContainerLayout, *Buffer);
+  auto DS = MappedBlockStream::createDirectoryStream(ContainerLayout, *Buffer,
+                                                     Allocator);
   BinaryStreamReader Reader(*DS);
   if (auto EC = Reader.readInteger(NumStreams))
     return EC;
@@ -228,17 +234,37 @@ ArrayRef<support::ulittle32_t> PDBFile::getDirectoryBlockArray() const {
   return ContainerLayout.DirectoryBlocks;
 }
 
+std::unique_ptr<MappedBlockStream>
+PDBFile::createIndexedStream(uint16_t SN) const {
+  if (SN == kInvalidStreamIndex)
+    return nullptr;
+  return MappedBlockStream::createIndexedStream(ContainerLayout, *Buffer, SN,
+                                                Allocator);
+}
+
+MSFStreamLayout PDBFile::getStreamLayout(uint32_t StreamIdx) const {
+  MSFStreamLayout Result;
+  auto Blocks = getStreamBlockList(StreamIdx);
+  Result.Blocks.assign(Blocks.begin(), Blocks.end());
+  Result.Length = getStreamByteSize(StreamIdx);
+  return Result;
+}
+
+msf::MSFStreamLayout PDBFile::getFpmStreamLayout() const {
+  return msf::getFpmStreamLayout(ContainerLayout);
+}
+
 Expected<GlobalsStream &> PDBFile::getPDBGlobalsStream() {
   if (!Globals) {
     auto DbiS = getPDBDbiStream();
     if (!DbiS)
       return DbiS.takeError();
 
-    auto GlobalS = safelyCreateIndexedStream(
-        ContainerLayout, *Buffer, DbiS->getGlobalSymbolStreamIndex());
+    auto GlobalS =
+        safelyCreateIndexedStream(DbiS->getGlobalSymbolStreamIndex());
     if (!GlobalS)
       return GlobalS.takeError();
-    auto TempGlobals = llvm::make_unique<GlobalsStream>(std::move(*GlobalS));
+    auto TempGlobals = std::make_unique<GlobalsStream>(std::move(*GlobalS));
     if (auto EC = TempGlobals->reload())
       return std::move(EC);
     Globals = std::move(TempGlobals);
@@ -248,10 +274,10 @@ Expected<GlobalsStream &> PDBFile::getPDBGlobalsStream() {
 
 Expected<InfoStream &> PDBFile::getPDBInfoStream() {
   if (!Info) {
-    auto InfoS = safelyCreateIndexedStream(ContainerLayout, *Buffer, StreamPDB);
+    auto InfoS = safelyCreateIndexedStream(StreamPDB);
     if (!InfoS)
       return InfoS.takeError();
-    auto TempInfo = llvm::make_unique<InfoStream>(std::move(*InfoS));
+    auto TempInfo = std::make_unique<InfoStream>(std::move(*InfoS));
     if (auto EC = TempInfo->reload())
       return std::move(EC);
     Info = std::move(TempInfo);
@@ -261,11 +287,11 @@ Expected<InfoStream &> PDBFile::getPDBInfoStream() {
 
 Expected<DbiStream &> PDBFile::getPDBDbiStream() {
   if (!Dbi) {
-    auto DbiS = safelyCreateIndexedStream(ContainerLayout, *Buffer, StreamDBI);
+    auto DbiS = safelyCreateIndexedStream(StreamDBI);
     if (!DbiS)
       return DbiS.takeError();
-    auto TempDbi = llvm::make_unique<DbiStream>(*this, std::move(*DbiS));
-    if (auto EC = TempDbi->reload())
+    auto TempDbi = std::make_unique<DbiStream>(std::move(*DbiS));
+    if (auto EC = TempDbi->reload(this))
       return std::move(EC);
     Dbi = std::move(TempDbi);
   }
@@ -274,10 +300,10 @@ Expected<DbiStream &> PDBFile::getPDBDbiStream() {
 
 Expected<TpiStream &> PDBFile::getPDBTpiStream() {
   if (!Tpi) {
-    auto TpiS = safelyCreateIndexedStream(ContainerLayout, *Buffer, StreamTPI);
+    auto TpiS = safelyCreateIndexedStream(StreamTPI);
     if (!TpiS)
       return TpiS.takeError();
-    auto TempTpi = llvm::make_unique<TpiStream>(*this, std::move(*TpiS));
+    auto TempTpi = std::make_unique<TpiStream>(*this, std::move(*TpiS));
     if (auto EC = TempTpi->reload())
       return std::move(EC);
     Tpi = std::move(TempTpi);
@@ -287,10 +313,13 @@ Expected<TpiStream &> PDBFile::getPDBTpiStream() {
 
 Expected<TpiStream &> PDBFile::getPDBIpiStream() {
   if (!Ipi) {
-    auto IpiS = safelyCreateIndexedStream(ContainerLayout, *Buffer, StreamIPI);
+    if (!hasPDBIpiStream())
+      return make_error<RawError>(raw_error_code::no_stream);
+
+    auto IpiS = safelyCreateIndexedStream(StreamIPI);
     if (!IpiS)
       return IpiS.takeError();
-    auto TempIpi = llvm::make_unique<TpiStream>(*this, std::move(*IpiS));
+    auto TempIpi = std::make_unique<TpiStream>(*this, std::move(*IpiS));
     if (auto EC = TempIpi->reload())
       return std::move(EC);
     Ipi = std::move(TempIpi);
@@ -304,12 +333,11 @@ Expected<PublicsStream &> PDBFile::getPDBPublicsStream() {
     if (!DbiS)
       return DbiS.takeError();
 
-    auto PublicS = safelyCreateIndexedStream(
-        ContainerLayout, *Buffer, DbiS->getPublicSymbolStreamIndex());
+    auto PublicS =
+        safelyCreateIndexedStream(DbiS->getPublicSymbolStreamIndex());
     if (!PublicS)
       return PublicS.takeError();
-    auto TempPublics =
-        llvm::make_unique<PublicsStream>(*this, std::move(*PublicS));
+    auto TempPublics = std::make_unique<PublicsStream>(std::move(*PublicS));
     if (auto EC = TempPublics->reload())
       return std::move(EC);
     Publics = std::move(TempPublics);
@@ -324,12 +352,11 @@ Expected<SymbolStream &> PDBFile::getPDBSymbolStream() {
       return DbiS.takeError();
 
     uint32_t SymbolStreamNum = DbiS->getSymRecordStreamIndex();
-    auto SymbolS =
-        safelyCreateIndexedStream(ContainerLayout, *Buffer, SymbolStreamNum);
+    auto SymbolS = safelyCreateIndexedStream(SymbolStreamNum);
     if (!SymbolS)
       return SymbolS.takeError();
 
-    auto TempSymbols = llvm::make_unique<SymbolStream>(std::move(*SymbolS));
+    auto TempSymbols = std::make_unique<SymbolStream>(std::move(*SymbolS));
     if (auto EC = TempSymbols->reload())
       return std::move(EC);
     Symbols = std::move(TempSymbols);
@@ -337,46 +364,84 @@ Expected<SymbolStream &> PDBFile::getPDBSymbolStream() {
   return *Symbols;
 }
 
-Expected<StringTable &> PDBFile::getStringTable() {
-  if (!Strings || !StringTableStream) {
-    auto IS = getPDBInfoStream();
-    if (!IS)
-      return IS.takeError();
-
-    uint32_t NameStreamIndex = IS->getNamedStreamIndex("/names");
-
-    auto NS =
-        safelyCreateIndexedStream(ContainerLayout, *Buffer, NameStreamIndex);
+Expected<PDBStringTable &> PDBFile::getStringTable() {
+  if (!Strings) {
+    auto NS = safelyCreateNamedStream("/names");
     if (!NS)
       return NS.takeError();
 
+    auto N = std::make_unique<PDBStringTable>();
     BinaryStreamReader Reader(**NS);
-    auto N = llvm::make_unique<StringTable>();
-    if (auto EC = N->load(Reader))
+    if (auto EC = N->reload(Reader))
       return std::move(EC);
-    Strings = std::move(N);
+    assert(Reader.bytesRemaining() == 0);
     StringTableStream = std::move(*NS);
+    Strings = std::move(N);
   }
   return *Strings;
 }
 
-bool PDBFile::hasPDBDbiStream() const { return StreamDBI < getNumStreams(); }
+Expected<InjectedSourceStream &> PDBFile::getInjectedSourceStream() {
+  if (!InjectedSources) {
+    auto IJS = safelyCreateNamedStream("/src/headerblock");
+    if (!IJS)
+      return IJS.takeError();
+
+    auto Strings = getStringTable();
+    if (!Strings)
+      return Strings.takeError();
+
+    auto IJ = std::make_unique<InjectedSourceStream>(std::move(*IJS));
+    if (auto EC = IJ->reload(*Strings))
+      return std::move(EC);
+    InjectedSources = std::move(IJ);
+  }
+  return *InjectedSources;
+}
+
+uint32_t PDBFile::getPointerSize() {
+  auto DbiS = getPDBDbiStream();
+  if (!DbiS)
+    return 0;
+  PDB_Machine Machine = DbiS->getMachineType();
+  if (Machine == PDB_Machine::Amd64)
+    return 8;
+  return 4;
+}
+
+bool PDBFile::hasPDBDbiStream() const {
+  return StreamDBI < getNumStreams() && getStreamByteSize(StreamDBI) > 0;
+}
 
 bool PDBFile::hasPDBGlobalsStream() {
   auto DbiS = getPDBDbiStream();
-  if (!DbiS)
+  if (!DbiS) {
+    consumeError(DbiS.takeError());
     return false;
+  }
+
   return DbiS->getGlobalSymbolStreamIndex() < getNumStreams();
 }
 
-bool PDBFile::hasPDBInfoStream() { return StreamPDB < getNumStreams(); }
+bool PDBFile::hasPDBInfoStream() const { return StreamPDB < getNumStreams(); }
 
-bool PDBFile::hasPDBIpiStream() const { return StreamIPI < getNumStreams(); }
+bool PDBFile::hasPDBIpiStream() const {
+  if (!hasPDBInfoStream())
+    return false;
+
+  if (StreamIPI >= getNumStreams())
+    return false;
+
+  auto &InfoStream = cantFail(const_cast<PDBFile *>(this)->getPDBInfoStream());
+  return InfoStream.containsIdStream();
+}
 
 bool PDBFile::hasPDBPublicsStream() {
   auto DbiS = getPDBDbiStream();
-  if (!DbiS)
+  if (!DbiS) {
+    consumeError(DbiS.takeError());
     return false;
+  }
   return DbiS->getPublicSymbolStreamIndex() < getNumStreams();
 }
 
@@ -389,11 +454,30 @@ bool PDBFile::hasPDBSymbolStream() {
 
 bool PDBFile::hasPDBTpiStream() const { return StreamTPI < getNumStreams(); }
 
-bool PDBFile::hasStringTable() {
+bool PDBFile::hasPDBStringTable() {
   auto IS = getPDBInfoStream();
   if (!IS)
     return false;
-  return IS->getNamedStreamIndex("/names") < getNumStreams();
+  Expected<uint32_t> ExpectedNSI = IS->getNamedStreamIndex("/names");
+  if (!ExpectedNSI) {
+    consumeError(ExpectedNSI.takeError());
+    return false;
+  }
+  assert(*ExpectedNSI < getNumStreams());
+  return true;
+}
+
+bool PDBFile::hasPDBInjectedSourceStream() {
+  auto IS = getPDBInfoStream();
+  if (!IS)
+    return false;
+  Expected<uint32_t> ExpectedNSI = IS->getNamedStreamIndex("/src/headerblock");
+  if (!ExpectedNSI) {
+    consumeError(ExpectedNSI.takeError());
+    return false;
+  }
+  assert(*ExpectedNSI < getNumStreams());
+  return true;
 }
 
 /// Wrapper around MappedBlockStream::createIndexedStream() that checks if a
@@ -401,10 +485,23 @@ bool PDBFile::hasStringTable() {
 /// will have an MSFError with code msf_error_code::no_stream.  Else, the return
 /// value will contain the stream returned by createIndexedStream().
 Expected<std::unique_ptr<MappedBlockStream>>
-PDBFile::safelyCreateIndexedStream(const MSFLayout &Layout,
-                                   BinaryStreamRef MsfData,
-                                   uint32_t StreamIndex) const {
+PDBFile::safelyCreateIndexedStream(uint32_t StreamIndex) const {
   if (StreamIndex >= getNumStreams())
+    // This rejects kInvalidStreamIndex with an error as well.
     return make_error<RawError>(raw_error_code::no_stream);
-  return MappedBlockStream::createIndexedStream(Layout, MsfData, StreamIndex);
+  return createIndexedStream(StreamIndex);
+}
+
+Expected<std::unique_ptr<MappedBlockStream>>
+PDBFile::safelyCreateNamedStream(StringRef Name) {
+  auto IS = getPDBInfoStream();
+  if (!IS)
+    return IS.takeError();
+
+  Expected<uint32_t> ExpectedNSI = IS->getNamedStreamIndex(Name);
+  if (!ExpectedNSI)
+    return ExpectedNSI.takeError();
+  uint32_t NameStreamIndex = *ExpectedNSI;
+
+  return safelyCreateIndexedStream(NameStreamIndex);
 }

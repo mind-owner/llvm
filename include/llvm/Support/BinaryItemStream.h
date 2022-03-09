@@ -1,9 +1,8 @@
 //===- BinaryItemStream.h ---------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,7 +44,7 @@ public:
     if (!ExpectedIndex)
       return ExpectedIndex.takeError();
     const auto &Item = Items[*ExpectedIndex];
-    if (auto EC = checkOffset(Offset, Size))
+    if (auto EC = checkOffsetForRead(Offset, Size))
       return EC;
     if (Size > Traits::length(Item))
       return make_error<BinaryStreamError>(stream_error_code::stream_too_short);
@@ -62,32 +61,45 @@ public:
     return Error::success();
   }
 
-  void setItems(ArrayRef<T> ItemArray) { Items = ItemArray; }
+  void setItems(ArrayRef<T> ItemArray) {
+    Items = ItemArray;
+    computeItemOffsets();
+  }
 
   uint32_t getLength() override {
-    uint32_t Size = 0;
-    for (const auto &Item : Items)
-      Size += Traits::length(Item);
-    return Size;
+    return ItemEndOffsets.empty() ? 0 : ItemEndOffsets.back();
   }
 
 private:
-  Expected<uint32_t> translateOffsetIndex(uint32_t Offset) const {
+  void computeItemOffsets() {
+    ItemEndOffsets.clear();
+    ItemEndOffsets.reserve(Items.size());
     uint32_t CurrentOffset = 0;
-    uint32_t CurrentIndex = 0;
     for (const auto &Item : Items) {
-      if (CurrentOffset >= Offset)
-        break;
-      CurrentOffset += Traits::length(Item);
-      ++CurrentIndex;
+      uint32_t Len = Traits::length(Item);
+      assert(Len > 0 && "no empty items");
+      CurrentOffset += Len;
+      ItemEndOffsets.push_back(CurrentOffset);
     }
-    if (CurrentOffset != Offset)
+  }
+
+  Expected<uint32_t> translateOffsetIndex(uint32_t Offset) {
+    // Make sure the offset is somewhere in our items array.
+    if (Offset >= getLength())
       return make_error<BinaryStreamError>(stream_error_code::stream_too_short);
-    return CurrentIndex;
+    ++Offset;
+    auto Iter =
+        std::lower_bound(ItemEndOffsets.begin(), ItemEndOffsets.end(), Offset);
+    size_t Idx = std::distance(ItemEndOffsets.begin(), Iter);
+    assert(Idx < Items.size() && "binary search for offset failed");
+    return Idx;
   }
 
   llvm::support::endianness Endian;
   ArrayRef<T> Items;
+
+  // Sorted vector of offsets to accelerate lookup.
+  std::vector<uint32_t> ItemEndOffsets;
 };
 
 } // end namespace llvm

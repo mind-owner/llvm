@@ -1,9 +1,8 @@
 //===- Target.td - Define GlobalISel rules -----------------*- tablegen -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -30,20 +29,12 @@ def s64 : LLT;
 // Definitions that inherit from this may also inherit from
 // GIComplexPatternEquiv to enable the import of SelectionDAG patterns involving
 // those ComplexPatterns.
-class GIComplexOperandMatcher<LLT type, dag operands, string matcherfn> {
+class GIComplexOperandMatcher<LLT type, string matcherfn> {
   // The expected type of the root of the match.
   //
   // TODO: We should probably support, any-type, any-scalar, and multiple types
   //       in the future.
   LLT Type = type;
-
-  // The operands that result from a successful match
-  // Should be of the form '(ops ty1, ty2, ...)' where ty1/ty2 are definitions
-  // that inherit from Operand.
-  //
-  // FIXME: Which definition is used for ty1/ty2 doesn't actually matter at the
-  //        moment. Only the number of operands is used.
-  dag Operands = operands;
 
   // The function that determines whether the operand matches. It should be of
   // the form:
@@ -53,4 +44,17 @@ class GIComplexOperandMatcher<LLT type, dag operands, string matcherfn> {
   // otherwise. If it returns true, then all the ResultX arguments must be
   // overwritten.
   string MatcherFn = matcherfn;
+}
+
+// Defines a custom renderer. This is analogous to SDNodeXForm from
+// SelectionDAG. Unlike SDNodeXForm, this matches a MachineInstr and
+// renders directly to the result instruction without an intermediate node.
+//
+// Definitions that inherit from this may also inherit from GISDNodeXFormEquiv
+// to enable the import of SelectionDAG patterns involving those SDNodeXForms.
+class GICustomOperandRenderer<string rendererfn> {
+  // The function renders the operand(s) of the matched instruction to
+  // the specified instruction. It should be of the form:
+  //   void render(MachineInstrBuilder &MIB, const MachineInstr &MI)
+  string RendererFn = rendererfn;
 }

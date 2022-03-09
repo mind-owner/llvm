@@ -1,7 +1,19 @@
+//===- lib/Codegen/MachineRegionInfo.cpp ----------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #include "llvm/CodeGen/MachineRegionInfo.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/RegionInfoImpl.h"
 #include "llvm/CodeGen/MachinePostDominators.h"
+#include "llvm/Config/llvm-config.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "machine-region-info"
 
@@ -11,36 +23,29 @@ STATISTIC(numMachineRegions,       "The # of machine regions");
 STATISTIC(numMachineSimpleRegions, "The # of simple machine regions");
 
 namespace llvm {
+
 template class RegionBase<RegionTraits<MachineFunction>>;
 template class RegionNodeBase<RegionTraits<MachineFunction>>;
 template class RegionInfoBase<RegionTraits<MachineFunction>>;
-}
+
+} // end namespace llvm
 
 //===----------------------------------------------------------------------===//
 // MachineRegion implementation
-//
 
 MachineRegion::MachineRegion(MachineBasicBlock *Entry, MachineBasicBlock *Exit,
                              MachineRegionInfo* RI,
                              MachineDominatorTree *DT, MachineRegion *Parent) :
-  RegionBase<RegionTraits<MachineFunction>>(Entry, Exit, RI, DT, Parent) {
+  RegionBase<RegionTraits<MachineFunction>>(Entry, Exit, RI, DT, Parent) {}
 
-}
-
-MachineRegion::~MachineRegion() { }
+MachineRegion::~MachineRegion() = default;
 
 //===----------------------------------------------------------------------===//
 // MachineRegionInfo implementation
-//
 
-MachineRegionInfo::MachineRegionInfo() :
-  RegionInfoBase<RegionTraits<MachineFunction>>() {
+MachineRegionInfo::MachineRegionInfo() = default;
 
-}
-
-MachineRegionInfo::~MachineRegionInfo() {
-
-}
+MachineRegionInfo::~MachineRegionInfo() = default;
 
 void MachineRegionInfo::updateStatistics(MachineRegion *R) {
   ++numMachineRegions;
@@ -73,9 +78,7 @@ MachineRegionInfoPass::MachineRegionInfoPass() : MachineFunctionPass(ID) {
   initializeMachineRegionInfoPassPass(*PassRegistry::getPassRegistry());
 }
 
-MachineRegionInfoPass::~MachineRegionInfoPass() {
-
-}
+MachineRegionInfoPass::~MachineRegionInfoPass() = default;
 
 bool MachineRegionInfoPass::runOnMachineFunction(MachineFunction &F) {
   releaseMemory();
@@ -86,7 +89,7 @@ bool MachineRegionInfoPass::runOnMachineFunction(MachineFunction &F) {
 
   RI.recalculate(F, DT, PDT, DF);
 
-  DEBUG(RI.dump());
+  LLVM_DEBUG(RI.dump());
 
   return false;
 }
@@ -137,8 +140,9 @@ INITIALIZE_PASS_END(MachineRegionInfoPass, DEBUG_TYPE,
 // the link time optimization.
 
 namespace llvm {
-  FunctionPass *createMachineRegionInfoPass() {
-    return new MachineRegionInfoPass();
-  }
+
+FunctionPass *createMachineRegionInfoPass() {
+  return new MachineRegionInfoPass();
 }
 
+} // end namespace llvm

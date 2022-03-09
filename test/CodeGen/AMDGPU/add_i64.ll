@@ -19,8 +19,8 @@ define amdgpu_kernel void @test_i64_vreg(i64 addrspace(1)* noalias %out, i64 add
 
 ; Check that the SGPR add operand is correctly moved to a VGPR.
 ; SI-LABEL: {{^}}sgpr_operand:
-; SI: v_add_i32
-; SI: v_addc_u32
+; SI: s_add_u32
+; SI: s_addc_u32
 define amdgpu_kernel void @sgpr_operand(i64 addrspace(1)* noalias %out, i64 addrspace(1)* noalias %in, i64 addrspace(1)* noalias %in_bar, i64 %a) {
   %foo = load i64, i64 addrspace(1)* %in, align 8
   %result = add i64 %foo, %a
@@ -32,8 +32,8 @@ define amdgpu_kernel void @sgpr_operand(i64 addrspace(1)* noalias %out, i64 addr
 ; SGPR as other operand.
 ;
 ; SI-LABEL: {{^}}sgpr_operand_reversed:
-; SI: v_add_i32
-; SI: v_addc_u32
+; SI: s_add_u32
+; SI: s_addc_u32
 define amdgpu_kernel void @sgpr_operand_reversed(i64 addrspace(1)* noalias %out, i64 addrspace(1)* noalias %in, i64 %a) {
   %foo = load i64, i64 addrspace(1)* %in, align 8
   %result = add i64 %a, %foo
@@ -76,7 +76,7 @@ define amdgpu_kernel void @test_v2i64_vreg(<2 x i64> addrspace(1)* noalias %out,
 ; SI-NOT: addc
 ; SI: v_mov_b32_e32 [[VRESULT:v[0-9]+]], [[SRESULT]]
 ; SI: buffer_store_dword [[VRESULT]],
-define amdgpu_kernel void @trunc_i64_add_to_i32(i32 addrspace(1)* %out, i64 %a, i64 %b) {
+define amdgpu_kernel void @trunc_i64_add_to_i32(i32 addrspace(1)* %out, i32, i64 %a, i32, i64 %b) {
   %add = add i64 %b, %a
   %trunc = trunc i64 %add to i32
   store i32 %trunc, i32 addrspace(1)* %out, align 8

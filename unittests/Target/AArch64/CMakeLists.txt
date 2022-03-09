@@ -9,6 +9,7 @@ set(LLVM_LINK_COMPONENTS
   AArch64Info
   CodeGen
   Core
+  GlobalISel
   MC
   MIRParser
   SelectionDAG
@@ -18,4 +19,5 @@ set(LLVM_LINK_COMPONENTS
 
 add_llvm_unittest(AArch64Tests
   InstSizes.cpp
+  TestStackOffset.cpp
   )

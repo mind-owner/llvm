@@ -1,18 +1,17 @@
 //===-- Decompressor.cpp --------------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Object/Decompressor.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/Endian.h"
-#include "llvm/Support/ELF.h"
 
 using namespace llvm;
 using namespace llvm::support::endian;
@@ -57,7 +56,7 @@ Error Decompressor::consumeCompressedZLibHeader(bool Is64Bit,
     return createError("corrupted compressed section header");
 
   DataExtractor Extractor(SectionData, IsLittleEndian, 0);
-  uint32_t Offset = 0;
+  uint64_t Offset = 0;
   if (Extractor.getUnsigned(&Offset, Is64Bit ? sizeof(Elf64_Word)
                                              : sizeof(Elf32_Word)) !=
       ELFCOMPRESS_ZLIB)
@@ -78,19 +77,19 @@ bool Decompressor::isGnuStyle(StringRef Name) {
 }
 
 bool Decompressor::isCompressed(const object::SectionRef &Section) {
-  StringRef Name;
-  if (Section.getName(Name))
-    return false;
-  return Section.isCompressed() || isGnuStyle(Name);
+  if (Section.isCompressed())
+    return true;
+
+  Expected<StringRef> SecNameOrErr = Section.getName();
+  if (SecNameOrErr)
+    return isGnuStyle(*SecNameOrErr);
+
+  consumeError(SecNameOrErr.takeError());
+  return false;
 }
 
 bool Decompressor::isCompressedELFSection(uint64_t Flags, StringRef Name) {
   return (Flags & ELF::SHF_COMPRESSED) || isGnuStyle(Name);
-}
-
-Error Decompressor::decompress(SmallString<32> &Out) {
-  Out.resize(DecompressedSize);
-  return decompress({Out.data(), (size_t)DecompressedSize});
 }
 
 Error Decompressor::decompress(MutableArrayRef<char> Buffer) {

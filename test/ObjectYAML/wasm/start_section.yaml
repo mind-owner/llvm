@@ -1,10 +1,29 @@
 # RUN: yaml2obj %s | obj2yaml | FileCheck %s
+
 --- !WASM
 FileHeader:
   Version:         0x00000001
 Sections:
+  - Type:            TYPE
+    Signatures:
+      - Index:           0
+        ParamTypes:      []
+        ReturnTypes:     []
+  - Type:            FUNCTION
+    FunctionTypes: [ 0, 0, 0 ]
   - Type:            START
     StartFunction:   1
+  - Type:            CODE
+    Functions:
+      - Index:           0
+        Locals:
+        Body:            0B
+      - Index:           1
+        Locals:
+        Body:            0B
+      - Index:           2
+        Locals:
+        Body:            0B
 ...
 # CHECK: --- !WASM
 # CHECK: FileHeader:

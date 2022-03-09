@@ -1,9 +1,8 @@
 //===- LexicalScopes.cpp - Collecting lexical scope info --------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -31,12 +30,13 @@ namespace llvm {
 class MachineBasicBlock;
 class MachineFunction;
 class MachineInstr;
+class MDNode;
 
 //===----------------------------------------------------------------------===//
 /// InsnRange - This is used to track range of instructions with identical
 /// lexical scope.
 ///
-typedef std::pair<const MachineInstr *, const MachineInstr *> InsnRange;
+using InsnRange = std::pair<const MachineInstr *, const MachineInstr *>;
 
 //===----------------------------------------------------------------------===//
 /// LexicalScope - This class is used to track scope information.
@@ -195,7 +195,7 @@ public:
   }
 
   /// dump - Print data structures to dbgs().
-  void dump();
+  void dump() const;
 
   /// getOrCreateAbstractScope - Find or create an abstract lexical scope.
   LexicalScope *getOrCreateAbstractScope(const DILocalScope *Scope);

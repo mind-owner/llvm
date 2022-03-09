@@ -1,9 +1,8 @@
 //===- RegAllocPBQP.cpp ---- PBQP Register Allocator ----------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -29,35 +28,40 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/CodeGen/RegAllocPBQP.h"
 #include "RegisterCoalescer.h"
 #include "Spiller.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/LiveInterval.h"
-#include "llvm/CodeGen/LiveIntervalAnalysis.h"
+#include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveRangeEdit.h"
-#include "llvm/CodeGen/LiveStackAnalysis.h"
+#include "llvm/CodeGen/LiveStacks.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/PBQP/Graph.h"
+#include "llvm/CodeGen/PBQP/Math.h"
 #include "llvm/CodeGen/PBQP/Solution.h"
 #include "llvm/CodeGen/PBQPRAConstraint.h"
-#include "llvm/CodeGen/RegAllocPBQP.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCRegisterInfo.h"
@@ -68,8 +72,6 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Printable.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Target/TargetRegisterInfo.h"
-#include "llvm/Target/TargetSubtargetInfo.h"
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
@@ -82,8 +84,8 @@
 #include <string>
 #include <system_error>
 #include <tuple>
-#include <vector>
 #include <utility>
+#include <vector>
 
 using namespace llvm;
 
@@ -139,13 +141,13 @@ public:
   }
 
 private:
-  typedef std::map<const LiveInterval*, unsigned> LI2NodeMap;
-  typedef std::vector<const LiveInterval*> Node2LIMap;
-  typedef std::vector<unsigned> AllowedSet;
-  typedef std::vector<AllowedSet> AllowedSetMap;
-  typedef std::pair<unsigned, unsigned> RegPair;
-  typedef std::map<RegPair, PBQP::PBQPNum> CoalesceMap;
-  typedef std::set<unsigned> RegSet;
+  using LI2NodeMap = std::map<const LiveInterval *, unsigned>;
+  using Node2LIMap = std::vector<const LiveInterval *>;
+  using AllowedSet = std::vector<unsigned>;
+  using AllowedSetMap = std::vector<AllowedSet>;
+  using RegPair = std::pair<unsigned, unsigned>;
+  using CoalesceMap = std::map<RegPair, PBQP::PBQPNum>;
+  using RegSet = std::set<unsigned>;
 
   char *customPassID;
 
@@ -157,25 +159,25 @@ private:
   /// always available for the remat of all the siblings of the original reg.
   SmallPtrSet<MachineInstr *, 32> DeadRemats;
 
-  /// \brief Finds the initial set of vreg intervals to allocate.
+  /// Finds the initial set of vreg intervals to allocate.
   void findVRegIntervalsToAlloc(const MachineFunction &MF, LiveIntervals &LIS);
 
-  /// \brief Constructs an initial graph.
+  /// Constructs an initial graph.
   void initializeGraph(PBQPRAGraph &G, VirtRegMap &VRM, Spiller &VRegSpiller);
 
-  /// \brief Spill the given VReg.
+  /// Spill the given VReg.
   void spillVReg(unsigned VReg, SmallVectorImpl<unsigned> &NewIntervals,
                  MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM,
                  Spiller &VRegSpiller);
 
-  /// \brief Given a solved PBQP problem maps this solution back to a register
+  /// Given a solved PBQP problem maps this solution back to a register
   /// assignment.
   bool mapPBQPToRegAlloc(const PBQPRAGraph &G,
                          const PBQP::Solution &Solution,
                          VirtRegMap &VRM,
                          Spiller &VRegSpiller);
 
-  /// \brief Postprocessing before final spilling. Sets basic block "live in"
+  /// Postprocessing before final spilling. Sets basic block "live in"
   /// variables.
   void finalizeAlloc(MachineFunction &MF, LiveIntervals &LIS,
                      VirtRegMap &VRM) const;
@@ -185,7 +187,7 @@ private:
 
 char RegAllocPBQP::ID = 0;
 
-/// @brief Set spill costs for each node in the PBQP reg-alloc graph.
+/// Set spill costs for each node in the PBQP reg-alloc graph.
 class SpillCosts : public PBQPRAConstraint {
 public:
   void apply(PBQPRAGraph &G) override {
@@ -209,15 +211,15 @@ public:
   }
 };
 
-/// @brief Add interference edges between overlapping vregs.
+/// Add interference edges between overlapping vregs.
 class Interference : public PBQPRAConstraint {
 private:
-  typedef const PBQP::RegAlloc::AllowedRegVector* AllowedRegVecPtr;
-  typedef std::pair<AllowedRegVecPtr, AllowedRegVecPtr> IKey;
-  typedef DenseMap<IKey, PBQPRAGraph::MatrixPtr> IMatrixCache;
-  typedef DenseSet<IKey> DisjointAllowedRegsCache;
-  typedef std::pair<PBQP::GraphBase::NodeId, PBQP::GraphBase::NodeId> IEdgeKey;
-  typedef DenseSet<IEdgeKey> IEdgeCache;
+  using AllowedRegVecPtr = const PBQP::RegAlloc::AllowedRegVector *;
+  using IKey = std::pair<AllowedRegVecPtr, AllowedRegVecPtr>;
+  using IMatrixCache = DenseMap<IKey, PBQPRAGraph::MatrixPtr>;
+  using DisjointAllowedRegsCache = DenseSet<IKey>;
+  using IEdgeKey = std::pair<PBQP::GraphBase::NodeId, PBQP::GraphBase::NodeId>;
+  using IEdgeCache = DenseSet<IEdgeKey>;
 
   bool haveDisjointAllowedRegs(const PBQPRAGraph &G, PBQPRAGraph::NodeId NId,
                                PBQPRAGraph::NodeId MId,
@@ -252,8 +254,8 @@ private:
   // for the fast interference graph construction algorithm. The last is there
   // to save us from looking up node ids via the VRegToNode map in the graph
   // metadata.
-  typedef std::tuple<LiveInterval*, size_t, PBQP::GraphBase::NodeId>
-    IntervalInfo;
+  using IntervalInfo =
+      std::tuple<LiveInterval*, size_t, PBQP::GraphBase::NodeId>;
 
   static SlotIndex getStartPoint(const IntervalInfo &I) {
     return std::get<0>(I)->segments[std::get<1>(I)].start;
@@ -320,9 +322,10 @@ public:
     // Cache known disjoint allowed registers pairs
     DisjointAllowedRegsCache D;
 
-    typedef std::set<IntervalInfo, decltype(&lowestEndPoint)> IntervalSet;
-    typedef std::priority_queue<IntervalInfo, std::vector<IntervalInfo>,
-                                decltype(&lowestStartPoint)> IntervalQueue;
+    using IntervalSet = std::set<IntervalInfo, decltype(&lowestEndPoint)>;
+    using IntervalQueue =
+        std::priority_queue<IntervalInfo, std::vector<IntervalInfo>,
+                            decltype(&lowestStartPoint)>;
     IntervalSet Active(lowestEndPoint);
     IntervalQueue Inactive(lowestStartPoint);
 
@@ -555,19 +558,10 @@ void RegAllocPBQP::findVRegIntervalsToAlloc(const MachineFunction &MF,
 
   // Iterate over all live ranges.
   for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
-    unsigned Reg = TargetRegisterInfo::index2VirtReg(I);
+    unsigned Reg = Register::index2VirtReg(I);
     if (MRI.reg_nodbg_empty(Reg))
       continue;
-    LiveInterval &LI = LIS.getInterval(Reg);
-
-    // If this live interval is non-empty we will use pbqp to allocate it.
-    // Empty intervals we allocate in a simple post-processing stage in
-    // finalizeAlloc.
-    if (!LI.empty()) {
-      VRegsToAlloc.insert(LI.reg);
-    } else {
-      EmptyIntervalVRegs.insert(LI.reg);
-    }
+    VRegsToAlloc.insert(Reg);
   }
 }
 
@@ -591,12 +585,23 @@ void RegAllocPBQP::initializeGraph(PBQPRAGraph &G, VirtRegMap &VRM,
 
   std::vector<unsigned> Worklist(VRegsToAlloc.begin(), VRegsToAlloc.end());
 
+  std::map<unsigned, std::vector<unsigned>> VRegAllowedMap;
+
   while (!Worklist.empty()) {
     unsigned VReg = Worklist.back();
     Worklist.pop_back();
 
-    const TargetRegisterClass *TRC = MRI.getRegClass(VReg);
     LiveInterval &VRegLI = LIS.getInterval(VReg);
+
+    // If this is an empty interval move it to the EmptyIntervalVRegs set then
+    // continue.
+    if (VRegLI.empty()) {
+      EmptyIntervalVRegs.insert(VRegLI.reg);
+      VRegsToAlloc.erase(VRegLI.reg);
+      continue;
+    }
+
+    const TargetRegisterClass *TRC = MRI.getRegClass(VReg);
 
     // Record any overlaps with regmask operands.
     BitVector RegMaskOverlaps;
@@ -636,7 +641,21 @@ void RegAllocPBQP::initializeGraph(PBQPRAGraph &G, VirtRegMap &VRM,
       spillVReg(VReg, NewVRegs, MF, LIS, VRM, VRegSpiller);
       Worklist.insert(Worklist.end(), NewVRegs.begin(), NewVRegs.end());
       continue;
+    } else
+      VRegAllowedMap[VReg] = std::move(VRegAllowed);
+  }
+
+  for (auto &KV : VRegAllowedMap) {
+    auto VReg = KV.first;
+
+    // Move empty intervals to the EmptyIntervalVReg set.
+    if (LIS.getInterval(VReg).empty()) {
+      EmptyIntervalVRegs.insert(VReg);
+      VRegsToAlloc.erase(VReg);
+      continue;
     }
+
+    auto &VRegAllowed = KV.second;
 
     PBQPRAGraph::RawVector NodeCosts(VRegAllowed.size() + 1, 0);
 
@@ -658,7 +677,6 @@ void RegAllocPBQP::spillVReg(unsigned VReg,
                              SmallVectorImpl<unsigned> &NewIntervals,
                              MachineFunction &MF, LiveIntervals &LIS,
                              VirtRegMap &VRM, Spiller &VRegSpiller) {
-
   VRegsToAlloc.erase(VReg);
   LiveRangeEdit LRE(&LIS.getInterval(VReg), NewIntervals, MF, LIS, &VRM,
                     nullptr, &DeadRemats);
@@ -666,8 +684,8 @@ void RegAllocPBQP::spillVReg(unsigned VReg,
 
   const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
   (void)TRI;
-  DEBUG(dbgs() << "VREG " << PrintReg(VReg, &TRI) << " -> SPILLED (Cost: "
-               << LRE.getParent().weight << ", New vregs: ");
+  LLVM_DEBUG(dbgs() << "VREG " << printReg(VReg, &TRI) << " -> SPILLED (Cost: "
+                    << LRE.getParent().weight << ", New vregs: ");
 
   // Copy any newly inserted live intervals into the list of regs to
   // allocate.
@@ -675,11 +693,11 @@ void RegAllocPBQP::spillVReg(unsigned VReg,
        I != E; ++I) {
     const LiveInterval &LI = LIS.getInterval(*I);
     assert(!LI.empty() && "Empty spill range.");
-    DEBUG(dbgs() << PrintReg(LI.reg, &TRI) << " ");
+    LLVM_DEBUG(dbgs() << printReg(LI.reg, &TRI) << " ");
     VRegsToAlloc.insert(LI.reg);
   }
 
-  DEBUG(dbgs() << ")\n");
+  LLVM_DEBUG(dbgs() << ")\n");
 }
 
 bool RegAllocPBQP::mapPBQPToRegAlloc(const PBQPRAGraph &G,
@@ -705,8 +723,8 @@ bool RegAllocPBQP::mapPBQPToRegAlloc(const PBQPRAGraph &G,
 
     if (AllocOption != PBQP::RegAlloc::getSpillOptionIdx()) {
       unsigned PReg = G.getNodeMetadata(NId).getAllowedRegs()[AllocOption - 1];
-      DEBUG(dbgs() << "VREG " << PrintReg(VReg, &TRI) << " -> "
-            << TRI.getName(PReg) << "\n");
+      LLVM_DEBUG(dbgs() << "VREG " << printReg(VReg, &TRI) << " -> "
+                        << TRI.getName(PReg) << "\n");
       assert(PReg != 0 && "Invalid preg selected.");
       VRM.assignVirt2Phys(VReg, PReg);
     } else {
@@ -736,7 +754,15 @@ void RegAllocPBQP::finalizeAlloc(MachineFunction &MF,
 
     if (PReg == 0) {
       const TargetRegisterClass &RC = *MRI.getRegClass(LI.reg);
-      PReg = RC.getRawAllocationOrder(MF).front();
+      const ArrayRef<MCPhysReg> RawPRegOrder = RC.getRawAllocationOrder(MF);
+      for (unsigned CandidateReg : RawPRegOrder) {
+        if (!VRM.getRegInfo().isReserved(CandidateReg)) {
+          PReg = CandidateReg;
+          break;
+        }
+      }
+      assert(PReg &&
+             "No un-reserved physical registers in this register class");
     }
 
     VRM.assignVirt2Phys(LI.reg, PReg);
@@ -774,7 +800,7 @@ bool RegAllocPBQP::runOnMachineFunction(MachineFunction &MF) {
 
   MF.getRegInfo().freezeReservedRegs(MF);
 
-  DEBUG(dbgs() << "PBQP Register Allocating for " << MF.getName() << "\n");
+  LLVM_DEBUG(dbgs() << "PBQP Register Allocating for " << MF.getName() << "\n");
 
   // Allocator main loop:
   //
@@ -789,7 +815,7 @@ bool RegAllocPBQP::runOnMachineFunction(MachineFunction &MF) {
   findVRegIntervalsToAlloc(MF, LIS);
 
 #ifndef NDEBUG
-  const Function &F = *MF.getFunction();
+  const Function &F = MF.getFunction();
   std::string FullyQualifiedName =
     F.getParent()->getModuleIdentifier() + "." + F.getName().str();
 #endif
@@ -798,18 +824,18 @@ bool RegAllocPBQP::runOnMachineFunction(MachineFunction &MF) {
   if (!VRegsToAlloc.empty()) {
     const TargetSubtargetInfo &Subtarget = MF.getSubtarget();
     std::unique_ptr<PBQPRAConstraintList> ConstraintsRoot =
-      llvm::make_unique<PBQPRAConstraintList>();
-    ConstraintsRoot->addConstraint(llvm::make_unique<SpillCosts>());
-    ConstraintsRoot->addConstraint(llvm::make_unique<Interference>());
+      std::make_unique<PBQPRAConstraintList>();
+    ConstraintsRoot->addConstraint(std::make_unique<SpillCosts>());
+    ConstraintsRoot->addConstraint(std::make_unique<Interference>());
     if (PBQPCoalescing)
-      ConstraintsRoot->addConstraint(llvm::make_unique<Coalescing>());
+      ConstraintsRoot->addConstraint(std::make_unique<Coalescing>());
     ConstraintsRoot->addConstraint(Subtarget.getCustomPBQPConstraints());
 
     bool PBQPAllocComplete = false;
     unsigned Round = 0;
 
     while (!PBQPAllocComplete) {
-      DEBUG(dbgs() << "  PBQP Regalloc round " << Round << ":\n");
+      LLVM_DEBUG(dbgs() << "  PBQP Regalloc round " << Round << ":\n");
 
       PBQPRAGraph G(PBQPRAGraph::GraphMetadata(MF, LIS, MBFI));
       initializeGraph(G, VRM, *VRegSpiller);
@@ -822,9 +848,9 @@ bool RegAllocPBQP::runOnMachineFunction(MachineFunction &MF) {
         std::string GraphFileName = FullyQualifiedName + "." + RS.str() +
                                     ".pbqpgraph";
         std::error_code EC;
-        raw_fd_ostream OS(GraphFileName, EC, sys::fs::F_Text);
-        DEBUG(dbgs() << "Dumping graph for round " << Round << " to \""
-              << GraphFileName << "\"\n");
+        raw_fd_ostream OS(GraphFileName, EC, sys::fs::OF_Text);
+        LLVM_DEBUG(dbgs() << "Dumping graph for round " << Round << " to \""
+                          << GraphFileName << "\"\n");
         G.dump(OS);
       }
 #endif
@@ -841,7 +867,7 @@ bool RegAllocPBQP::runOnMachineFunction(MachineFunction &MF) {
   VRegsToAlloc.clear();
   EmptyIntervalVRegs.clear();
 
-  DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
+  LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
 
   return true;
 }
@@ -854,7 +880,7 @@ static Printable PrintNodeInfo(PBQP::RegAlloc::PBQPRAGraph::NodeId NId,
     const TargetRegisterInfo *TRI = MRI.getTargetRegisterInfo();
     unsigned VReg = G.getNodeMetadata(NId).getVReg();
     const char *RegClassName = TRI->getRegClassName(MRI.getRegClass(VReg));
-    OS << NId << " (" << RegClassName << ':' << PrintReg(VReg, TRI) << ')';
+    OS << NId << " (" << RegClassName << ':' << printReg(VReg, TRI) << ')';
   });
 }
 
@@ -914,5 +940,3 @@ FunctionPass *llvm::createPBQPRegisterAllocator(char *customPassID) {
 FunctionPass* llvm::createDefaultPBQPRegisterAllocator() {
   return createPBQPRegisterAllocator();
 }
-
-#undef DEBUG_TYPE

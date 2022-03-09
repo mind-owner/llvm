@@ -1,9 +1,8 @@
-//===-- llvm/CodeGen/MachineModuleInfoImpls.h -------------------*- C++ -*-===//
+//===- llvm/CodeGen/MachineModuleInfoImpls.h --------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,11 +14,12 @@
 #ifndef LLVM_CODEGEN_MACHINEMODULEINFOIMPLS_H
 #define LLVM_CODEGEN_MACHINEMODULEINFOIMPLS_H
 
-#include "llvm/CodeGen/ValueTypes.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
-#include "llvm/Support/Wasm.h"
+#include <cassert>
 
 namespace llvm {
+
 class MCSymbol;
 
 /// MachineModuleInfoMachO - This is a MachineModuleInfoImpl implementation
@@ -36,6 +36,7 @@ class MachineModuleInfoMachO : public MachineModuleInfoImpl {
   DenseMap<MCSymbol *, StubValueTy> ThreadLocalGVStubs;
 
   virtual void anchor(); // Out of line virtual method.
+
 public:
   MachineModuleInfoMachO(const MachineModuleInfo &) {}
 
@@ -64,6 +65,7 @@ class MachineModuleInfoELF : public MachineModuleInfoImpl {
   DenseMap<MCSymbol *, StubValueTy> GVStubs;
 
   virtual void anchor(); // Out of line virtual method.
+
 public:
   MachineModuleInfoELF(const MachineModuleInfo &) {}
 
@@ -77,33 +79,28 @@ public:
   SymbolListTy GetGVStubList() { return getSortedStubs(GVStubs); }
 };
 
-/// MachineModuleInfoWasm - This is a MachineModuleInfoImpl implementation
-/// for Wasm targets.
-class MachineModuleInfoWasm : public MachineModuleInfoImpl {
-  /// WebAssembly global variables defined by CodeGen.
-  std::vector<wasm::Global> Globals;
-
-  /// The WebAssembly global variable which is the stack pointer.
-  unsigned StackPointerGlobal;
+/// MachineModuleInfoCOFF - This is a MachineModuleInfoImpl implementation
+/// for COFF targets.
+class MachineModuleInfoCOFF : public MachineModuleInfoImpl {
+  /// GVStubs - These stubs are used to materialize global addresses in PIC
+  /// mode.
+  DenseMap<MCSymbol *, StubValueTy> GVStubs;
 
   virtual void anchor(); // Out of line virtual method.
+
 public:
-  MachineModuleInfoWasm(const MachineModuleInfo &)
-    : StackPointerGlobal(-1U) {}
+  MachineModuleInfoCOFF(const MachineModuleInfo &) {}
 
-  void addGlobal(const wasm::Global &G) { Globals.push_back(G); }
-  const std::vector<wasm::Global> &getGlobals() const { return Globals; }
+  StubValueTy &getGVStubEntry(MCSymbol *Sym) {
+    assert(Sym && "Key cannot be null");
+    return GVStubs[Sym];
+  }
 
-  bool hasStackPointerGlobal() const {
-    return StackPointerGlobal != -1U;
-  }
-  unsigned getStackPointerGlobal() const {
-    assert(hasStackPointerGlobal() && "Stack ptr global hasn't been set");
-    return StackPointerGlobal;
-  }
-  void setStackPointerGlobal(unsigned Global) { StackPointerGlobal = Global; }
+  /// Accessor methods to return the set of stubs in sorted order.
+
+  SymbolListTy GetGVStubList() { return getSortedStubs(GVStubs); }
 };
 
 } // end namespace llvm
 
-#endif
+#endif // LLVM_CODEGEN_MACHINEMODULEINFOIMPLS_H

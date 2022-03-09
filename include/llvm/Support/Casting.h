@@ -1,9 +1,8 @@
-//===-- llvm/Support/Casting.h - Allow flexible, checked, casts -*- C++ -*-===//
+//===- llvm/Support/Casting.h - Allow flexible, checked, casts --*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -19,6 +18,7 @@
 #include "llvm/Support/type_traits.h"
 #include <cassert>
 #include <memory>
+#include <type_traits>
 
 namespace llvm {
 
@@ -31,18 +31,19 @@ namespace llvm {
 // template selection process...  the default implementation is a noop.
 //
 template<typename From> struct simplify_type {
-  typedef       From SimpleType;        // The real type this represents...
+  using SimpleType = From; // The real type this represents...
 
   // An accessor to get the real value...
   static SimpleType &getSimplifiedValue(From &Val) { return Val; }
 };
 
 template<typename From> struct simplify_type<const From> {
-  typedef typename simplify_type<From>::SimpleType NonConstSimpleType;
-  typedef typename add_const_past_pointer<NonConstSimpleType>::type
-    SimpleType;
-  typedef typename add_lvalue_reference_if_not_pointer<SimpleType>::type
-    RetType;
+  using NonConstSimpleType = typename simplify_type<From>::SimpleType;
+  using SimpleType =
+      typename add_const_past_pointer<NonConstSimpleType>::type;
+  using RetType =
+      typename add_lvalue_reference_if_not_pointer<SimpleType>::type;
+
   static RetType getSimplifiedValue(const From& Val) {
     return simplify_type<From>::getSimplifiedValue(const_cast<From&>(Val));
   }
@@ -58,7 +59,7 @@ struct isa_impl {
   }
 };
 
-/// \brief Always allow upcasts, and perform no dynamic check for them.
+/// Always allow upcasts, and perform no dynamic check for them.
 template <typename To, typename From>
 struct isa_impl<
     To, From, typename std::enable_if<std::is_base_of<To, From>::value>::type> {
@@ -142,42 +143,51 @@ template <class X, class Y> LLVM_NODISCARD inline bool isa(const Y &Val) {
                        typename simplify_type<const Y>::SimpleType>::doit(Val);
 }
 
+// isa_and_nonnull<X> - Functionally identical to isa, except that a null value
+// is accepted.
+//
+template <class X, class Y>
+LLVM_NODISCARD inline bool isa_and_nonnull(const Y &Val) {
+  if (!Val)
+    return false;
+  return isa<X>(Val);
+}
+
 //===----------------------------------------------------------------------===//
 //                          cast<x> Support Templates
 //===----------------------------------------------------------------------===//
 
 template<class To, class From> struct cast_retty;
 
-
 // Calculate what type the 'cast' function should return, based on a requested
 // type of To and a source type of From.
 template<class To, class From> struct cast_retty_impl {
-  typedef To& ret_type;         // Normal case, return Ty&
+  using ret_type = To &;       // Normal case, return Ty&
 };
 template<class To, class From> struct cast_retty_impl<To, const From> {
-  typedef const To &ret_type;   // Normal case, return Ty&
+  using ret_type = const To &; // Normal case, return Ty&
 };
 
 template<class To, class From> struct cast_retty_impl<To, From*> {
-  typedef To* ret_type;         // Pointer arg case, return Ty*
+  using ret_type = To *;       // Pointer arg case, return Ty*
 };
 
 template<class To, class From> struct cast_retty_impl<To, const From*> {
-  typedef const To* ret_type;   // Constant pointer arg case, return const Ty*
+  using ret_type = const To *; // Constant pointer arg case, return const Ty*
 };
 
 template<class To, class From> struct cast_retty_impl<To, const From*const> {
-  typedef const To* ret_type;   // Constant pointer arg case, return const Ty*
+  using ret_type = const To *; // Constant pointer arg case, return const Ty*
 };
 
 template <class To, class From>
 struct cast_retty_impl<To, std::unique_ptr<From>> {
 private:
-  typedef typename cast_retty_impl<To, From *>::ret_type PointerType;
-  typedef typename std::remove_pointer<PointerType>::type ResultType;
+  using PointerType = typename cast_retty_impl<To, From *>::ret_type;
+  using ResultType = typename std::remove_pointer<PointerType>::type;
 
 public:
-  typedef std::unique_ptr<ResultType> ret_type;
+  using ret_type = std::unique_ptr<ResultType>;
 };
 
 template<class To, class From, class SimpleFrom>
@@ -185,19 +195,19 @@ struct cast_retty_wrap {
   // When the simplified type and the from type are not the same, use the type
   // simplifier to reduce the type, then reuse cast_retty_impl to get the
   // resultant type.
-  typedef typename cast_retty<To, SimpleFrom>::ret_type ret_type;
+  using ret_type = typename cast_retty<To, SimpleFrom>::ret_type;
 };
 
 template<class To, class FromTy>
 struct cast_retty_wrap<To, FromTy, FromTy> {
   // When the simplified type is equal to the from type, use it directly.
-  typedef typename cast_retty_impl<To,FromTy>::ret_type ret_type;
+  using ret_type = typename cast_retty_impl<To,FromTy>::ret_type;
 };
 
 template<class To, class From>
 struct cast_retty {
-  typedef typename cast_retty_wrap<To, From,
-                   typename simplify_type<From>::SimpleType>::ret_type ret_type;
+  using ret_type = typename cast_retty_wrap<
+      To, From, typename simplify_type<From>::SimpleType>::ret_type;
 };
 
 // Ensure the non-simple values are converted using the simplify_type template
@@ -393,6 +403,6 @@ LLVM_NODISCARD inline auto unique_dyn_cast_or_null(std::unique_ptr<Y> &&Val)
   return unique_dyn_cast_or_null<X, Y>(Val);
 }
 
-} // End llvm namespace
+} // end namespace llvm
 
-#endif
+#endif // LLVM_SUPPORT_CASTING_H

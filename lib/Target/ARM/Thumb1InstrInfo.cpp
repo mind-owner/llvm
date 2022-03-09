@@ -1,9 +1,8 @@
 //===-- Thumb1InstrInfo.cpp - Thumb-1 Instruction Information -------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -11,12 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ARMSubtarget.h"
 #include "Thumb1InstrInfo.h"
+#include "ARMSubtarget.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
-#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/MC/MCInst.h"
 
 using namespace llvm;
@@ -24,8 +22,8 @@ using namespace llvm;
 Thumb1InstrInfo::Thumb1InstrInfo(const ARMSubtarget &STI)
     : ARMBaseInstrInfo(STI), RI() {}
 
-/// getNoopForMachoTarget - Return the noop instruction to use for a noop.
-void Thumb1InstrInfo::getNoopForMachoTarget(MCInst &NopInst) const {
+/// Return the noop instruction to use for a noop.
+void Thumb1InstrInfo::getNoop(MCInst &NopInst) const {
   NopInst.setOpcode(ARM::tMOVr);
   NopInst.addOperand(MCOperand::createReg(ARM::R8));
   NopInst.addOperand(MCOperand::createReg(ARM::R8));
@@ -82,12 +80,11 @@ storeRegToStackSlot(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
                     const TargetRegisterClass *RC,
                     const TargetRegisterInfo *TRI) const {
   assert((RC == &ARM::tGPRRegClass ||
-          (TargetRegisterInfo::isPhysicalRegister(SrcReg) &&
-           isARMLowRegister(SrcReg))) && "Unknown regclass!");
+          (Register::isPhysicalRegister(SrcReg) && isARMLowRegister(SrcReg))) &&
+         "Unknown regclass!");
 
   if (RC == &ARM::tGPRRegClass ||
-      (TargetRegisterInfo::isPhysicalRegister(SrcReg) &&
-       isARMLowRegister(SrcReg))) {
+      (Register::isPhysicalRegister(SrcReg) && isARMLowRegister(SrcReg))) {
     DebugLoc DL;
     if (I != MBB.end()) DL = I->getDebugLoc();
 
@@ -110,13 +107,13 @@ loadRegFromStackSlot(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
                      unsigned DestReg, int FI,
                      const TargetRegisterClass *RC,
                      const TargetRegisterInfo *TRI) const {
-  assert((RC == &ARM::tGPRRegClass ||
-          (TargetRegisterInfo::isPhysicalRegister(DestReg) &&
-           isARMLowRegister(DestReg))) && "Unknown regclass!");
+  assert(
+      (RC->hasSuperClassEq(&ARM::tGPRRegClass) ||
+       (Register::isPhysicalRegister(DestReg) && isARMLowRegister(DestReg))) &&
+      "Unknown regclass!");
 
-  if (RC == &ARM::tGPRRegClass ||
-      (TargetRegisterInfo::isPhysicalRegister(DestReg) &&
-       isARMLowRegister(DestReg))) {
+  if (RC->hasSuperClassEq(&ARM::tGPRRegClass) ||
+      (Register::isPhysicalRegister(DestReg) && isARMLowRegister(DestReg))) {
     DebugLoc DL;
     if (I != MBB.end()) DL = I->getDebugLoc();
 
@@ -141,4 +138,17 @@ void Thumb1InstrInfo::expandLoadStackGuard(
     expandLoadStackGuardBase(MI, ARM::tLDRLIT_ga_pcrel, ARM::tLDRi);
   else
     expandLoadStackGuardBase(MI, ARM::tLDRLIT_ga_abs, ARM::tLDRi);
+}
+
+bool Thumb1InstrInfo::canCopyGluedNodeDuringSchedule(SDNode *N) const {
+  // In Thumb1 the scheduler may need to schedule a cross-copy between GPRS and CPSR
+  // but this is not always possible there, so allow the Scheduler to clone tADCS and tSBCS
+  // even if they have glue.
+  // FIXME. Actually implement the cross-copy where it is possible (post v6)
+  // because these copies entail more spilling.
+  unsigned Opcode = N->getMachineOpcode();
+  if (Opcode == ARM::tADCS || Opcode == ARM::tSBCS)
+    return true;
+
+  return false;
 }

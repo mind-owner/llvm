@@ -1,9 +1,8 @@
 //===- DbiStreamBuilder.h - PDB Dbi Stream Creation -------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,9 +11,12 @@
 
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/BinaryFormat/COFF.h"
 #include "llvm/Support/Error.h"
 
+#include "llvm/DebugInfo/CodeView/DebugFrameDataSubsection.h"
 #include "llvm/DebugInfo/PDB/Native/PDBFile.h"
+#include "llvm/DebugInfo/PDB/Native/PDBStringTableBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/RawConstants.h"
 #include "llvm/DebugInfo/PDB/PDBTypes.h"
 #include "llvm/Support/BinaryByteStream.h"
@@ -22,16 +24,20 @@
 #include "llvm/Support/Endian.h"
 
 namespace llvm {
+namespace codeview {
+struct FrameData;
+}
 namespace msf {
 class MSFBuilder;
 }
 namespace object {
 struct coff_section;
+struct FpoData;
 }
 namespace pdb {
 class DbiStream;
 struct DbiStreamHeader;
-class ModInfoBuilder;
+class DbiModuleDescriptorBuilder;
 class PDBFile;
 
 class DbiStreamBuilder {
@@ -45,29 +51,38 @@ public:
   void setVersionHeader(PdbRaw_DbiVer V);
   void setAge(uint32_t A);
   void setBuildNumber(uint16_t B);
+  void setBuildNumber(uint8_t Major, uint8_t Minor);
   void setPdbDllVersion(uint16_t V);
   void setPdbDllRbld(uint16_t R);
   void setFlags(uint16_t F);
   void setMachineType(PDB_Machine M);
-  void setSectionContribs(ArrayRef<SectionContrib> SecMap);
+  void setMachineType(COFF::MachineTypes M);
   void setSectionMap(ArrayRef<SecMapEntry> SecMap);
 
   // Add given bytes as a new stream.
   Error addDbgStream(pdb::DbgHeaderType Type, ArrayRef<uint8_t> Data);
 
+  uint32_t addECName(StringRef Name);
+
   uint32_t calculateSerializedLength() const;
 
-  Expected<ModInfoBuilder &> addModuleInfo(StringRef ModuleName);
-  Error addModuleSourceFile(StringRef Module, StringRef File);
+  void setGlobalsStreamIndex(uint32_t Index);
+  void setPublicsStreamIndex(uint32_t Index);
+  void setSymbolRecordStreamIndex(uint32_t Index);
+  void addNewFpoData(const codeview::FrameData &FD);
+  void addOldFpoData(const object::FpoData &Fpo);
+
+  Expected<DbiModuleDescriptorBuilder &> addModuleInfo(StringRef ModuleName);
+  Error addModuleSourceFile(DbiModuleDescriptorBuilder &Module, StringRef File);
+  Expected<uint32_t> getSourceFileNameIndex(StringRef FileName);
 
   Error finalizeMsfLayout();
 
   Error commit(const msf::MSFLayout &Layout, WritableBinaryStreamRef MsfBuffer);
 
-  // A helper function to create Section Contributions from COFF input
-  // section headers.
-  static std::vector<SectionContrib>
-  createSectionContribs(ArrayRef<llvm::object::coff_section> SecHdrs);
+  void addSectionContrib(const SectionContrib &SC) {
+    SectionContribs.emplace_back(SC);
+  }
 
   // A helper function to create a Section Map from a COFF section header.
   static std::vector<SecMapEntry>
@@ -75,19 +90,20 @@ public:
 
 private:
   struct DebugStream {
-    ArrayRef<uint8_t> Data;
-    uint16_t StreamNumber = 0;
+    std::function<Error(BinaryStreamWriter &)> WriteFn;
+    uint32_t Size = 0;
+    uint16_t StreamNumber = kInvalidStreamIndex;
   };
 
   Error finalize();
   uint32_t calculateModiSubstreamSize() const;
+  uint32_t calculateNamesOffset() const;
   uint32_t calculateSectionContribsStreamSize() const;
   uint32_t calculateSectionMapStreamSize() const;
   uint32_t calculateFileInfoSubstreamSize() const;
   uint32_t calculateNamesBufferSize() const;
   uint32_t calculateDbgStreamsSize() const;
 
-  Error generateModiSubstream();
   Error generateFileInfoSubstream();
 
   msf::MSFBuilder &Msf;
@@ -100,19 +116,25 @@ private:
   uint16_t PdbDllRbld;
   uint16_t Flags;
   PDB_Machine MachineType;
+  uint32_t GlobalsStreamIndex = kInvalidStreamIndex;
+  uint32_t PublicsStreamIndex = kInvalidStreamIndex;
+  uint32_t SymRecordStreamIndex = kInvalidStreamIndex;
 
   const DbiStreamHeader *Header;
 
-  StringMap<std::unique_ptr<ModInfoBuilder>> ModiMap;
-  std::vector<ModInfoBuilder *> ModiList;
+  std::vector<std::unique_ptr<DbiModuleDescriptorBuilder>> ModiList;
+
+  Optional<codeview::DebugFrameDataSubsection> NewFpoData;
+  std::vector<object::FpoData> OldFpoData;
 
   StringMap<uint32_t> SourceFileNames;
 
+  PDBStringTableBuilder ECNamesBuilder;
   WritableBinaryStreamRef NamesBuffer;
   MutableBinaryByteStream FileInfoBuffer;
-  ArrayRef<SectionContrib> SectionContribs;
+  std::vector<SectionContrib> SectionContribs;
   ArrayRef<SecMapEntry> SectionMap;
-  llvm::SmallVector<DebugStream, (int)DbgHeaderType::Max> DbgStreams;
+  std::array<Optional<DebugStream>, (int)DbgHeaderType::Max> DbgStreams;
 };
 }
 }

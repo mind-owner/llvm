@@ -1,9 +1,8 @@
 //===- LiveIntervalUnion.h - Live interval union data struct ---*- C++ -*--===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -26,12 +25,14 @@
 
 namespace llvm {
 
+class raw_ostream;
 class TargetRegisterInfo;
 
 #ifndef NDEBUG
 // forward declaration
 template <unsigned Element> class SparseBitVector;
-typedef SparseBitVector<128> LiveVirtRegBitSet;
+
+using LiveVirtRegBitSet = SparseBitVector<128>;
 #endif
 
 /// Union of live intervals that are strong candidates for coalescing into a
@@ -42,19 +43,19 @@ class LiveIntervalUnion {
   // A set of live virtual register segments that supports fast insertion,
   // intersection, and removal.
   // Mapping SlotIndex intervals to virtual register numbers.
-  typedef IntervalMap<SlotIndex, LiveInterval*> LiveSegments;
+  using LiveSegments = IntervalMap<SlotIndex, LiveInterval*>;
 
 public:
   // SegmentIter can advance to the next segment ordered by starting position
   // which may belong to a different live virtual register. We also must be able
   // to reach the current segment's containing virtual register.
-  typedef LiveSegments::iterator SegmentIter;
+  using SegmentIter = LiveSegments::iterator;
 
   /// Const version of SegmentIter.
-  typedef LiveSegments::const_iterator ConstSegmentIter;
+  using ConstSegmentIter = LiveSegments::const_iterator;
 
   // LiveIntervalUnions share an external allocator.
-  typedef LiveSegments::Allocator Allocator;
+  using Allocator = LiveSegments::Allocator;
 
 private:
   unsigned Tag = 0;       // unique tag for current contents.
@@ -76,7 +77,7 @@ public:
   SlotIndex startIndex() const { return Segments.start(); }
 
   // Provide public access to the underlying map to allow overlap iteration.
-  typedef LiveSegments Map;
+  using Map = LiveSegments;
   const Map &getMap() const { return Segments; }
 
   /// getTag - Return an opaque tag representing the current state of the union.
@@ -152,7 +153,7 @@ public:
         unsigned MaxInterferingRegs = std::numeric_limits<unsigned>::max());
 
     // Was this virtual register visited during collectInterferingVRegs?
-    bool isSeenInterference(LiveInterval *VReg) const;
+    bool isSeenInterference(LiveInterval *VirtReg) const;
 
     // Did collectInterferingVRegs collect all interferences?
     bool seenAllInterferences() const { return SeenAllInterferences; }

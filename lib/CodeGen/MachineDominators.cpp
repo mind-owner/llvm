@@ -1,9 +1,8 @@
 //===- MachineDominators.cpp - Machine Dominator Calculation --------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -13,25 +12,28 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/MachineDominators.h"
-#include "llvm/CodeGen/Passes.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/CodeGen/Passes.h"
 #include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
 
+namespace llvm {
 // Always verify dominfo if expensive checking is enabled.
 #ifdef EXPENSIVE_CHECKS
-static bool VerifyMachineDomInfo = true;
+bool VerifyMachineDomInfo = true;
 #else
-static bool VerifyMachineDomInfo = false;
+bool VerifyMachineDomInfo = false;
 #endif
+} // namespace llvm
+
 static cl::opt<bool, true> VerifyMachineDomInfoX(
-    "verify-machine-dom-info", cl::location(VerifyMachineDomInfo),
+    "verify-machine-dom-info", cl::location(VerifyMachineDomInfo), cl::Hidden,
     cl::desc("Verify machine dominator info (time consuming)"));
 
 namespace llvm {
 template class DomTreeNodeBase<MachineBasicBlock>;
-template class DominatorTreeBase<MachineBasicBlock>;
+template class DominatorTreeBase<MachineBasicBlock, false>; // DomTreeBase
 }
 
 char MachineDominatorTree::ID = 0;
@@ -49,7 +51,7 @@ void MachineDominatorTree::getAnalysisUsage(AnalysisUsage &AU) const {
 bool MachineDominatorTree::runOnMachineFunction(MachineFunction &F) {
   CriticalEdgesToSplit.clear();
   NewBBs.clear();
-  DT.reset(new DominatorTreeBase<MachineBasicBlock>(false));
+  DT.reset(new DomTreeBase<MachineBasicBlock>());
   DT->recalculate(F);
   return false;
 }
@@ -66,7 +68,10 @@ void MachineDominatorTree::releaseMemory() {
 
 void MachineDominatorTree::verifyAnalysis() const {
   if (DT && VerifyMachineDomInfo)
-    verifyDomTree();
+    if (!DT->verify(DomTreeT::VerificationLevel::Basic)) {
+      errs() << "MachineDominatorTree verification failed\n";
+      abort();
+    }
 }
 
 void MachineDominatorTree::print(raw_ostream &OS, const Module*) const {
@@ -137,21 +142,4 @@ void MachineDominatorTree::applySplitCriticalEdges() const {
   }
   NewBBs.clear();
   CriticalEdgesToSplit.clear();
-}
-
-void MachineDominatorTree::verifyDomTree() const {
-  if (!DT)
-    return;
-  MachineFunction &F = *getRoot()->getParent();
-
-  DominatorTreeBase<MachineBasicBlock> OtherDT(false);
-  OtherDT.recalculate(F);
-  if (getRootNode()->getBlock() != OtherDT.getRootNode()->getBlock() ||
-      DT->compare(OtherDT)) {
-    errs() << "MachineDominatorTree is not up to date!\nComputed:\n";
-    DT->print(errs());
-    errs() << "\nActual:\n";
-    OtherDT.print(errs());
-    abort();
-  }
 }

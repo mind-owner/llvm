@@ -1,9 +1,8 @@
 //===-------- llvm/GlobalAlias.h - GlobalAlias class ------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -62,12 +61,12 @@ public:
   /// removeFromParent - This method unlinks 'this' from the containing module,
   /// but does not delete it.
   ///
-  void removeFromParent() override;
+  void removeFromParent();
 
   /// eraseFromParent - This method unlinks 'this' from the containing module
   /// and deletes it.
   ///
-  void eraseFromParent() override;
+  void eraseFromParent();
 
   /// These methods retrieve and set alias target.
   void setAliasee(Constant *Aliasee);
@@ -84,7 +83,7 @@ public:
   }
 
   // Methods for support type inquiry through isa, cast, and dyn_cast:
-  static inline bool classof(const Value *V) {
+  static bool classof(const Value *V) {
     return V->getValueID() == Value::GlobalAliasVal;
   }
 };

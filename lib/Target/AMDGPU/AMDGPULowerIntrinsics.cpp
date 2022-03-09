@@ -1,14 +1,15 @@
 //===-- AMDGPULowerIntrinsics.cpp -----------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "AMDGPU.h"
 #include "AMDGPUSubtarget.h"
+#include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -25,18 +26,21 @@ const unsigned MaxStaticSize = 1024;
 
 class AMDGPULowerIntrinsics : public ModulePass {
 private:
-  const TargetMachine *TM;
-
   bool makeLIDRangeMetadata(Function &F) const;
 
 public:
   static char ID;
 
-  AMDGPULowerIntrinsics(const TargetMachine *TM = nullptr)
-    : ModulePass(ID), TM(TM) { }
+  AMDGPULowerIntrinsics() : ModulePass(ID) {}
+
   bool runOnModule(Module &M) override;
+  bool expandMemIntrinsicUses(Function &F);
   StringRef getPassName() const override {
     return "AMDGPU Lower Intrinsics";
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<TargetTransformInfoWrapperPass>();
   }
 };
 
@@ -46,8 +50,8 @@ char AMDGPULowerIntrinsics::ID = 0;
 
 char &llvm::AMDGPULowerIntrinsicsID = AMDGPULowerIntrinsics::ID;
 
-INITIALIZE_TM_PASS(AMDGPULowerIntrinsics, DEBUG_TYPE,
-                  "Lower intrinsics", false, false)
+INITIALIZE_PASS(AMDGPULowerIntrinsics, DEBUG_TYPE, "Lower intrinsics", false,
+                false)
 
 // TODO: Should refine based on estimated number of accesses (e.g. does it
 // require splitting based on alignment)
@@ -56,7 +60,7 @@ static bool shouldExpandOperationWithSize(Value *Size) {
   return !CI || (CI->getZExtValue() > MaxStaticSize);
 }
 
-static bool expandMemIntrinsicUses(Function &F) {
+bool AMDGPULowerIntrinsics::expandMemIntrinsicUses(Function &F) {
   Intrinsic::ID ID = F.getIntrinsicID();
   bool Changed = false;
 
@@ -68,7 +72,10 @@ static bool expandMemIntrinsicUses(Function &F) {
     case Intrinsic::memcpy: {
       auto *Memcpy = cast<MemCpyInst>(Inst);
       if (shouldExpandOperationWithSize(Memcpy->getLength())) {
-        expandMemCpyAsLoop(Memcpy);
+        Function *ParentFunc = Memcpy->getParent()->getParent();
+        const TargetTransformInfo &TTI =
+            getAnalysis<TargetTransformInfoWrapperPass>().getTTI(*ParentFunc);
+        expandMemCpyAsLoop(Memcpy, TTI);
         Changed = true;
         Memcpy->eraseFromParent();
       }
@@ -104,18 +111,19 @@ static bool expandMemIntrinsicUses(Function &F) {
 }
 
 bool AMDGPULowerIntrinsics::makeLIDRangeMetadata(Function &F) const {
-  if (!TM)
+  auto *TPC = getAnalysisIfAvailable<TargetPassConfig>();
+  if (!TPC)
     return false;
 
+  const TargetMachine &TM = TPC->getTM<TargetMachine>();
   bool Changed = false;
-  const AMDGPUSubtarget &ST = TM->getSubtarget<AMDGPUSubtarget>(F);
 
   for (auto *U : F.users()) {
     auto *CI = dyn_cast<CallInst>(U);
     if (!CI)
       continue;
 
-    Changed |= ST.makeLIDRangeMetadata(CI);
+    Changed |= AMDGPUSubtarget::get(TM, F).makeLIDRangeMetadata(CI);
   }
   return Changed;
 }
@@ -155,6 +163,6 @@ bool AMDGPULowerIntrinsics::runOnModule(Module &M) {
   return Changed;
 }
 
-ModulePass *llvm::createAMDGPULowerIntrinsicsPass(const TargetMachine *TM) {
-  return new AMDGPULowerIntrinsics(TM);
+ModulePass *llvm::createAMDGPULowerIntrinsicsPass() {
+  return new AMDGPULowerIntrinsics();
 }

@@ -1,9 +1,8 @@
 //===-- xray-graph.h - XRay Function Call Graph Renderer --------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -46,6 +45,7 @@ class ColorHelper {
   double MaxIn;
 
   ArrayRef<std::tuple<uint8_t, uint8_t, uint8_t>> ColorMap;
+  ArrayRef<std::tuple<uint8_t, uint8_t, uint8_t>> BoundMap;
 
 public:
   /// Enum of the availible Sequential Color Schemes
@@ -73,9 +73,16 @@ public:
 
   std::string getColorString(double Point) const;
 
+  // Get the Default color, at the moment allways black.
+  std::tuple<uint8_t, uint8_t, uint8_t> getDefaultColorTuple() const {
+    return std::make_tuple(0, 0, 0);
+  }
+
+  std::string getDefaultColorString() const { return "black"; }
+
   // Convert a tuple to a string
   static std::string getColorString(std::tuple<uint8_t, uint8_t, uint8_t> t);
 };
-}
-}
+} // namespace xray
+} // namespace llvm
 #endif

@@ -5,18 +5,21 @@ add_llvm_library(LLVMTransformUtils
   BreakCriticalEdges.cpp
   BuildLibCalls.cpp
   BypassSlowDivision.cpp
+  CallPromotionUtils.cpp
+  CanonicalizeAliases.cpp
   CloneFunction.cpp
   CloneModule.cpp
-  CmpInstAnalysis.cpp
   CodeExtractor.cpp
   CtorUtils.cpp
   DemoteRegToStack.cpp
+  EntryExitInstrumenter.cpp
   EscapeEnumerator.cpp
   Evaluator.cpp
   FlattenCFG.cpp
   FunctionComparator.cpp
   FunctionImportUtils.cpp
   GlobalStatus.cpp
+  GuardUtils.cpp
   InlineFunction.cpp
   ImportedFunctionsInliningStatistics.cpp
   InstructionNamer.cpp
@@ -24,8 +27,10 @@ add_llvm_library(LLVMTransformUtils
   LCSSA.cpp
   LibCallsShrinkWrap.cpp
   Local.cpp
+  LoopRotationUtils.cpp
   LoopSimplify.cpp
   LoopUnroll.cpp
+  LoopUnrollAndJam.cpp
   LoopUnrollPeel.cpp
   LoopUnrollRuntime.cpp
   LoopUtils.cpp
@@ -35,17 +40,19 @@ add_llvm_library(LLVMTransformUtils
   LowerSwitch.cpp
   Mem2Reg.cpp
   MetaRenamer.cpp
+  MisExpect.cpp
   ModuleUtils.cpp
   NameAnonGlobals.cpp
   PredicateInfo.cpp
   PromoteMemoryToRegister.cpp
   StripGCRelocates.cpp
   SSAUpdater.cpp
+  SSAUpdaterBulk.cpp
   SanitizerStats.cpp
   SimplifyCFG.cpp
   SimplifyIndVar.cpp
-  SimplifyInstructions.cpp
   SimplifyLibCalls.cpp
+  SizeOpts.cpp
   SplitModule.cpp
   StripNonLineTableDebugInfo.cpp
   SymbolRewriter.cpp

@@ -1,4 +1,4 @@
-; RUN: llc -verify-machineinstrs < %s -march=ppc32 -fp-contract=fast -mattr=-vsx -disable-ppc-vsx-fma-mutation=false | FileCheck %s
+; RUN: llc -verify-machineinstrs < %s -mtriple=ppc32-- -fp-contract=fast -mattr=-vsx -disable-ppc-vsx-fma-mutation=false | FileCheck %s
 ; RUN: llc -verify-machineinstrs < %s -mtriple=powerpc64-unknown-linux-gnu -fp-contract=fast -mattr=+vsx -mcpu=pwr7 -disable-ppc-vsx-fma-mutation=false | FileCheck -check-prefix=CHECK-VSX %s
 
 define double @test_FMADD_EXT1(float %A, float %B, double %C) {
@@ -54,7 +54,6 @@ define double @test_FMSUB_EXT2(float %A, float %B, double %C) {
                                 
 ; CHECK-VSX-LABEL: test_FMSUB_EXT2:
 ; CHECK-VSX: xsnmsubmdp
-; CHECK-VSX-NEXT: fmr
 ; CHECK-VSX-NEXT: blr
 }
 

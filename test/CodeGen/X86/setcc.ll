@@ -7,9 +7,9 @@
 
 define zeroext i16 @t1(i16 zeroext %x) nounwind readnone ssp {
 ; CHECK-LABEL: t1:
-; CHECK:       ## BB#0:
+; CHECK:       ## %bb.0:
 ; CHECK-NEXT:    xorl %eax, %eax
-; CHECK-NEXT:    cmpl $26, %edi
+; CHECK-NEXT:    cmpw $26, %di
 ; CHECK-NEXT:    seta %al
 ; CHECK-NEXT:    shll $5, %eax
 ; CHECK-NEXT:    retq
@@ -20,9 +20,9 @@ define zeroext i16 @t1(i16 zeroext %x) nounwind readnone ssp {
 
 define zeroext i16 @t2(i16 zeroext %x) nounwind readnone ssp {
 ; CHECK-LABEL: t2:
-; CHECK:       ## BB#0:
+; CHECK:       ## %bb.0:
 ; CHECK-NEXT:    xorl %eax, %eax
-; CHECK-NEXT:    cmpl $26, %edi
+; CHECK-NEXT:    cmpw $26, %di
 ; CHECK-NEXT:    setb %al
 ; CHECK-NEXT:    shll $5, %eax
 ; CHECK-NEXT:    retq
@@ -33,7 +33,7 @@ define zeroext i16 @t2(i16 zeroext %x) nounwind readnone ssp {
 
 define i64 @t3(i64 %x) nounwind readnone ssp {
 ; CHECK-LABEL: t3:
-; CHECK:       ## BB#0:
+; CHECK:       ## %bb.0:
 ; CHECK-NEXT:    xorl %eax, %eax
 ; CHECK-NEXT:    cmpq $18, %rdi
 ; CHECK-NEXT:    setb %al
@@ -48,7 +48,7 @@ define i64 @t3(i64 %x) nounwind readnone ssp {
 
 define i32 @t4(i32 %a) {
 ; CHECK-LABEL: t4:
-; CHECK:       ## BB#0:
+; CHECK:       ## %bb.0:
 ; CHECK-NEXT:    movq _v4@{{.*}}(%rip), %rax
 ; CHECK-NEXT:    cmpl $1, (%rax)
 ; CHECK-NEXT:    movw $1, %ax
@@ -67,7 +67,7 @@ define i32 @t4(i32 %a) {
 
 define i8 @t5(i32 %a) #0 {
 ; CHECK-LABEL: t5:
-; CHECK:       ## BB#0:
+; CHECK:       ## %bb.0:
 ; CHECK-NEXT:    testl %edi, %edi
 ; CHECK-NEXT:    setns %al
 ; CHECK-NEXT:    retq
@@ -79,7 +79,7 @@ define i8 @t5(i32 %a) #0 {
 
 define zeroext i1 @t6(i32 %a) #0 {
 ; CHECK-LABEL: t6:
-; CHECK:       ## BB#0:
+; CHECK:       ## %bb.0:
 ; CHECK-NEXT:    testl %edi, %edi
 ; CHECK-NEXT:    setns %al
 ; CHECK-NEXT:    retq
@@ -87,6 +87,20 @@ define zeroext i1 @t6(i32 %a) #0 {
   %trunc = trunc i32 %.lobit to i1
   %.not = xor i1 %trunc, 1
   ret i1 %.not
+}
+
+define i16 @shift_and(i16 %a) {
+; CHECK-LABEL: shift_and:
+; CHECK:       ## %bb.0:
+; CHECK-NEXT:    movl %edi, %eax
+; CHECK-NEXT:    shrl $10, %eax
+; CHECK-NEXT:    andl $1, %eax
+; CHECK-NEXT:    ## kill: def $ax killed $ax killed $eax
+; CHECK-NEXT:    retq
+  %and = and i16 %a, 1024
+  %cmp = icmp ne i16 %and, 0
+  %conv = zext i1 %cmp to i16
+  ret i16 %conv
 }
 
 attributes #0 = { "target-cpu"="skylake-avx512" }

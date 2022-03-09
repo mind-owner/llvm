@@ -1,9 +1,8 @@
 //===- llvm/unittest/Support/CompressionTest.cpp - Compression tests ------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,10 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Support/Compression.h"
-#include "llvm/Support/Error.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Config/config.h"
+#include "llvm/Support/Error.h"
 #include "gtest/gtest.h"
 
 using namespace llvm;
@@ -24,7 +23,7 @@ namespace {
 
 #if LLVM_ENABLE_ZLIB == 1 && HAVE_LIBZ
 
-void TestZlibCompression(StringRef Input, zlib::CompressionLevel Level) {
+void TestZlibCompression(StringRef Input, int Level) {
   SmallString<32> Compressed;
   SmallString<32> Uncompressed;
 

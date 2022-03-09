@@ -1,9 +1,8 @@
-//===--- StringMap.h - String Hash table map interface ----------*- C++ -*-===//
+//===- StringMap.h - String Hash table map interface ------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,34 +15,33 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/PointerLikeTypeTraits.h"
+#include "llvm/Support/ErrorHandling.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
-#include <new>
+#include <iterator>
 #include <utility>
 
 namespace llvm {
 
-  template<typename ValueT>
-  class StringMapConstIterator;
-  template<typename ValueT>
-  class StringMapIterator;
-  template <typename ValueT> class StringMapKeyIterator;
-  template<typename ValueTy>
-  class StringMapEntry;
+template<typename ValueTy> class StringMapConstIterator;
+template<typename ValueTy> class StringMapIterator;
+template<typename ValueTy> class StringMapKeyIterator;
 
 /// StringMapEntryBase - Shared base class of StringMapEntry instances.
 class StringMapEntryBase {
-  unsigned StrLen;
+  size_t StrLen;
 
 public:
-  explicit StringMapEntryBase(unsigned Len) : StrLen(Len) {}
+  explicit StringMapEntryBase(size_t Len) : StrLen(Len) {}
 
-  unsigned getKeyLength() const { return StrLen; }
+  size_t getKeyLength() const { return StrLen; }
 };
 
 /// StringMapImpl - This is the base class of StringMap that is shared among
@@ -53,17 +51,15 @@ protected:
   // Array of NumBuckets pointers to entries, null pointers are holes.
   // TheTable[NumBuckets] contains a sentinel value for easy iteration. Followed
   // by an array of the actual hash values as unsigned integers.
-  StringMapEntryBase **TheTable;
-  unsigned NumBuckets;
-  unsigned NumItems;
-  unsigned NumTombstones;
+  StringMapEntryBase **TheTable = nullptr;
+  unsigned NumBuckets = 0;
+  unsigned NumItems = 0;
+  unsigned NumTombstones = 0;
   unsigned ItemSize;
 
 protected:
   explicit StringMapImpl(unsigned itemSize)
-      : TheTable(nullptr),
-        // Initialize the map with zero buckets to allocation.
-        NumBuckets(0), NumItems(0), NumTombstones(0), ItemSize(itemSize) {}
+      : ItemSize(itemSize) {}
   StringMapImpl(StringMapImpl &&RHS)
       : TheTable(RHS.TheTable), NumBuckets(RHS.NumBuckets),
         NumItems(RHS.NumItems), NumTombstones(RHS.NumTombstones),
@@ -122,52 +118,75 @@ public:
   }
 };
 
-/// StringMapEntry - This is used to represent one value that is inserted into
-/// a StringMap.  It contains the Value itself and the key: the string length
-/// and data.
+/// StringMapEntryStorage - Holds the value in a StringMapEntry.
+///
+/// Factored out into a separate base class to make it easier to specialize.
+/// This is primarily intended to support StringSet, which doesn't need a value
+/// stored at all.
 template<typename ValueTy>
-class StringMapEntry : public StringMapEntryBase {
+class StringMapEntryStorage : public StringMapEntryBase {
 public:
   ValueTy second;
 
-  explicit StringMapEntry(unsigned strLen)
+  explicit StringMapEntryStorage(size_t strLen)
     : StringMapEntryBase(strLen), second() {}
   template <typename... InitTy>
-  StringMapEntry(unsigned strLen, InitTy &&... InitVals)
+  StringMapEntryStorage(size_t strLen, InitTy &&... InitVals)
       : StringMapEntryBase(strLen), second(std::forward<InitTy>(InitVals)...) {}
-  StringMapEntry(StringMapEntry &E) = delete;
-
-  StringRef getKey() const {
-    return StringRef(getKeyData(), getKeyLength());
-  }
+  StringMapEntryStorage(StringMapEntryStorage &E) = delete;
 
   const ValueTy &getValue() const { return second; }
   ValueTy &getValue() { return second; }
 
   void setValue(const ValueTy &V) { second = V; }
+};
+
+template<>
+class StringMapEntryStorage<NoneType> : public StringMapEntryBase {
+public:
+  explicit StringMapEntryStorage(size_t strLen, NoneType none = None)
+    : StringMapEntryBase(strLen) {}
+  StringMapEntryStorage(StringMapEntryStorage &E) = delete;
+
+  NoneType getValue() const { return None; }
+};
+
+/// StringMapEntry - This is used to represent one value that is inserted into
+/// a StringMap.  It contains the Value itself and the key: the string length
+/// and data.
+template<typename ValueTy>
+class StringMapEntry final : public StringMapEntryStorage<ValueTy> {
+public:
+  using StringMapEntryStorage<ValueTy>::StringMapEntryStorage;
+
+  StringRef getKey() const {
+    return StringRef(getKeyData(), this->getKeyLength());
+  }
 
   /// getKeyData - Return the start of the string data that is the key for this
   /// value.  The string data is always stored immediately after the
   /// StringMapEntry object.
   const char *getKeyData() const {return reinterpret_cast<const char*>(this+1);}
 
-  StringRef first() const { return StringRef(getKeyData(), getKeyLength()); }
+  StringRef first() const {
+    return StringRef(getKeyData(), this->getKeyLength());
+  }
 
   /// Create a StringMapEntry for the specified key construct the value using
   /// \p InitiVals.
   template <typename AllocatorTy, typename... InitTy>
   static StringMapEntry *Create(StringRef Key, AllocatorTy &Allocator,
                                 InitTy &&... InitVals) {
-    unsigned KeyLength = Key.size();
+    size_t KeyLength = Key.size();
 
     // Allocate a new item with space for the string at the end and a null
     // terminator.
-    unsigned AllocSize = static_cast<unsigned>(sizeof(StringMapEntry))+
-      KeyLength+1;
-    unsigned Alignment = alignof(StringMapEntry);
+    size_t AllocSize = sizeof(StringMapEntry) + KeyLength + 1;
+    size_t Alignment = alignof(StringMapEntry);
 
     StringMapEntry *NewItem =
       static_cast<StringMapEntry*>(Allocator.Allocate(AllocSize,Alignment));
+    assert(NewItem && "Unhandled out-of-memory");
 
     // Construct the value.
     new (NewItem) StringMapEntry(KeyLength, std::forward<InitTy>(InitVals)...);
@@ -203,8 +222,7 @@ public:
   template<typename AllocatorTy>
   void Destroy(AllocatorTy &Allocator) {
     // Free memory referenced by the item.
-    unsigned AllocSize =
-        static_cast<unsigned>(sizeof(StringMapEntry)) + getKeyLength() + 1;
+    size_t AllocSize = sizeof(StringMapEntry) + this->getKeyLength() + 1;
     this->~StringMapEntry();
     Allocator.Deallocate(static_cast<void *>(this), AllocSize);
   }
@@ -225,9 +243,10 @@ class StringMap : public StringMapImpl {
   AllocatorTy Allocator;
 
 public:
-  typedef StringMapEntry<ValueTy> MapEntryTy;
+  using MapEntryTy = StringMapEntry<ValueTy>;
 
   StringMap() : StringMapImpl(static_cast<unsigned>(sizeof(MapEntryTy))) {}
+
   explicit StringMap(unsigned InitialSize)
     : StringMapImpl(InitialSize, static_cast<unsigned>(sizeof(MapEntryTy))) {}
 
@@ -247,12 +266,6 @@ public:
 
   StringMap(StringMap &&RHS)
       : StringMapImpl(std::move(RHS)), Allocator(std::move(RHS.Allocator)) {}
-
-  StringMap &operator=(StringMap RHS) {
-    StringMapImpl::swap(RHS);
-    std::swap(Allocator, RHS.Allocator);
-    return *this;
-  }
 
   StringMap(const StringMap &RHS) :
     StringMapImpl(static_cast<unsigned>(sizeof(MapEntryTy))),
@@ -289,16 +302,37 @@ public:
     // not worthwhile.
   }
 
+  StringMap &operator=(StringMap RHS) {
+    StringMapImpl::swap(RHS);
+    std::swap(Allocator, RHS.Allocator);
+    return *this;
+  }
+
+  ~StringMap() {
+    // Delete all the elements in the map, but don't reset the elements
+    // to default values.  This is a copy of clear(), but avoids unnecessary
+    // work not required in the destructor.
+    if (!empty()) {
+      for (unsigned I = 0, E = NumBuckets; I != E; ++I) {
+        StringMapEntryBase *Bucket = TheTable[I];
+        if (Bucket && Bucket != getTombstoneVal()) {
+          static_cast<MapEntryTy*>(Bucket)->Destroy(Allocator);
+        }
+      }
+    }
+    free(TheTable);
+  }
+
   AllocatorTy &getAllocator() { return Allocator; }
   const AllocatorTy &getAllocator() const { return Allocator; }
 
-  typedef const char* key_type;
-  typedef ValueTy mapped_type;
-  typedef StringMapEntry<ValueTy> value_type;
-  typedef size_t size_type;
+  using key_type = const char*;
+  using mapped_type = ValueTy;
+  using value_type = StringMapEntry<ValueTy>;
+  using size_type = size_t;
 
-  typedef StringMapConstIterator<ValueTy> const_iterator;
-  typedef StringMapIterator<ValueTy> iterator;
+  using const_iterator = StringMapConstIterator<ValueTy>;
+  using iterator = StringMapIterator<ValueTy>;
 
   iterator begin() {
     return iterator(TheTable, NumBuckets == 0);
@@ -313,7 +347,7 @@ public:
     return const_iterator(TheTable+NumBuckets, true);
   }
 
-  llvm::iterator_range<StringMapKeyIterator<ValueTy>> keys() const {
+  iterator_range<StringMapKeyIterator<ValueTy>> keys() const {
     return make_range(StringMapKeyIterator<ValueTy>(begin()),
                       StringMapKeyIterator<ValueTy>(end()));
   }
@@ -348,6 +382,11 @@ public:
     return find(Key) == end() ? 0 : 1;
   }
 
+  template <typename InputTy>
+  size_type count(const StringMapEntry<InputTy> &MapEntry) const {
+    return count(MapEntry.getKey());
+  }
+
   /// insert - Insert the specified key/value pair into the map.  If the key
   /// already exists in the map, return false and ignore the request, otherwise
   /// insert it and return true.
@@ -373,6 +412,16 @@ public:
   /// the pair points to the element with key equivalent to the key of the pair.
   std::pair<iterator, bool> insert(std::pair<StringRef, ValueTy> KV) {
     return try_emplace(KV.first, std::move(KV.second));
+  }
+
+  /// Inserts an element or assigns to the current element if the key already
+  /// exists. The return type is the same as try_emplace.
+  template <typename V>
+  std::pair<iterator, bool> insert_or_assign(StringRef Key, V &&Val) {
+    auto Ret = try_emplace(Key, std::forward<V>(Val));
+    if (!Ret.second)
+      Ret.first->second = std::forward<V>(Val);
+    return Ret;
   }
 
   /// Emplace a new element for the specified key into the map if the key isn't
@@ -432,21 +481,6 @@ public:
     if (I == end()) return false;
     erase(I);
     return true;
-  }
-
-  ~StringMap() {
-    // Delete all the elements in the map, but don't reset the elements
-    // to default values.  This is a copy of clear(), but avoids unnecessary
-    // work not required in the destructor.
-    if (!empty()) {
-      for (unsigned I = 0, E = NumBuckets; I != E; ++I) {
-        StringMapEntryBase *Bucket = TheTable[I];
-        if (Bucket && Bucket != getTombstoneVal()) {
-          static_cast<MapEntryTy*>(Bucket)->Destroy(Allocator);
-        }
-      }
-    }
-    free(TheTable);
   }
 };
 
@@ -542,7 +576,6 @@ class StringMapKeyIterator
 
 public:
   StringMapKeyIterator() = default;
-
   explicit StringMapKeyIterator(StringMapConstIterator<ValueTy> Iter)
       : base(std::move(Iter)) {}
 

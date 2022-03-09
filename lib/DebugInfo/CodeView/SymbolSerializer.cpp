@@ -1,20 +1,27 @@
-//===- SymbolSerializer.cpp -------------------------------------*- C++ -*-===//
+//===- SymbolSerializer.cpp -----------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/CodeView/SymbolSerializer.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/DebugInfo/CodeView/SymbolRecord.h"
+#include "llvm/Support/Endian.h"
+#include "llvm/Support/Error.h"
+#include <cassert>
+#include <cstdint>
+#include <cstring>
 
 using namespace llvm;
 using namespace llvm::codeview;
 
-SymbolSerializer::SymbolSerializer(BumpPtrAllocator &Allocator)
-  : Storage(Allocator), RecordBuffer(MaxRecordLength), Stream(RecordBuffer, llvm::support::little),
-  Writer(Stream), Mapping(Writer) { }
+SymbolSerializer::SymbolSerializer(BumpPtrAllocator &Allocator,
+                                   CodeViewContainer Container)
+    : Storage(Allocator), Stream(RecordBuffer, support::little), Writer(Stream),
+      Mapping(Writer, Container) {}
 
 Error SymbolSerializer::visitSymbolBegin(CVSymbol &Record) {
   assert(!CurrentSymbol.hasValue() && "Already in a symbol mapping!");

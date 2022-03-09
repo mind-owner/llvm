@@ -3,6 +3,15 @@
 ; RUN: llc < %s -mtriple=arm64-apple-ios7.0 -aarch64-neon-syntax=apple 2>&1 | FileCheck -check-prefix=NO_REMARK %s
 ; RUN: llc < %s -mtriple=arm64-apple-ios7.0 -aarch64-neon-syntax=apple -pass-remarks-output=%t.yaml -pass-remarks-with-hotness 2>&1 | FileCheck -check-prefix=NO_REMARK %s
 ; RUN: cat %t.yaml | FileCheck -check-prefix=YAML %s
+;
+; Verify that remarks below the hotness threshold are not output.
+; RUN: llc < %s -mtriple=arm64-apple-ios7.0 -aarch64-neon-syntax=apple -pass-remarks-missed=regalloc \
+; RUN:       -pass-remarks-with-hotness -pass-remarks-hotness-threshold=500 \
+; RUN:       2>&1 | FileCheck -check-prefix=THRESHOLD %s
+; RUN: llc < %s -mtriple=arm64-apple-ios7.0 -aarch64-neon-syntax=apple -pass-remarks-output=%t.threshold.yaml \
+; RUN:       -pass-remarks-with-hotness -pass-remarks-hotness-threshold=500 \
+; RUN:       2>&1 | FileCheck -check-prefix=NO_REMARK %s
+; RUN: cat %t.threshold.yaml | FileCheck -check-prefix=THRESHOLD_YAML %s
 
 ; This has two nested loops, each with one value that has to be spilled and
 ; then reloaded.
@@ -23,10 +32,13 @@
 
 ; NO_REMARK-NOT: remark
 
+; THRESHOLD-NOT: (hotness: 300)
+; THRESHOLD: remark: /tmp/kk.c:2:20: 1 spills 1 reloads generated in loop (hotness: 30000)
+
 ; YAML: --- !Missed
 ; YAML: Pass:            regalloc
 ; YAML: Name:            LoopSpillReload
-; YAML: DebugLoc:        { File: /tmp/kk.c, Line: 3, Column: 20 }
+; YAML: DebugLoc:        { File: '/tmp/kk.c', Line: 3, Column: 20 }
 ; YAML: Function:        fpr128
 ; YAML: Hotness:         300
 ; YAML: Args:
@@ -39,7 +51,7 @@
 ; YAML: --- !Missed
 ; YAML: Pass:            regalloc
 ; YAML: Name:            LoopSpillReload
-; YAML: DebugLoc:        { File: /tmp/kk.c, Line: 2, Column: 20 }
+; YAML: DebugLoc:        { File: '/tmp/kk.c', Line: 2, Column: 20 }
 ; YAML: Function:        fpr128
 ; YAML: Hotness:         30000
 ; YAML: Args:
@@ -52,7 +64,7 @@
 ; YAML: --- !Missed
 ; YAML: Pass:            regalloc
 ; YAML: Name:            LoopSpillReload
-; YAML: DebugLoc:        { File: /tmp/kk.c, Line: 1, Column: 20 }
+; YAML: DebugLoc:        { File: '/tmp/kk.c', Line: 1, Column: 20 }
 ; YAML: Function:        fpr128
 ; YAML: Hotness:         300
 ; YAML: Args:
@@ -62,6 +74,21 @@
 ; YAML:   - String:          ' reloads '
 ; YAML:   - String:          generated in loop
 ; YAML: ...
+
+; THRESHOLD_YAML-NOT: Hotness:         300{{$}}
+; THRESHOLD_YAML: --- !Missed
+; THRESHOLD_YAML: Pass:            regalloc
+; THRESHOLD_YAML: Name:            LoopSpillReload
+; THRESHOLD_YAML: DebugLoc:        { File: '/tmp/kk.c', Line: 2, Column: 20 }
+; THRESHOLD_YAML: Function:        fpr128
+; THRESHOLD_YAML: Hotness:         30000
+; THRESHOLD_YAML: Args:
+; THRESHOLD_YAML:   - NumSpills:       '1'
+; THRESHOLD_YAML:   - String:          ' spills '
+; THRESHOLD_YAML:   - NumReloads:      '1'
+; THRESHOLD_YAML:   - String:          ' reloads '
+; THRESHOLD_YAML:   - String:          generated in loop
+; THRESHOLD_YAML: ...
 
 define void @fpr128(<4 x float>* %p) nounwind ssp !prof !11 {
 entry:
@@ -108,7 +135,7 @@ end3:
 !3 = !{i32 2, !"Debug Info Version", i32 3}
 !4 = !{i32 1, !"PIC Level", i32 2}
 !5 = !{!"clang version 3.9.0 "}
-!6 = distinct !DISubprogram(name: "success", scope: !1, file: !1, line: 1, type: !7, isLocal: false, isDefinition: true, scopeLine: 1, flags: DIFlagPrototyped, isOptimized: true, unit: !0, variables: !2)
+!6 = distinct !DISubprogram(name: "success", scope: !1, file: !1, line: 1, type: !7, isLocal: false, isDefinition: true, scopeLine: 1, flags: DIFlagPrototyped, isOptimized: true, unit: !0, retainedNodes: !2)
 !7 = !DISubroutineType(types: !2)
 !8 = !DILocation(line: 1, column: 20, scope: !6)
 !9 = !DILocation(line: 2, column: 20, scope: !6)

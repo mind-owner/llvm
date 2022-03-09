@@ -1,4 +1,4 @@
-; RUN: llc < %s -march=nvptx -mcpu=sm_20 | FileCheck %s
+; RUN: llc < %s -march=nvptx -mcpu=sm_20 -verify-machineinstrs | FileCheck %s
 
 target datalayout = "e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64"
 
@@ -108,7 +108,7 @@ define i16 @myctlz_ret16_2(i16 %a) {
 define void @myctlz_store16(i16 %a, i16* %b) {
 ; CHECK: ld.param.
 ; CHECK-NEXT: cvt.u32.u16
-; CHECK-NET: clz.b32
+; CHECK-NEXT: clz.b32
 ; CHECK-DAG: cvt.u16.u32
 ; CHECK-DAG: sub.
 ; CHECK: st.{{[a-z]}}16
@@ -121,7 +121,7 @@ define void @myctlz_store16(i16 %a, i16* %b) {
 define void @myctlz_store16_2(i16 %a, i16* %b) {
 ; CHECK: ld.param.
 ; CHECK-NEXT: cvt.u32.u16
-; CHECK-NET: clz.b32
+; CHECK-NEXT: clz.b32
 ; CHECK-DAG: cvt.u16.u32
 ; CHECK-DAG: sub.
 ; CHECK: st.{{[a-z]}}16

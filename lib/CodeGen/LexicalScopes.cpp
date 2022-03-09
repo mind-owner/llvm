@@ -1,9 +1,8 @@
 //===- LexicalScopes.cpp - Collecting lexical scope info ------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -14,13 +13,15 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/CodeGen/LexicalScopes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/CodeGen/LexicalScopes.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
@@ -47,11 +48,11 @@ void LexicalScopes::reset() {
 
 /// initialize - Scan machine function and constuct lexical scope nest.
 void LexicalScopes::initialize(const MachineFunction &Fn) {
+  reset();
   // Don't attempt any lexical scope creation for a NoDebug compile unit.
-  if (Fn.getFunction()->getSubprogram()->getUnit()->getEmissionKind() ==
+  if (Fn.getFunction().getSubprogram()->getUnit()->getEmissionKind() ==
       DICompileUnit::NoDebug)
     return;
-  reset();
   MF = &Fn;
   SmallVector<InsnRange, 4> MIRanges;
   DenseMap<const MachineInstr *, LexicalScope *> MI2ScopeMap;
@@ -86,8 +87,9 @@ void LexicalScopes::extractLexicalScopes(
         continue;
       }
 
-      // Ignore DBG_VALUE. It does not contribute to any instruction in output.
-      if (MInsn.isDebugValue())
+      // Ignore DBG_VALUE and similar instruction that do not contribute to any
+      // instruction in the output.
+      if (MInsn.isMetaInstruction())
         continue;
 
       if (RangeBeginMI) {
@@ -172,7 +174,7 @@ LexicalScopes::getOrCreateRegularScope(const DILocalScope *Scope) {
                                                     false)).first;
 
   if (!Parent) {
-    assert(cast<DISubprogram>(Scope)->describes(MF->getFunction()));
+    assert(cast<DISubprogram>(Scope)->describes(&MF->getFunction()));
     assert(!CurrentFnLexicalScope);
     CurrentFnLexicalScope = &I->second;
   }
@@ -276,7 +278,9 @@ void LexicalScopes::assignInstructionRanges(
 /// DebugLoc.
 void LexicalScopes::getMachineBasicBlocks(
     const DILocation *DL, SmallPtrSetImpl<const MachineBasicBlock *> &MBBs) {
+  assert(MF && "Method called on a uninitialized LexicalScopes object!");
   MBBs.clear();
+
   LexicalScope *Scope = getOrCreateLexicalScope(DL);
   if (!Scope)
     return;
@@ -295,6 +299,7 @@ void LexicalScopes::getMachineBasicBlocks(
 /// dominates - Return true if DebugLoc's lexical scope dominates at least one
 /// machine instruction's lexical scope in a given machine basic block.
 bool LexicalScopes::dominates(const DILocation *DL, MachineBasicBlock *MBB) {
+  assert(MF && "Unexpected uninitialized LexicalScopes object!");
   LexicalScope *Scope = getOrCreateLexicalScope(DL);
   if (!Scope)
     return false;

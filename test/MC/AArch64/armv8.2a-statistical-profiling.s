@@ -1,9 +1,10 @@
 // RUN: llvm-mc -triple aarch64-none-linux-gnu -show-encoding -mattr=+spe < %s | FileCheck %s
+// RUN: llvm-mc -triple aarch64-none-linux-gnu -show-encoding -mcpu=neoverse-n1 < %s | FileCheck %s
 // RUN: not llvm-mc -triple aarch64-none-linux-gnu -show-encoding < %s 2>&1 | FileCheck --check-prefix=NO_SPE %s
 
   psb csync
 // CHECK: psb csync              // encoding: [0x3f,0x22,0x03,0xd5]
-// NO_SPE:  invalid operand for instruction
+// NO_SPE:  instruction requires: spe
 
   msr pmblimitr_el1, x0
   msr pmbptr_el1, x0

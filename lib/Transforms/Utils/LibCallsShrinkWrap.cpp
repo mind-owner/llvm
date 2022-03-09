@@ -1,9 +1,8 @@
 //===-- LibCallsShrinkWrap.cpp ----------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -33,6 +32,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstVisitor.h"
@@ -47,16 +47,6 @@ using namespace llvm;
 
 STATISTIC(NumWrappedOneCond, "Number of One-Condition Wrappers Inserted");
 STATISTIC(NumWrappedTwoCond, "Number of Two-Condition Wrappers Inserted");
-
-static cl::opt<bool> LibCallsShrinkWrapDoDomainError(
-    "libcalls-shrinkwrap-domain-error", cl::init(true), cl::Hidden,
-    cl::desc("Perform shrink-wrap on lib calls with domain errors"));
-static cl::opt<bool> LibCallsShrinkWrapDoRangeError(
-    "libcalls-shrinkwrap-range-error", cl::init(true), cl::Hidden,
-    cl::desc("Perform shrink-wrap on lib calls with range errors"));
-static cl::opt<bool> LibCallsShrinkWrapDoPoleError(
-    "libcalls-shrinkwrap-pole-error", cl::init(true), cl::Hidden,
-    cl::desc("Perform shrink-wrap on lib calls with pole errors"));
 
 namespace {
 class LibCallsShrinkWrapLegacyPass : public FunctionPass {
@@ -82,18 +72,20 @@ INITIALIZE_PASS_END(LibCallsShrinkWrapLegacyPass, "libcalls-shrinkwrap",
 namespace {
 class LibCallsShrinkWrap : public InstVisitor<LibCallsShrinkWrap> {
 public:
-  LibCallsShrinkWrap(const TargetLibraryInfo &TLI) : TLI(TLI), Changed(false){};
-  bool isChanged() const { return Changed; }
+  LibCallsShrinkWrap(const TargetLibraryInfo &TLI, DominatorTree *DT)
+      : TLI(TLI), DT(DT){};
   void visitCallInst(CallInst &CI) { checkCandidate(CI); }
-  void perform() {
+  bool perform() {
+    bool Changed = false;
     for (auto &CI : WorkList) {
-      DEBUG(dbgs() << "CDCE calls: " << CI->getCalledFunction()->getName()
-                   << "\n");
+      LLVM_DEBUG(dbgs() << "CDCE calls: " << CI->getCalledFunction()->getName()
+                        << "\n");
       if (perform(CI)) {
         Changed = true;
-        DEBUG(dbgs() << "Transformed\n");
+        LLVM_DEBUG(dbgs() << "Transformed\n");
       }
     }
+    return Changed;
   }
 
 private:
@@ -134,8 +126,8 @@ private:
   }
 
   const TargetLibraryInfo &TLI;
+  DominatorTree *DT;
   SmallVector<CallInst *, 16> WorkList;
-  bool Changed;
 };
 } // end anonymous namespace
 
@@ -241,8 +233,6 @@ bool LibCallsShrinkWrap::performCallErrors(CallInst *CI,
   case LibFunc_atanhf: // Same as atanh
   case LibFunc_atanhl: // Same as atanh
   {
-    if (!LibCallsShrinkWrapDoDomainError || !LibCallsShrinkWrapDoPoleError)
-      return false;
     ++NumWrappedTwoCond;
     Cond = createOrCond(CI, CmpInst::FCMP_OLE, -1.0f, CmpInst::FCMP_OGE, 1.0f);
     break;
@@ -262,8 +252,6 @@ bool LibCallsShrinkWrap::performCallErrors(CallInst *CI,
   case LibFunc_logbf:  // Same as log
   case LibFunc_logbl:  // Same as log
   {
-    if (!LibCallsShrinkWrapDoDomainError || !LibCallsShrinkWrapDoPoleError)
-      return false;
     ++NumWrappedOneCond;
     Cond = createCond(CI, CmpInst::FCMP_OLE, 0.0f);
     break;
@@ -274,8 +262,6 @@ bool LibCallsShrinkWrap::performCallErrors(CallInst *CI,
   case LibFunc_log1pf: // Same as log1p
   case LibFunc_log1pl: // Same as log1p
   {
-    if (!LibCallsShrinkWrapDoDomainError || !LibCallsShrinkWrapDoPoleError)
-      return false;
     ++NumWrappedOneCond;
     Cond = createCond(CI, CmpInst::FCMP_OLE, -1.0f);
     break;
@@ -285,9 +271,6 @@ bool LibCallsShrinkWrap::performCallErrors(CallInst *CI,
                      // RangeError:  overflow or underflow
   case LibFunc_powf:
   case LibFunc_powl: {
-    if (!LibCallsShrinkWrapDoDomainError || !LibCallsShrinkWrapDoPoleError ||
-        !LibCallsShrinkWrapDoRangeError)
-      return false;
     Cond = generateCondForPow(CI, Func);
     if (Cond == nullptr)
       return false;
@@ -346,7 +329,7 @@ Value *LibCallsShrinkWrap::generateOneRangeCond(CallInst *CI,
     UpperBound = 11356.0f;
     break;
   default:
-    llvm_unreachable("Should be reach here");
+    llvm_unreachable("Unhandled library call!");
   }
 
   ++NumWrappedOneCond;
@@ -410,7 +393,7 @@ Value *LibCallsShrinkWrap::generateTwoRangeCond(CallInst *CI,
     UpperBound = 11383.0f;
     break;
   default:
-    llvm_unreachable("Should be reach here");
+    llvm_unreachable("Unhandled library call!");
   }
 
   ++NumWrappedTwoCond;
@@ -437,7 +420,7 @@ Value *LibCallsShrinkWrap::generateCondForPow(CallInst *CI,
                                               const LibFunc &Func) {
   // FIXME: LibFunc_powf and powl TBD.
   if (Func != LibFunc_pow) {
-    DEBUG(dbgs() << "Not handled powf() and powl()\n");
+    LLVM_DEBUG(dbgs() << "Not handled powf() and powl()\n");
     return nullptr;
   }
 
@@ -449,7 +432,7 @@ Value *LibCallsShrinkWrap::generateCondForPow(CallInst *CI,
   if (ConstantFP *CF = dyn_cast<ConstantFP>(Base)) {
     double D = CF->getValueAPF().convertToDouble();
     if (D < 1.0f || D > APInt::getMaxValue(8).getZExtValue()) {
-      DEBUG(dbgs() << "Not handled pow(): constant base out of range\n");
+      LLVM_DEBUG(dbgs() << "Not handled pow(): constant base out of range\n");
       return nullptr;
     }
 
@@ -463,7 +446,7 @@ Value *LibCallsShrinkWrap::generateCondForPow(CallInst *CI,
   // If the Base value coming from an integer type.
   Instruction *I = dyn_cast<Instruction>(Base);
   if (!I) {
-    DEBUG(dbgs() << "Not handled pow(): FP type base\n");
+    LLVM_DEBUG(dbgs() << "Not handled pow(): FP type base\n");
     return nullptr;
   }
   unsigned Opcode = I->getOpcode();
@@ -477,7 +460,7 @@ Value *LibCallsShrinkWrap::generateCondForPow(CallInst *CI,
     else if (BW == 32)
       UpperV = 32.0f;
     else {
-      DEBUG(dbgs() << "Not handled pow(): type too wide\n");
+      LLVM_DEBUG(dbgs() << "Not handled pow(): type too wide\n");
       return nullptr;
     }
 
@@ -493,25 +476,28 @@ Value *LibCallsShrinkWrap::generateCondForPow(CallInst *CI,
     Value *Cond0 = BBBuilder.CreateFCmp(CmpInst::FCMP_OLE, Base, V0);
     return BBBuilder.CreateOr(Cond0, Cond);
   }
-  DEBUG(dbgs() << "Not handled pow(): base not from integer convert\n");
+  LLVM_DEBUG(dbgs() << "Not handled pow(): base not from integer convert\n");
   return nullptr;
 }
 
 // Wrap conditions that can potentially generate errno to the library call.
 void LibCallsShrinkWrap::shrinkWrapCI(CallInst *CI, Value *Cond) {
-  assert(Cond != nullptr && "hrinkWrapCI is not expecting an empty call inst");
+  assert(Cond != nullptr && "ShrinkWrapCI is not expecting an empty call inst");
   MDNode *BranchWeights =
       MDBuilder(CI->getContext()).createBranchWeights(1, 2000);
-  TerminatorInst *NewInst =
-      SplitBlockAndInsertIfThen(Cond, CI, false, BranchWeights);
+
+  Instruction *NewInst =
+      SplitBlockAndInsertIfThen(Cond, CI, false, BranchWeights, DT);
   BasicBlock *CallBB = NewInst->getParent();
   CallBB->setName("cdce.call");
-  CallBB->getSingleSuccessor()->setName("cdce.end");
+  BasicBlock *SuccBB = CallBB->getSingleSuccessor();
+  assert(SuccBB && "The split block should have a single successor");
+  SuccBB->setName("cdce.end");
   CI->removeFromParent();
   CallBB->getInstList().insert(CallBB->getFirstInsertionPt(), CI);
-  DEBUG(dbgs() << "== Basic Block After ==");
-  DEBUG(dbgs() << *CallBB->getSinglePredecessor() << *CallBB
-               << *CallBB->getSingleSuccessor() << "\n");
+  LLVM_DEBUG(dbgs() << "== Basic Block After ==");
+  LLVM_DEBUG(dbgs() << *CallBB->getSinglePredecessor() << *CallBB
+                    << *CallBB->getSingleSuccessor() << "\n");
 }
 
 // Perform the transformation to a single candidate.
@@ -522,32 +508,35 @@ bool LibCallsShrinkWrap::perform(CallInst *CI) {
   TLI.getLibFunc(*Callee, Func);
   assert(Func && "perform() is not expecting an empty function");
 
-  if (LibCallsShrinkWrapDoDomainError && performCallDomainErrorOnly(CI, Func))
+  if (performCallDomainErrorOnly(CI, Func) || performCallRangeErrorOnly(CI, Func))
     return true;
-
-  if (LibCallsShrinkWrapDoRangeError && performCallRangeErrorOnly(CI, Func))
-    return true;
-
   return performCallErrors(CI, Func);
 }
 
 void LibCallsShrinkWrapLegacyPass::getAnalysisUsage(AnalysisUsage &AU) const {
+  AU.addPreserved<DominatorTreeWrapperPass>();
   AU.addPreserved<GlobalsAAWrapperPass>();
   AU.addRequired<TargetLibraryInfoWrapperPass>();
 }
 
-static bool runImpl(Function &F, const TargetLibraryInfo &TLI) {
+static bool runImpl(Function &F, const TargetLibraryInfo &TLI,
+                    DominatorTree *DT) {
   if (F.hasFnAttribute(Attribute::OptimizeForSize))
     return false;
-  LibCallsShrinkWrap CCDCE(TLI);
+  LibCallsShrinkWrap CCDCE(TLI, DT);
   CCDCE.visit(F);
-  CCDCE.perform();
-  return CCDCE.isChanged();
+  bool Changed = CCDCE.perform();
+
+// Verify the dominator after we've updated it locally.
+  assert(!DT || DT->verify(DominatorTree::VerificationLevel::Fast));
+  return Changed;
 }
 
 bool LibCallsShrinkWrapLegacyPass::runOnFunction(Function &F) {
-  auto &TLI = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
-  return runImpl(F, TLI);
+  auto &TLI = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
+  auto *DTWP = getAnalysisIfAvailable<DominatorTreeWrapperPass>();
+  auto *DT = DTWP ? &DTWP->getDomTree() : nullptr;
+  return runImpl(F, TLI, DT);
 }
 
 namespace llvm {
@@ -561,11 +550,12 @@ FunctionPass *createLibCallsShrinkWrapPass() {
 PreservedAnalyses LibCallsShrinkWrapPass::run(Function &F,
                                               FunctionAnalysisManager &FAM) {
   auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
-  bool Changed = runImpl(F, TLI);
-  if (!Changed)
+  auto *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
+  if (!runImpl(F, TLI, DT))
     return PreservedAnalyses::all();
   auto PA = PreservedAnalyses();
   PA.preserve<GlobalsAA>();
+  PA.preserve<DominatorTreeAnalysis>();
   return PA;
 }
 }

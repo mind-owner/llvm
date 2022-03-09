@@ -1,9 +1,8 @@
 //===-- llvm/Argument.h - Definition of the Argument class ------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -27,8 +26,7 @@ namespace llvm {
 /// for a specific function. When used in the body of said function, the
 /// argument of course represents the value of the actual argument that the
 /// function was called with.
-class Argument : public Value {
-  virtual void anchor();
+class Argument final : public Value {
   Function *Parent;
   unsigned ArgNo;
 
@@ -80,6 +78,9 @@ public:
   /// If this is a byval or inalloca argument, return its alignment.
   unsigned getParamAlignment() const;
 
+  /// If this is a byval argument, return its type.
+  Type *getParamByValType() const;
+
   /// Return true if this argument has the nest attribute.
   bool hasNestAttr() const;
 
@@ -91,6 +92,9 @@ public:
 
   /// Return true if this argument has the sret attribute.
   bool hasStructRetAttr() const;
+
+  /// Return true if this argument has the inreg attribute.
+  bool hasInRegAttr() const;
 
   /// Return true if this argument has the returned attribute.
   bool hasReturnedAttr() const;
@@ -108,24 +112,22 @@ public:
   bool hasSExtAttr() const;
 
   /// Add attributes to an argument.
-  void addAttr(AttributeList AS);
+  void addAttrs(AttrBuilder &B);
 
-  void addAttr(Attribute::AttrKind Kind) {
-    addAttr(AttributeList::get(getContext(), getArgNo() + 1, Kind));
-  }
+  void addAttr(Attribute::AttrKind Kind);
+
+  void addAttr(Attribute Attr);
 
   /// Remove attributes from an argument.
-  void removeAttr(AttributeList AS);
-
-  void removeAttr(Attribute::AttrKind Kind) {
-    removeAttr(AttributeList::get(getContext(), getArgNo() + 1, Kind));
-  }
+  void removeAttr(Attribute::AttrKind Kind);
 
   /// Check if an argument has a given attribute.
   bool hasAttribute(Attribute::AttrKind Kind) const;
 
+  Attribute getAttribute(Attribute::AttrKind Kind) const;
+
   /// Method for support type inquiry through isa, cast, and dyn_cast.
-  static inline bool classof(const Value *V) {
+  static bool classof(const Value *V) {
     return V->getValueID() == ArgumentVal;
   }
 };

@@ -1,9 +1,8 @@
 //===- CachePruningTest.cpp -----------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -18,7 +17,7 @@ TEST(CachePruningPolicyParser, Empty) {
   ASSERT_TRUE(bool(P));
   EXPECT_EQ(std::chrono::seconds(1200), P->Interval);
   EXPECT_EQ(std::chrono::hours(7 * 24), P->Expiration);
-  EXPECT_EQ(75u, P->PercentageOfAvailableSpace);
+  EXPECT_EQ(75u, P->MaxSizePercentageOfAvailableSpace);
 }
 
 TEST(CachePruningPolicyParser, Interval) {
@@ -27,10 +26,10 @@ TEST(CachePruningPolicyParser, Interval) {
   EXPECT_EQ(std::chrono::seconds(1), P->Interval);
   P = parseCachePruningPolicy("prune_interval=2m");
   ASSERT_TRUE(bool(P));
-  EXPECT_EQ(std::chrono::minutes(2), P->Interval);
+  EXPECT_EQ(std::chrono::minutes(2), *P->Interval);
   P = parseCachePruningPolicy("prune_interval=3h");
   ASSERT_TRUE(bool(P));
-  EXPECT_EQ(std::chrono::hours(3), P->Interval);
+  EXPECT_EQ(std::chrono::hours(3), *P->Interval);
 }
 
 TEST(CachePruningPolicyParser, Expiration) {
@@ -39,10 +38,30 @@ TEST(CachePruningPolicyParser, Expiration) {
   EXPECT_EQ(std::chrono::seconds(1), P->Expiration);
 }
 
-TEST(CachePruningPolicyParser, PercentageOfAvailableSpace) {
+TEST(CachePruningPolicyParser, MaxSizePercentageOfAvailableSpace) {
   auto P = parseCachePruningPolicy("cache_size=100%");
   ASSERT_TRUE(bool(P));
-  EXPECT_EQ(100u, P->PercentageOfAvailableSpace);
+  EXPECT_EQ(100u, P->MaxSizePercentageOfAvailableSpace);
+  EXPECT_EQ(0u, P->MaxSizeBytes);
+}
+
+TEST(CachePruningPolicyParser, MaxSizeBytes) {
+  auto P = parseCachePruningPolicy("cache_size_bytes=1");
+  ASSERT_TRUE(bool(P));
+  EXPECT_EQ(75u, P->MaxSizePercentageOfAvailableSpace);
+  EXPECT_EQ(1u, P->MaxSizeBytes);
+  P = parseCachePruningPolicy("cache_size_bytes=2k");
+  ASSERT_TRUE(bool(P));
+  EXPECT_EQ(75u, P->MaxSizePercentageOfAvailableSpace);
+  EXPECT_EQ(2u * 1024u, P->MaxSizeBytes);
+  P = parseCachePruningPolicy("cache_size_bytes=3m");
+  ASSERT_TRUE(bool(P));
+  EXPECT_EQ(75u, P->MaxSizePercentageOfAvailableSpace);
+  EXPECT_EQ(3u * 1024u * 1024u, P->MaxSizeBytes);
+  P = parseCachePruningPolicy("cache_size_bytes=4G");
+  ASSERT_TRUE(bool(P));
+  EXPECT_EQ(75u, P->MaxSizePercentageOfAvailableSpace);
+  EXPECT_EQ(4ull * 1024ull * 1024ull * 1024ull, P->MaxSizeBytes);
 }
 
 TEST(CachePruningPolicyParser, Multiple) {
@@ -50,7 +69,7 @@ TEST(CachePruningPolicyParser, Multiple) {
   ASSERT_TRUE(bool(P));
   EXPECT_EQ(std::chrono::seconds(1200), P->Interval);
   EXPECT_EQ(std::chrono::seconds(1), P->Expiration);
-  EXPECT_EQ(50u, P->PercentageOfAvailableSpace);
+  EXPECT_EQ(50u, P->MaxSizePercentageOfAvailableSpace);
 }
 
 TEST(CachePruningPolicyParser, Errors) {
@@ -66,6 +85,12 @@ TEST(CachePruningPolicyParser, Errors) {
             toString(parseCachePruningPolicy("cache_size=foo%").takeError()));
   EXPECT_EQ("'101' must be between 0 and 100",
             toString(parseCachePruningPolicy("cache_size=101%").takeError()));
+  EXPECT_EQ(
+      "'foo' not an integer",
+      toString(parseCachePruningPolicy("cache_size_bytes=foo").takeError()));
+  EXPECT_EQ(
+      "'foo' not an integer",
+      toString(parseCachePruningPolicy("cache_size_bytes=foom").takeError()));
   EXPECT_EQ("Unknown key: 'foo'",
             toString(parseCachePruningPolicy("foo=bar").takeError()));
 }

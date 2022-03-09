@@ -27,7 +27,7 @@ declare i32 @llvm.ctlz.i32(i32, i1) nounwind readnone
 
 define i32 @test2(i32 %x) nounwind {
 ; CHECK-LABEL: @test2(
-; CHECK-NEXT:    [[COUNT:%.*]] = tail call i32 @llvm.ctlz.i32(i32 %x, i1 true) #0
+; CHECK-NEXT:    [[COUNT:%.*]] = tail call i32 @llvm.ctlz.i32(i32 %x, i1 true)
 ; CHECK-NEXT:    [[SUB:%.*]] = xor i32 [[COUNT]], 31
 ; CHECK-NEXT:    ret i32 [[SUB]]
 ;
@@ -39,7 +39,7 @@ define i32 @test2(i32 %x) nounwind {
 define i32 @test3(i32 %x) {
 ; CHECK-LABEL: @test3(
 ; CHECK-NEXT:    [[AND:%.*]] = and i32 %x, 31
-; CHECK-NEXT:    [[ADD:%.*]] = sub nsw i32 73, [[AND]]
+; CHECK-NEXT:    [[ADD:%.*]] = sub nuw nsw i32 73, [[AND]]
 ; CHECK-NEXT:    ret i32 [[ADD]]
 ;
   %and = and i32 %x, 31

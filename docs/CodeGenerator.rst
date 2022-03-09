@@ -566,7 +566,7 @@ MI bundle support does not change the physical representations of
 MachineBasicBlock and MachineInstr. All the MIs (including top level and nested
 ones) are stored as sequential list of MIs. The "bundled" MIs are marked with
 the 'InsideBundle' flag. A top level MI with the special BUNDLE opcode is used
-to represent the start of a bundle. It's legal to mix BUNDLE MIs with indiviual
+to represent the start of a bundle. It's legal to mix BUNDLE MIs with individual
 MIs that are not inside bundles nor represent bundles.
 
 MachineInstr passes should operate on a MI bundle as a single unit. Member
@@ -579,15 +579,18 @@ inside bundles. The top level BUNDLE instruction must have the correct set of
 register MachineOperand's that represent the cumulative inputs and outputs of
 the bundled MIs.
 
-Packing / bundling of MachineInstr's should be done as part of the register
-allocation super-pass. More specifically, the pass which determines what MIs
-should be bundled together must be done after code generator exits SSA form
-(i.e. after two-address pass, PHI elimination, and copy coalescing).  Bundles
-should only be finalized (i.e. adding BUNDLE MIs and input and output register
-MachineOperands) after virtual registers have been rewritten into physical
-registers. This requirement eliminates the need to add virtual register operands
-to BUNDLE instructions which would effectively double the virtual register def
-and use lists.
+Packing / bundling of MachineInstrs for VLIW architectures should
+generally be done as part of the register allocation super-pass. More
+specifically, the pass which determines what MIs should be bundled
+together should be done after code generator exits SSA form
+(i.e. after two-address pass, PHI elimination, and copy coalescing).
+Such bundles should be finalized (i.e. adding BUNDLE MIs and input and
+output register MachineOperands) after virtual registers have been
+rewritten into physical registers. This eliminates the need to add
+virtual register operands to BUNDLE instructions which would
+effectively double the virtual register def and use lists. Bundles may
+use virtual registers and be formed in SSA form, but may not be
+appropriate for all use cases.
 
 .. _MC Layer:
 
@@ -911,6 +914,31 @@ implement the legalization ("custom").
 A target implementation tells the legalizer which operations are not supported
 (and which of the above three actions to take) by calling the
 ``setOperationAction`` method in its ``TargetLowering`` constructor.
+
+If a target has legal vector types, it is expected to produce efficient machine
+code for common forms of the shufflevector IR instruction using those types.
+This may require custom legalization for SelectionDAG vector operations that
+are created from the shufflevector IR. The shufflevector forms that should be
+handled include:
+
+* Vector select --- Each element of the vector is chosen from either of the
+  corresponding elements of the 2 input vectors. This operation may also be
+  known as a "blend" or "bitwise select" in target assembly. This type of shuffle
+  maps directly to the ``shuffle_vector`` SelectionDAG node.
+
+* Insert subvector --- A vector is placed into a longer vector type starting
+  at index 0. This type of shuffle maps directly to the ``insert_subvector``
+  SelectionDAG node with the ``index`` operand set to 0.
+
+* Extract subvector --- A vector is pulled from a longer vector type starting
+  at index 0. This type of shuffle maps directly to the ``extract_subvector``
+  SelectionDAG node with the ``index`` operand set to 0.
+
+* Splat --- All elements of the vector have identical scalar elements. This
+  operation may also be known as a "broadcast" or "duplicate" in target assembly.
+  The shufflevector IR instruction may change the vector length, so this operation
+  may map to multiple SelectionDAG nodes including ``shuffle_vector``,
+  ``concat_vectors``, ``insert_subvector``, and ``extract_subvector``.
 
 Prior to the existence of the Legalize passes, we required that every target
 `selector`_ supported and handled every operator and type even if they are not
@@ -1578,6 +1606,17 @@ which lowers MCInst's into machine code bytes and relocations.  This is
 important if you want to support direct .o file emission, or would like to
 implement an assembler for your target.
 
+Emitting function stack size information
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A section containing metadata on function stack sizes will be emitted when
+``TargetLoweringObjectFile::StackSizesSection`` is not null, and
+``TargetOptions::EmitStackSizeSection`` is set (-stack-size-section). The
+section will contain an array of pairs of function symbol values (pointer size)
+and stack sizes (unsigned LEB128). The stack size values only include the space
+allocated in the function prologue. Functions with dynamic stack allocations are
+not included.
+
 VLIW Packetizer
 ---------------
 
@@ -2025,15 +2064,16 @@ Tail call optimization
 ----------------------
 
 Tail call optimization, callee reusing the stack of the caller, is currently
-supported on x86/x86-64 and PowerPC. It is performed if:
+supported on x86/x86-64, PowerPC, and WebAssembly. It is performed on x86/x86-64
+and PowerPC if:
 
 * Caller and callee have the calling convention ``fastcc``, ``cc 10`` (GHC
-  calling convention) or ``cc 11`` (HiPE calling convention).
+  calling convention), ``cc 11`` (HiPE calling convention), or ``tailcc``.
 
 * The call is a tail call - in tail position (ret immediately follows call and
   ret uses value of call or is void).
 
-* Option ``-tailcallopt`` is enabled.
+* Option ``-tailcallopt`` is enabled or the calling convention is ``tailcc``.
 
 * Platform-specific constraints are met.
 
@@ -2052,6 +2092,15 @@ PowerPC constraints:
 
 * On ppc32/64 GOT/PIC only module-local calls (visibility = hidden or protected)
   are supported.
+
+WebAssembly constraints:
+
+* No variable argument lists are used
+
+* The 'tail-call' target attribute is enabled.
+
+* The caller and callee's return types must match. The caller cannot
+  be void unless the callee is, too.
 
 Example:
 
@@ -2502,8 +2551,8 @@ When BPF_CLASS(code) == BPF_ALU or BPF_ALU64 or BPF_JMP,
 
 ::
 
-  BPF_X     0x0  use src_reg register as source operand
-  BPF_K     0x1  use 32 bit immediate as source operand
+  BPF_X     0x1  use src_reg register as source operand
+  BPF_K     0x0  use 32 bit immediate as source operand
 
 and four MSB bits store operation code
 
@@ -2642,59 +2691,6 @@ to ensure valid register usage and operand types.
 The AMDGPU backend
 ------------------
 
-The AMDGPU code generator lives in the lib/Target/AMDGPU directory, and is an
-open source native AMD GCN ISA code generator.
-
-Target triples supported
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-The following are the known target triples that are supported by the AMDGPU
-backend.
-
-* **amdgcn--** --- AMD GCN GPUs (AMDGPU.7.0.0+)
-* **amdgcn--amdhsa** --- AMD GCN GPUs (AMDGPU.7.0.0+) with HSA support
-* **r600--** --- AMD GPUs HD2XXX-HD6XXX
-
-Relocations
-^^^^^^^^^^^
-
-Supported relocatable fields are:
-
-* **word32** --- This specifies a 32-bit field occupying 4 bytes with arbitrary
-  byte alignment. These values use the same byte order as other word values in
-  the AMD GPU architecture
-* **word64** --- This specifies a 64-bit field occupying 8 bytes with arbitrary
-  byte alignment. These values use the same byte order as other word values in
-  the AMD GPU architecture
-
-Following notations are used for specifying relocation calculations:
-
-* **A** --- Represents the addend used to compute the value of the relocatable
-  field
-* **G** --- Represents the offset into the global offset table at which the
-  relocation entry’s symbol will reside during execution.
-* **GOT** --- Represents the address of the global offset table.
-* **P** --- Represents the place (section offset or address) of the storage unit
-  being relocated (computed using ``r_offset``)
-* **S** --- Represents the value of the symbol whose index resides in the
-  relocation entry
-
-AMDGPU Backend generates *Elf64_Rela* relocation records with the following
-supported relocation types:
-
-  ==========================  =====  ==========  ==============================
-  Relocation type             Value  Field       Calculation
-  ==========================  =====  ==========  ==============================
-  ``R_AMDGPU_NONE``           0      ``none``    ``none``
-  ``R_AMDGPU_ABS32_LO``       1      ``word32``  (S + A) & 0xFFFFFFFF
-  ``R_AMDGPU_ABS32_HI``       2      ``word32``  (S + A) >> 32
-  ``R_AMDGPU_ABS64``          3      ``word64``  S + A
-  ``R_AMDGPU_REL32``          4      ``word32``  S + A - P
-  ``R_AMDGPU_REL64``          5      ``word64``  S + A - P
-  ``R_AMDGPU_ABS32``          6      ``word32``  S + A
-  ``R_AMDGPU_GOTPCREL``       7      ``word32``  G + GOT + A - P
-  ``R_AMDGPU_GOTPCREL32_LO``  8      ``word32``  (G + GOT + A - P) & 0xFFFFFFFF
-  ``R_AMDGPU_GOTPCREL32_HI``  9      ``word32``  (G + GOT + A - P) >> 32
-  ``R_AMDGPU_REL32_LO``       10     ``word32``  (S + A - P) & 0xFFFFFFFF
-  ``R_AMDGPU_REL32_HI``       11     ``word32``  (S + A - P) >> 32
-  ==========================  =====  ==========  ==============================
+The AMDGPU code generator lives in the ``lib/Target/AMDGPU``
+directory. This code generator is capable of targeting a variety of
+AMD GPU processors. Refer to :doc:`AMDGPUUsage` for more information.

@@ -1,17 +1,15 @@
 //===- ProfileSummaryInfoTest.cpp - ProfileSummaryInfo unit tests ---------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
-#include "llvm/Analysis/BlockFrequencyInfoImpl.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
-#include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CallSite.h"
@@ -102,6 +100,9 @@ TEST_F(ProfileSummaryInfoTest, TestNoProfile) {
   Function *F = M->getFunction("f");
 
   ProfileSummaryInfo PSI = buildPSI(M.get());
+  EXPECT_FALSE(PSI.hasProfileSummary());
+  EXPECT_FALSE(PSI.hasSampleProfile());
+  EXPECT_FALSE(PSI.hasInstrumentationProfile());
   // In the absence of profiles, is{Hot|Cold}X methods should always return
   // false.
   EXPECT_FALSE(PSI.isHotCount(1000));
@@ -116,8 +117,8 @@ TEST_F(ProfileSummaryInfoTest, TestNoProfile) {
   BasicBlock *BB1 = BB0.getTerminator()->getSuccessor(0);
 
   BlockFrequencyInfo BFI = buildBFI(*F);
-  EXPECT_FALSE(PSI.isHotBB(&BB0, &BFI));
-  EXPECT_FALSE(PSI.isColdBB(&BB0, &BFI));
+  EXPECT_FALSE(PSI.isHotBlock(&BB0, &BFI));
+  EXPECT_FALSE(PSI.isColdBlock(&BB0, &BFI));
 
   CallSite CS1(BB1->getFirstNonPHI());
   EXPECT_FALSE(PSI.isHotCallSite(CS1, &BFI));
@@ -130,10 +131,23 @@ TEST_F(ProfileSummaryInfoTest, TestCommon) {
   Function *H = M->getFunction("h");
 
   ProfileSummaryInfo PSI = buildPSI(M.get());
+  EXPECT_TRUE(PSI.hasProfileSummary());
   EXPECT_TRUE(PSI.isHotCount(400));
   EXPECT_TRUE(PSI.isColdCount(2));
   EXPECT_FALSE(PSI.isColdCount(100));
   EXPECT_FALSE(PSI.isHotCount(100));
+
+  EXPECT_TRUE(PSI.isHotCountNthPercentile(990000, 400));
+  EXPECT_FALSE(PSI.isHotCountNthPercentile(990000, 100));
+  EXPECT_FALSE(PSI.isHotCountNthPercentile(990000, 2));
+
+  EXPECT_TRUE(PSI.isHotCountNthPercentile(999999, 400));
+  EXPECT_TRUE(PSI.isHotCountNthPercentile(999999, 100));
+  EXPECT_FALSE(PSI.isHotCountNthPercentile(999999, 2));
+
+  EXPECT_FALSE(PSI.isHotCountNthPercentile(10000, 400));
+  EXPECT_FALSE(PSI.isHotCountNthPercentile(10000, 100));
+  EXPECT_FALSE(PSI.isHotCountNthPercentile(10000, 2));
 
   EXPECT_TRUE(PSI.isFunctionEntryHot(F));
   EXPECT_FALSE(PSI.isFunctionEntryHot(G));
@@ -144,6 +158,8 @@ TEST_F(ProfileSummaryInfoTest, InstrProf) {
   auto M = makeLLVMModule("InstrProf");
   Function *F = M->getFunction("f");
   ProfileSummaryInfo PSI = buildPSI(M.get());
+  EXPECT_TRUE(PSI.hasProfileSummary());
+  EXPECT_TRUE(PSI.hasInstrumentationProfile());
 
   BasicBlock &BB0 = F->getEntryBlock();
   BasicBlock *BB1 = BB0.getTerminator()->getSuccessor(0);
@@ -151,16 +167,37 @@ TEST_F(ProfileSummaryInfoTest, InstrProf) {
   BasicBlock *BB3 = BB1->getSingleSuccessor();
 
   BlockFrequencyInfo BFI = buildBFI(*F);
-  EXPECT_TRUE(PSI.isHotBB(&BB0, &BFI));
-  EXPECT_TRUE(PSI.isHotBB(BB1, &BFI));
-  EXPECT_FALSE(PSI.isHotBB(BB2, &BFI));
-  EXPECT_TRUE(PSI.isHotBB(BB3, &BFI));
+  EXPECT_TRUE(PSI.isHotBlock(&BB0, &BFI));
+  EXPECT_TRUE(PSI.isHotBlock(BB1, &BFI));
+  EXPECT_FALSE(PSI.isHotBlock(BB2, &BFI));
+  EXPECT_TRUE(PSI.isHotBlock(BB3, &BFI));
+
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(990000, &BB0, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(990000, BB1, &BFI));
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(990000, BB2, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(990000, BB3, &BFI));
+
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(999900, &BB0, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(999900, BB1, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(999900, BB2, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(999900, BB3, &BFI));
+
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(10000, &BB0, &BFI));
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(10000, BB1, &BFI));
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(10000, BB2, &BFI));
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(10000, BB3, &BFI));
 
   CallSite CS1(BB1->getFirstNonPHI());
   auto *CI2 = BB2->getFirstNonPHI();
   CallSite CS2(CI2);
 
   EXPECT_TRUE(PSI.isHotCallSite(CS1, &BFI));
+  EXPECT_FALSE(PSI.isHotCallSite(CS2, &BFI));
+
+  // Test that adding an MD_prof metadata with a hot count on CS2 does not
+  // change its hotness as it has no effect in instrumented profiling.
+  MDBuilder MDB(M->getContext());
+  CI2->setMetadata(llvm::LLVMContext::MD_prof, MDB.createBranchWeights({400}));
   EXPECT_FALSE(PSI.isHotCallSite(CS2, &BFI));
 }
 
@@ -168,6 +205,8 @@ TEST_F(ProfileSummaryInfoTest, SampleProf) {
   auto M = makeLLVMModule("SampleProfile");
   Function *F = M->getFunction("f");
   ProfileSummaryInfo PSI = buildPSI(M.get());
+  EXPECT_TRUE(PSI.hasProfileSummary());
+  EXPECT_TRUE(PSI.hasSampleProfile());
 
   BasicBlock &BB0 = F->getEntryBlock();
   BasicBlock *BB1 = BB0.getTerminator()->getSuccessor(0);
@@ -175,21 +214,40 @@ TEST_F(ProfileSummaryInfoTest, SampleProf) {
   BasicBlock *BB3 = BB1->getSingleSuccessor();
 
   BlockFrequencyInfo BFI = buildBFI(*F);
-  EXPECT_TRUE(PSI.isHotBB(&BB0, &BFI));
-  EXPECT_TRUE(PSI.isHotBB(BB1, &BFI));
-  EXPECT_FALSE(PSI.isHotBB(BB2, &BFI));
-  EXPECT_TRUE(PSI.isHotBB(BB3, &BFI));
+  EXPECT_TRUE(PSI.isHotBlock(&BB0, &BFI));
+  EXPECT_TRUE(PSI.isHotBlock(BB1, &BFI));
+  EXPECT_FALSE(PSI.isHotBlock(BB2, &BFI));
+  EXPECT_TRUE(PSI.isHotBlock(BB3, &BFI));
+
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(990000, &BB0, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(990000, BB1, &BFI));
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(990000, BB2, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(990000, BB3, &BFI));
+
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(999900, &BB0, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(999900, BB1, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(999900, BB2, &BFI));
+  EXPECT_TRUE(PSI.isHotBlockNthPercentile(999900, BB3, &BFI));
+
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(10000, &BB0, &BFI));
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(10000, BB1, &BFI));
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(10000, BB2, &BFI));
+  EXPECT_FALSE(PSI.isHotBlockNthPercentile(10000, BB3, &BFI));
 
   CallSite CS1(BB1->getFirstNonPHI());
   auto *CI2 = BB2->getFirstNonPHI();
+  // Manually attach branch weights metadata to the call instruction.
+  SmallVector<uint32_t, 1> Weights;
+  Weights.push_back(1000);
+  MDBuilder MDB(M->getContext());
+  CI2->setMetadata(LLVMContext::MD_prof, MDB.createBranchWeights(Weights));
   CallSite CS2(CI2);
 
-  EXPECT_TRUE(PSI.isHotCallSite(CS1, &BFI));
-  EXPECT_FALSE(PSI.isHotCallSite(CS2, &BFI));
+  EXPECT_FALSE(PSI.isHotCallSite(CS1, &BFI));
+  EXPECT_TRUE(PSI.isHotCallSite(CS2, &BFI));
 
   // Test that CS2 is considered hot when it gets an MD_prof metadata with
   // weights that exceed the hot count threshold.
-  MDBuilder MDB(M->getContext());
   CI2->setMetadata(llvm::LLVMContext::MD_prof, MDB.createBranchWeights({400}));
   EXPECT_TRUE(PSI.isHotCallSite(CS2, &BFI));
 }

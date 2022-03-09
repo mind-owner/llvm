@@ -1,4 +1,4 @@
-; RUN: opt -thinlto-bc -o %t %s
+; RUN: opt -thinlto-bc -thinlto-split-lto-unit -o %t %s
 ; RUN: llvm-modextract -b -n 0 -o - %t | llvm-dis | FileCheck --check-prefix=M0 %s
 ; RUN: llvm-modextract -b -n 1 -o - %t | llvm-dis | FileCheck --check-prefix=M1 %s
 
@@ -25,8 +25,12 @@ define i64 @ok1(i8* %this) {
 ; M0: define i64 @ok2
 ; M1: define available_externally i64 @ok2
 define i64 @ok2(i8* %this, i64 %arg) {
+  %1 = tail call { i64, i1 } @llvm.sadd.with.overflow.i64(i64 %arg, i64 %arg)
   ret i64 %arg
 }
+
+; M1: declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)
+declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)
 
 ; M0: define void @wrongtype1
 ; M1: declare void @wrongtype1()

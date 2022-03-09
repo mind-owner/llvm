@@ -10,7 +10,7 @@
 // CHECK: :[[@LINE+1]]:{{[0-9]+}}: error: expected relocatable expression
   .word -undef
 
-// CHECK: :[[@LINE+1]]:{{[0-9]+}}: error: No relocation available to represent this relative expression
+// CHECK: :[[@LINE+1]]:{{[0-9]+}}: error: symbol 'undef' can not be undefined in a subtraction expression
   adr x0, #a-undef
 
 // CHECK: :[[@LINE+1]]:{{[0-9]+}}: error: Cannot represent a difference across sections
@@ -31,7 +31,7 @@
 // CHECK: :[[@LINE+1]]:{{[0-9]+}}: error: invalid fixup for 16-bit load/store instruction
   ldrh w0, [x1, :gottprel_lo12:undef]
 
-// CHECK: :[[@LINE+1]]:{{[0-9]+}}: error: invalid fixup for 32-bit load/store instruction
+// CHECK: :[[@LINE+1]]:{{[0-9]+}}: error: LP64 32-bit load/store relocation not supported (ILP32 eqv: TLSIE_LD32_GOTTPREL_LO12_NC)
   ldr w0, [x1, :gottprel_lo12:undef]
 
 

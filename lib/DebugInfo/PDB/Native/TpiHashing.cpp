@@ -1,110 +1,129 @@
 //===- TpiHashing.cpp -----------------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/PDB/Native/TpiHashing.h"
 
+#include "llvm/DebugInfo/CodeView/TypeDeserializer.h"
 #include "llvm/DebugInfo/PDB/Native/Hash.h"
-#include "llvm/DebugInfo/PDB/Native/RawError.h"
+#include "llvm/Support/CRC.h"
 
 using namespace llvm;
 using namespace llvm::codeview;
 using namespace llvm::pdb;
 
 // Corresponds to `fUDTAnon`.
-template <typename T> static bool isAnonymous(T &Rec) {
-  StringRef Name = Rec.getName();
+static bool isAnonymous(StringRef Name) {
   return Name == "<unnamed-tag>" || Name == "__unnamed" ||
          Name.endswith("::<unnamed-tag>") || Name.endswith("::__unnamed");
 }
 
-// Computes a hash for a given TPI record.
-template <typename T>
-static uint32_t getTpiHash(T &Rec, ArrayRef<uint8_t> FullRecord) {
-  auto Opts = static_cast<uint16_t>(Rec.getOptions());
-
-  bool ForwardRef =
-      Opts & static_cast<uint16_t>(ClassOptions::ForwardReference);
-  bool Scoped = Opts & static_cast<uint16_t>(ClassOptions::Scoped);
-  bool UniqueName = Opts & static_cast<uint16_t>(ClassOptions::HasUniqueName);
-  bool IsAnon = UniqueName && isAnonymous(Rec);
+// Computes the hash for a user-defined type record. This could be a struct,
+// class, union, or enum.
+static uint32_t getHashForUdt(const TagRecord &Rec,
+                              ArrayRef<uint8_t> FullRecord) {
+  ClassOptions Opts = Rec.getOptions();
+  bool ForwardRef = bool(Opts & ClassOptions::ForwardReference);
+  bool Scoped = bool(Opts & ClassOptions::Scoped);
+  bool HasUniqueName = bool(Opts & ClassOptions::HasUniqueName);
+  bool IsAnon = HasUniqueName && isAnonymous(Rec.getName());
 
   if (!ForwardRef && !Scoped && !IsAnon)
     return hashStringV1(Rec.getName());
-  if (!ForwardRef && UniqueName && !IsAnon)
+  if (!ForwardRef && HasUniqueName && !IsAnon)
     return hashStringV1(Rec.getUniqueName());
   return hashBufferV8(FullRecord);
 }
 
-template <typename T> static uint32_t getSourceLineHash(T &Rec) {
+template <typename T>
+static Expected<uint32_t> getHashForUdt(const CVType &Rec) {
+  T Deserialized;
+  if (auto E = TypeDeserializer::deserializeAs(const_cast<CVType &>(Rec),
+                                               Deserialized))
+    return std::move(E);
+  return getHashForUdt(Deserialized, Rec.data());
+}
+
+template <typename T>
+static Expected<TagRecordHash> getTagRecordHashForUdt(const CVType &Rec) {
+  T Deserialized;
+  if (auto E = TypeDeserializer::deserializeAs(const_cast<CVType &>(Rec),
+                                               Deserialized))
+    return std::move(E);
+
+  ClassOptions Opts = Deserialized.getOptions();
+
+  bool ForwardRef = bool(Opts & ClassOptions::ForwardReference);
+
+  uint32_t ThisRecordHash = getHashForUdt(Deserialized, Rec.data());
+
+  // If we don't have a forward ref we can't compute the hash of it from the
+  // full record because it requires hashing the entire buffer.
+  if (!ForwardRef)
+    return TagRecordHash{std::move(Deserialized), ThisRecordHash, 0};
+
+  bool Scoped = bool(Opts & ClassOptions::Scoped);
+
+  StringRef NameToHash =
+      Scoped ? Deserialized.getUniqueName() : Deserialized.getName();
+  uint32_t FullHash = hashStringV1(NameToHash);
+  return TagRecordHash{std::move(Deserialized), FullHash, ThisRecordHash};
+}
+
+template <typename T>
+static Expected<uint32_t> getSourceLineHash(const CVType &Rec) {
+  T Deserialized;
+  if (auto E = TypeDeserializer::deserializeAs(const_cast<CVType &>(Rec),
+                                               Deserialized))
+    return std::move(E);
   char Buf[4];
-  support::endian::write32le(Buf, Rec.getUDT().getIndex());
+  support::endian::write32le(Buf, Deserialized.getUDT().getIndex());
   return hashStringV1(StringRef(Buf, 4));
 }
 
-void TpiHashUpdater::visitKnownRecordImpl(CVType &CVR,
-                                          UdtSourceLineRecord &Rec) {
-  CVR.Hash = getSourceLineHash(Rec);
+Expected<TagRecordHash> llvm::pdb::hashTagRecord(const codeview::CVType &Type) {
+  switch (Type.kind()) {
+  case LF_CLASS:
+  case LF_STRUCTURE:
+  case LF_INTERFACE:
+    return getTagRecordHashForUdt<ClassRecord>(Type);
+  case LF_UNION:
+    return getTagRecordHashForUdt<UnionRecord>(Type);
+  case LF_ENUM:
+    return getTagRecordHashForUdt<EnumRecord>(Type);
+  default:
+    assert(false && "Type is not a tag record!");
+  }
+  return make_error<StringError>("Invalid record type",
+                                 inconvertibleErrorCode());
 }
 
-void TpiHashUpdater::visitKnownRecordImpl(CVType &CVR,
-                                          UdtModSourceLineRecord &Rec) {
-  CVR.Hash = getSourceLineHash(Rec);
-}
+Expected<uint32_t> llvm::pdb::hashTypeRecord(const CVType &Rec) {
+  switch (Rec.kind()) {
+  case LF_CLASS:
+  case LF_STRUCTURE:
+  case LF_INTERFACE:
+    return getHashForUdt<ClassRecord>(Rec);
+  case LF_UNION:
+    return getHashForUdt<UnionRecord>(Rec);
+  case LF_ENUM:
+    return getHashForUdt<EnumRecord>(Rec);
 
-void TpiHashUpdater::visitKnownRecordImpl(CVType &CVR, ClassRecord &Rec) {
-  CVR.Hash = getTpiHash(Rec, CVR.data());
-}
+  case LF_UDT_SRC_LINE:
+    return getSourceLineHash<UdtSourceLineRecord>(Rec);
+  case LF_UDT_MOD_SRC_LINE:
+    return getSourceLineHash<UdtModSourceLineRecord>(Rec);
 
-void TpiHashUpdater::visitKnownRecordImpl(CVType &CVR, EnumRecord &Rec) {
-  CVR.Hash = getTpiHash(Rec, CVR.data());
-}
+  default:
+    break;
+  }
 
-void TpiHashUpdater::visitKnownRecordImpl(CVType &CVR, UnionRecord &Rec) {
-  CVR.Hash = getTpiHash(Rec, CVR.data());
-}
-
-Error TpiHashVerifier::visitKnownRecord(CVType &CVR, UdtSourceLineRecord &Rec) {
-  return verifySourceLine(Rec.getUDT());
-}
-
-Error TpiHashVerifier::visitKnownRecord(CVType &CVR,
-                                        UdtModSourceLineRecord &Rec) {
-  return verifySourceLine(Rec.getUDT());
-}
-
-Error TpiHashVerifier::visitKnownRecord(CVType &CVR, ClassRecord &Rec) {
-  if (getTpiHash(Rec, CVR.data()) % NumHashBuckets != HashValues[Index])
-    return errorInvalidHash();
-  return Error::success();
-}
-Error TpiHashVerifier::visitKnownRecord(CVType &CVR, EnumRecord &Rec) {
-  if (getTpiHash(Rec, CVR.data()) % NumHashBuckets != HashValues[Index])
-    return errorInvalidHash();
-  return Error::success();
-}
-Error TpiHashVerifier::visitKnownRecord(CVType &CVR, UnionRecord &Rec) {
-  if (getTpiHash(Rec, CVR.data()) % NumHashBuckets != HashValues[Index])
-    return errorInvalidHash();
-  return Error::success();
-}
-
-Error TpiHashVerifier::verifySourceLine(codeview::TypeIndex TI) {
-  char Buf[4];
-  support::endian::write32le(Buf, TI.getIndex());
-  uint32_t Hash = hashStringV1(StringRef(Buf, 4));
-  if (Hash % NumHashBuckets != HashValues[Index])
-    return errorInvalidHash();
-  return Error::success();
-}
-
-Error TpiHashVerifier::visitTypeBegin(CVType &Rec) {
-  ++Index;
-  RawRecord = Rec;
-  return Error::success();
+  // Run CRC32 over the bytes. This corresponds to `hashBufv8`.
+  JamCRC JC(/*Init=*/0U);
+  JC.update(Rec.data());
+  return JC.getCRC();
 }

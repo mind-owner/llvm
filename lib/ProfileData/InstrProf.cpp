@@ -1,9 +1,8 @@
 //===- InstrProf.cpp - Instrumented profiling format support --------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ProfileData/InstrProf.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -29,7 +29,7 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
-#include "llvm/ProfileData/InstrProf.h"
+#include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
@@ -45,8 +45,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -56,7 +56,7 @@
 using namespace llvm;
 
 static cl::opt<bool> StaticFuncFullModulePrefix(
-    "static-func-full-module-prefix", cl::init(true),
+    "static-func-full-module-prefix", cl::init(true), cl::Hidden,
     cl::desc("Use full module build paths in the profile counter names for "
              "static functions."));
 
@@ -69,7 +69,7 @@ static cl::opt<bool> StaticFuncFullModulePrefix(
 // the source directory name not being stripped. A non-zero option value here
 // can potentially prevent some inter-module indirect-call-promotions.
 static cl::opt<unsigned> StaticFuncStripDirNamePrefix(
-    "static-func-strip-dirname-prefix", cl::init(0),
+    "static-func-strip-dirname-prefix", cl::init(0), cl::Hidden,
     cl::desc("Strip specified level of directory name from source path in "
              "the profile counter name for static functions."));
 
@@ -111,6 +111,8 @@ static std::string getInstrProfErrString(instrprof_error Err) {
     return "Failed to uncompress data (zlib)";
   case instrprof_error::empty_raw_profile:
     return "Empty raw profile file";
+  case instrprof_error::zlib_unavailable:
+    return "Profile uses zlib compression but the profile reader was built without zlib support";
   }
   llvm_unreachable("A value of instrprof_error has no message.");
 }
@@ -138,88 +140,45 @@ const std::error_category &llvm::instrprof_category() {
 
 namespace {
 
-enum InstrProfSectKind {
-#define INSTR_PROF_SECT_ENTRY(Kind, SectName, SectNameCommon, SectNameCoff,    \
-                              Prefix)                                          \
-  Kind,
-#include "llvm/ProfileData/InstrProfData.inc"
-};
-
-const char *InstrProfSectName[] = {
-#define INSTR_PROF_SECT_ENTRY(Kind, SectName, SectNameCommon, SectNameCoff,    \
-                              Prefix)                                          \
-  SectName,
-#include "llvm/ProfileData/InstrProfData.inc"
-};
-
 const char *InstrProfSectNameCommon[] = {
-#define INSTR_PROF_SECT_ENTRY(Kind, SectName, SectNameCommon, SectNameCoff,    \
-                              Prefix)                                          \
+#define INSTR_PROF_SECT_ENTRY(Kind, SectNameCommon, SectNameCoff, Prefix)      \
   SectNameCommon,
 #include "llvm/ProfileData/InstrProfData.inc"
 };
 
 const char *InstrProfSectNameCoff[] = {
-#define INSTR_PROF_SECT_ENTRY(Kind, SectName, SectNameCommon, SectNameCoff,    \
-                              Prefix)                                          \
+#define INSTR_PROF_SECT_ENTRY(Kind, SectNameCommon, SectNameCoff, Prefix)      \
   SectNameCoff,
 #include "llvm/ProfileData/InstrProfData.inc"
 };
 
 const char *InstrProfSectNamePrefix[] = {
-#define INSTR_PROF_SECT_ENTRY(Kind, SectName, SectNameCommon, SectNameCoff,    \
-                              Prefix)                                          \
+#define INSTR_PROF_SECT_ENTRY(Kind, SectNameCommon, SectNameCoff, Prefix)      \
   Prefix,
 #include "llvm/ProfileData/InstrProfData.inc"
 };
-
-std::string getInstrProfSectionName(const Module *M, InstrProfSectKind Kind) {
-
-  if (!M)
-    return InstrProfSectName[Kind];
-
-  bool AddSegment = Triple(M->getTargetTriple()).isOSBinFormatMachO();
-  std::string SectName;
-  if (Triple(M->getTargetTriple()).isOSBinFormatCOFF())
-    SectName = InstrProfSectNameCoff[Kind];
-  else
-    SectName = InstrProfSectNameCommon[Kind];
-
-  if (AddSegment) {
-    SectName = InstrProfSectNamePrefix[Kind] + SectName;
-    if (Kind == IPSK_data) {
-      SectName += ",regular,live_support";
-    }
-  }
-  return SectName;
-}
 
 } // namespace
 
 namespace llvm {
 
-std::string getInstrProfCountersSectionName(const Module *M) {
-  return getInstrProfSectionName(M, IPSK_cnts);
-}
+std::string getInstrProfSectionName(InstrProfSectKind IPSK,
+                                    Triple::ObjectFormatType OF,
+                                    bool AddSegmentInfo) {
+  std::string SectName;
 
-std::string getInstrProfNameSectionName(const Module *M) {
-  return getInstrProfSectionName(M, IPSK_name);
-}
+  if (OF == Triple::MachO && AddSegmentInfo)
+    SectName = InstrProfSectNamePrefix[IPSK];
 
-std::string getInstrProfDataSectionName(const Module *M) {
-  return getInstrProfSectionName(M, IPSK_data);
-}
+  if (OF == Triple::COFF)
+    SectName += InstrProfSectNameCoff[IPSK];
+  else
+    SectName += InstrProfSectNameCommon[IPSK];
 
-std::string getInstrProfValuesSectionName(const Module *M) {
-  return getInstrProfSectionName(M, IPSK_vals);
-}
+  if (OF == Triple::MachO && IPSK == IPSK_data && AddSegmentInfo)
+    SectName += ",regular,live_support";
 
-std::string getInstrProfVNodesSectionName(const Module *M) {
-  return getInstrProfSectionName(M, IPSK_vnodes);
-}
-
-std::string getInstrProfCoverageSectionName(const Module *M) {
-  return getInstrProfSectionName(M, IPSK_covmap);
+  return SectName;
 }
 
 void SoftInstrProfErrors::addError(instrprof_error IE) {
@@ -293,11 +252,12 @@ static StringRef stripDirPrefix(StringRef PathNameStr, uint32_t NumPrefix) {
 // data, its original linkage must be non-internal.
 std::string getPGOFuncName(const Function &F, bool InLTO, uint64_t Version) {
   if (!InLTO) {
-    StringRef FileName = (StaticFuncFullModulePrefix
-                              ? F.getParent()->getName()
-                              : sys::path::filename(F.getParent()->getName()));
-    if (StaticFuncFullModulePrefix && StaticFuncStripDirNamePrefix != 0)
-      FileName = stripDirPrefix(FileName, StaticFuncStripDirNamePrefix);
+    StringRef FileName(F.getParent()->getSourceFileName());
+    uint32_t StripLevel = StaticFuncFullModulePrefix ? 0 : (uint32_t)-1;
+    if (StripLevel < StaticFuncStripDirNamePrefix)
+      StripLevel = StaticFuncStripDirNamePrefix;
+    if (StripLevel)
+      FileName = stripDirPrefix(FileName, StripLevel);
     return getPGOFuncName(F.getName(), F.getLinkage(), FileName, Version);
   }
 
@@ -373,14 +333,15 @@ GlobalVariable *createPGOFuncNameVar(Function &F, StringRef PGOFuncName) {
   return createPGOFuncNameVar(*F.getParent(), F.getLinkage(), PGOFuncName);
 }
 
-void InstrProfSymtab::create(Module &M, bool InLTO) {
+Error InstrProfSymtab::create(Module &M, bool InLTO) {
   for (Function &F : M) {
     // Function may not have a name: like using asm("") to overwrite the name.
     // Ignore in this case.
     if (!F.hasName())
       continue;
     const std::string &PGOFuncName = getPGOFuncName(F, InLTO);
-    addFuncName(PGOFuncName);
+    if (Error E = addFuncName(PGOFuncName))
+      return E;
     MD5FuncMap.emplace_back(Function::getGUID(PGOFuncName), &F);
     // In ThinLTO, local function may have been promoted to global and have
     // suffix added to the function name. We need to add the stripped function
@@ -389,16 +350,32 @@ void InstrProfSymtab::create(Module &M, bool InLTO) {
       auto pos = PGOFuncName.find('.');
       if (pos != std::string::npos) {
         const std::string &OtherFuncName = PGOFuncName.substr(0, pos);
-        addFuncName(OtherFuncName);
+        if (Error E = addFuncName(OtherFuncName))
+          return E;
         MD5FuncMap.emplace_back(Function::getGUID(OtherFuncName), &F);
       }
     }
   }
-
+  Sorted = false;
   finalizeSymtab();
+  return Error::success();
 }
 
-Error collectPGOFuncNameStrings(const std::vector<std::string> &NameStrs,
+uint64_t InstrProfSymtab::getFunctionHashFromAddress(uint64_t Address) {
+  finalizeSymtab();
+  auto It = partition_point(AddrToMD5Map, [=](std::pair<uint64_t, uint64_t> A) {
+    return A.first < Address;
+  });
+  // Raw function pointer collected by value profiler may be from
+  // external functions that are not instrumented. They won't have
+  // mapping data to be used by the deserializer. Force the value to
+  // be 0 in this case.
+  if (It != AddrToMD5Map.end() && It->first == Address)
+    return (uint64_t)It->second;
+  return 0;
+}
+
+Error collectPGOFuncNameStrings(ArrayRef<std::string> NameStrs,
                                 bool doCompression, std::string &Result) {
   assert(!NameStrs.empty() && "No name data to emit");
 
@@ -446,7 +423,7 @@ StringRef getPGOFuncNameVarInitializer(GlobalVariable *NameVar) {
   return NameStr;
 }
 
-Error collectPGOFuncNameStrings(const std::vector<GlobalVariable *> &NameVars,
+Error collectPGOFuncNameStrings(ArrayRef<GlobalVariable *> NameVars,
                                 std::string &Result, bool doCompression) {
   std::vector<std::string> NameStrs;
   for (auto *NameVar : NameVars) {
@@ -457,9 +434,8 @@ Error collectPGOFuncNameStrings(const std::vector<GlobalVariable *> &NameVars,
 }
 
 Error readPGOFuncNameStrings(StringRef NameStrings, InstrProfSymtab &Symtab) {
-  const uint8_t *P = reinterpret_cast<const uint8_t *>(NameStrings.data());
-  const uint8_t *EndP = reinterpret_cast<const uint8_t *>(NameStrings.data() +
-                                                          NameStrings.size());
+  const uint8_t *P = NameStrings.bytes_begin();
+  const uint8_t *EndP = NameStrings.bytes_end();
   while (P < EndP) {
     uint32_t N;
     uint64_t UncompressedSize = decodeULEB128(P, &N);
@@ -470,6 +446,9 @@ Error readPGOFuncNameStrings(StringRef NameStrings, InstrProfSymtab &Symtab) {
     SmallString<128> UncompressedNameStrings;
     StringRef NameStrings;
     if (isCompressed) {
+      if (!llvm::zlib::isAvailable())
+        return make_error<InstrProfError>(instrprof_error::zlib_unavailable);
+
       StringRef CompressedNameStrings(reinterpret_cast<const char *>(P),
                                       CompressedSize);
       if (Error E =
@@ -490,18 +469,138 @@ Error readPGOFuncNameStrings(StringRef NameStrings, InstrProfSymtab &Symtab) {
     SmallVector<StringRef, 0> Names;
     NameStrings.split(Names, getInstrProfNameSeparator());
     for (StringRef &Name : Names)
-      Symtab.addFuncName(Name);
+      if (Error E = Symtab.addFuncName(Name))
+        return E;
 
     while (P < EndP && *P == 0)
       P++;
   }
-  Symtab.finalizeSymtab();
   return Error::success();
 }
 
-void InstrProfValueSiteRecord::merge(SoftInstrProfErrors &SIPE,
-                                     InstrProfValueSiteRecord &Input,
-                                     uint64_t Weight) {
+void InstrProfRecord::accumulateCounts(CountSumOrPercent &Sum) const {
+  uint64_t FuncSum = 0;
+  Sum.NumEntries += Counts.size();
+  for (size_t F = 0, E = Counts.size(); F < E; ++F)
+    FuncSum += Counts[F];
+  Sum.CountSum += FuncSum;
+
+  for (uint32_t VK = IPVK_First; VK <= IPVK_Last; ++VK) {
+    uint64_t KindSum = 0;
+    uint32_t NumValueSites = getNumValueSites(VK);
+    for (size_t I = 0; I < NumValueSites; ++I) {
+      uint32_t NV = getNumValueDataForSite(VK, I);
+      std::unique_ptr<InstrProfValueData[]> VD = getValueForSite(VK, I);
+      for (uint32_t V = 0; V < NV; V++)
+        KindSum += VD[V].Count;
+    }
+    Sum.ValueCounts[VK] += KindSum;
+  }
+}
+
+void InstrProfValueSiteRecord::overlap(InstrProfValueSiteRecord &Input,
+                                       uint32_t ValueKind,
+                                       OverlapStats &Overlap,
+                                       OverlapStats &FuncLevelOverlap) {
+  this->sortByTargetValues();
+  Input.sortByTargetValues();
+  double Score = 0.0f, FuncLevelScore = 0.0f;
+  auto I = ValueData.begin();
+  auto IE = ValueData.end();
+  auto J = Input.ValueData.begin();
+  auto JE = Input.ValueData.end();
+  while (I != IE && J != JE) {
+    if (I->Value == J->Value) {
+      Score += OverlapStats::score(I->Count, J->Count,
+                                   Overlap.Base.ValueCounts[ValueKind],
+                                   Overlap.Test.ValueCounts[ValueKind]);
+      FuncLevelScore += OverlapStats::score(
+          I->Count, J->Count, FuncLevelOverlap.Base.ValueCounts[ValueKind],
+          FuncLevelOverlap.Test.ValueCounts[ValueKind]);
+      ++I;
+    } else if (I->Value < J->Value) {
+      ++I;
+      continue;
+    }
+    ++J;
+  }
+  Overlap.Overlap.ValueCounts[ValueKind] += Score;
+  FuncLevelOverlap.Overlap.ValueCounts[ValueKind] += FuncLevelScore;
+}
+
+// Return false on mismatch.
+void InstrProfRecord::overlapValueProfData(uint32_t ValueKind,
+                                           InstrProfRecord &Other,
+                                           OverlapStats &Overlap,
+                                           OverlapStats &FuncLevelOverlap) {
+  uint32_t ThisNumValueSites = getNumValueSites(ValueKind);
+  assert(ThisNumValueSites == Other.getNumValueSites(ValueKind));
+  if (!ThisNumValueSites)
+    return;
+
+  std::vector<InstrProfValueSiteRecord> &ThisSiteRecords =
+      getOrCreateValueSitesForKind(ValueKind);
+  MutableArrayRef<InstrProfValueSiteRecord> OtherSiteRecords =
+      Other.getValueSitesForKind(ValueKind);
+  for (uint32_t I = 0; I < ThisNumValueSites; I++)
+    ThisSiteRecords[I].overlap(OtherSiteRecords[I], ValueKind, Overlap,
+                               FuncLevelOverlap);
+}
+
+void InstrProfRecord::overlap(InstrProfRecord &Other, OverlapStats &Overlap,
+                              OverlapStats &FuncLevelOverlap,
+                              uint64_t ValueCutoff) {
+  // FuncLevel CountSum for other should already computed and nonzero.
+  assert(FuncLevelOverlap.Test.CountSum >= 1.0f);
+  accumulateCounts(FuncLevelOverlap.Base);
+  bool Mismatch = (Counts.size() != Other.Counts.size());
+
+  // Check if the value profiles mismatch.
+  if (!Mismatch) {
+    for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind) {
+      uint32_t ThisNumValueSites = getNumValueSites(Kind);
+      uint32_t OtherNumValueSites = Other.getNumValueSites(Kind);
+      if (ThisNumValueSites != OtherNumValueSites) {
+        Mismatch = true;
+        break;
+      }
+    }
+  }
+  if (Mismatch) {
+    Overlap.addOneMismatch(FuncLevelOverlap.Test);
+    return;
+  }
+
+  // Compute overlap for value counts.
+  for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind)
+    overlapValueProfData(Kind, Other, Overlap, FuncLevelOverlap);
+
+  double Score = 0.0;
+  uint64_t MaxCount = 0;
+  // Compute overlap for edge counts.
+  for (size_t I = 0, E = Other.Counts.size(); I < E; ++I) {
+    Score += OverlapStats::score(Counts[I], Other.Counts[I],
+                                 Overlap.Base.CountSum, Overlap.Test.CountSum);
+    MaxCount = std::max(Other.Counts[I], MaxCount);
+  }
+  Overlap.Overlap.CountSum += Score;
+  Overlap.Overlap.NumEntries += 1;
+
+  if (MaxCount >= ValueCutoff) {
+    double FuncScore = 0.0;
+    for (size_t I = 0, E = Other.Counts.size(); I < E; ++I)
+      FuncScore += OverlapStats::score(Counts[I], Other.Counts[I],
+                                       FuncLevelOverlap.Base.CountSum,
+                                       FuncLevelOverlap.Test.CountSum);
+    FuncLevelOverlap.Overlap.CountSum = FuncScore;
+    FuncLevelOverlap.Overlap.NumEntries = Other.Counts.size();
+    FuncLevelOverlap.Valid = true;
+  }
+}
+
+void InstrProfValueSiteRecord::merge(InstrProfValueSiteRecord &Input,
+                                     uint64_t Weight,
+                                     function_ref<void(instrprof_error)> Warn) {
   this->sortByTargetValues();
   Input.sortByTargetValues();
   auto I = ValueData.begin();
@@ -514,7 +613,7 @@ void InstrProfValueSiteRecord::merge(SoftInstrProfErrors &SIPE,
       bool Overflowed;
       I->Count = SaturatingMultiplyAdd(J->Count, Weight, I->Count, &Overflowed);
       if (Overflowed)
-        SIPE.addError(instrprof_error::counter_overflow);
+        Warn(instrprof_error::counter_overflow);
       ++I;
       continue;
     }
@@ -522,40 +621,43 @@ void InstrProfValueSiteRecord::merge(SoftInstrProfErrors &SIPE,
   }
 }
 
-void InstrProfValueSiteRecord::scale(SoftInstrProfErrors &SIPE,
-                                     uint64_t Weight) {
+void InstrProfValueSiteRecord::scale(uint64_t Weight,
+                                     function_ref<void(instrprof_error)> Warn) {
   for (auto I = ValueData.begin(), IE = ValueData.end(); I != IE; ++I) {
     bool Overflowed;
     I->Count = SaturatingMultiply(I->Count, Weight, &Overflowed);
     if (Overflowed)
-      SIPE.addError(instrprof_error::counter_overflow);
+      Warn(instrprof_error::counter_overflow);
   }
 }
 
 // Merge Value Profile data from Src record to this record for ValueKind.
 // Scale merged value counts by \p Weight.
-void InstrProfRecord::mergeValueProfData(uint32_t ValueKind,
-                                         InstrProfRecord &Src,
-                                         uint64_t Weight) {
+void InstrProfRecord::mergeValueProfData(
+    uint32_t ValueKind, InstrProfRecord &Src, uint64_t Weight,
+    function_ref<void(instrprof_error)> Warn) {
   uint32_t ThisNumValueSites = getNumValueSites(ValueKind);
   uint32_t OtherNumValueSites = Src.getNumValueSites(ValueKind);
   if (ThisNumValueSites != OtherNumValueSites) {
-    SIPE.addError(instrprof_error::value_site_count_mismatch);
+    Warn(instrprof_error::value_site_count_mismatch);
     return;
   }
+  if (!ThisNumValueSites)
+    return;
   std::vector<InstrProfValueSiteRecord> &ThisSiteRecords =
-      getValueSitesForKind(ValueKind);
-  std::vector<InstrProfValueSiteRecord> &OtherSiteRecords =
+      getOrCreateValueSitesForKind(ValueKind);
+  MutableArrayRef<InstrProfValueSiteRecord> OtherSiteRecords =
       Src.getValueSitesForKind(ValueKind);
   for (uint32_t I = 0; I < ThisNumValueSites; I++)
-    ThisSiteRecords[I].merge(SIPE, OtherSiteRecords[I], Weight);
+    ThisSiteRecords[I].merge(OtherSiteRecords[I], Weight, Warn);
 }
 
-void InstrProfRecord::merge(InstrProfRecord &Other, uint64_t Weight) {
+void InstrProfRecord::merge(InstrProfRecord &Other, uint64_t Weight,
+                            function_ref<void(instrprof_error)> Warn) {
   // If the number of counters doesn't match we either have bad data
   // or a hash collision.
   if (Counts.size() != Other.Counts.size()) {
-    SIPE.addError(instrprof_error::count_mismatch);
+    Warn(instrprof_error::count_mismatch);
     return;
   }
 
@@ -564,65 +666,52 @@ void InstrProfRecord::merge(InstrProfRecord &Other, uint64_t Weight) {
     Counts[I] =
         SaturatingMultiplyAdd(Other.Counts[I], Weight, Counts[I], &Overflowed);
     if (Overflowed)
-      SIPE.addError(instrprof_error::counter_overflow);
+      Warn(instrprof_error::counter_overflow);
   }
 
   for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind)
-    mergeValueProfData(Kind, Other, Weight);
+    mergeValueProfData(Kind, Other, Weight, Warn);
 }
 
-void InstrProfRecord::scaleValueProfData(uint32_t ValueKind, uint64_t Weight) {
-  uint32_t ThisNumValueSites = getNumValueSites(ValueKind);
-  std::vector<InstrProfValueSiteRecord> &ThisSiteRecords =
-      getValueSitesForKind(ValueKind);
-  for (uint32_t I = 0; I < ThisNumValueSites; I++)
-    ThisSiteRecords[I].scale(SIPE, Weight);
+void InstrProfRecord::scaleValueProfData(
+    uint32_t ValueKind, uint64_t Weight,
+    function_ref<void(instrprof_error)> Warn) {
+  for (auto &R : getValueSitesForKind(ValueKind))
+    R.scale(Weight, Warn);
 }
 
-void InstrProfRecord::scale(uint64_t Weight) {
+void InstrProfRecord::scale(uint64_t Weight,
+                            function_ref<void(instrprof_error)> Warn) {
   for (auto &Count : this->Counts) {
     bool Overflowed;
     Count = SaturatingMultiply(Count, Weight, &Overflowed);
     if (Overflowed)
-      SIPE.addError(instrprof_error::counter_overflow);
+      Warn(instrprof_error::counter_overflow);
   }
   for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind)
-    scaleValueProfData(Kind, Weight);
+    scaleValueProfData(Kind, Weight, Warn);
 }
 
 // Map indirect call target name hash to name string.
 uint64_t InstrProfRecord::remapValue(uint64_t Value, uint32_t ValueKind,
-                                     ValueMapType *ValueMap) {
-  if (!ValueMap)
+                                     InstrProfSymtab *SymTab) {
+  if (!SymTab)
     return Value;
-  switch (ValueKind) {
-  case IPVK_IndirectCallTarget: {
-    auto Result =
-        std::lower_bound(ValueMap->begin(), ValueMap->end(), Value,
-                         [](const std::pair<uint64_t, uint64_t> &LHS,
-                            uint64_t RHS) { return LHS.first < RHS; });
-   // Raw function pointer collected by value profiler may be from 
-   // external functions that are not instrumented. They won't have
-   // mapping data to be used by the deserializer. Force the value to
-   // be 0 in this case.
-    if (Result != ValueMap->end() && Result->first == Value)
-      Value = (uint64_t)Result->second;
-    else
-      Value = 0;
-    break;
-  }
-  }
+
+  if (ValueKind == IPVK_IndirectCallTarget)
+    return SymTab->getFunctionHashFromAddress(Value);
+
   return Value;
 }
 
 void InstrProfRecord::addValueData(uint32_t ValueKind, uint32_t Site,
                                    InstrProfValueData *VData, uint32_t N,
-                                   ValueMapType *ValueMap) {
+                                   InstrProfSymtab *ValueMap) {
   for (uint32_t I = 0; I < N; I++) {
     VData[I].Value = remapValue(VData[I].Value, ValueKind, ValueMap);
   }
   std::vector<InstrProfValueSiteRecord> &ValueSites =
-      getValueSitesForKind(ValueKind);
+      getOrCreateValueSitesForKind(ValueKind);
   if (N == 0)
     ValueSites.emplace_back();
   else
@@ -633,7 +722,7 @@ void InstrProfRecord::addValueData(uint32_t ValueKind, uint32_t Site,
 #include "llvm/ProfileData/InstrProfData.inc"
 
 /*!
- * \brief ValueProfRecordClosure Interface implementation for  InstrProfRecord
+ * ValueProfRecordClosure Interface implementation for  InstrProfRecord
  *  class. These C wrappers are used as adaptors so that C++ code can be
  *  invoked as callbacks.
  */
@@ -681,8 +770,9 @@ static ValueProfRecordClosure InstrProfRecordClosure = {
 
 // Wrapper implementation using the closure mechanism.
 uint32_t ValueProfData::getSize(const InstrProfRecord &Record) {
-  InstrProfRecordClosure.Record = &Record;
-  return getValueProfDataSize(&InstrProfRecordClosure);
+  auto Closure = InstrProfRecordClosure;
+  Closure.Record = &Record;
+  return getValueProfDataSize(&Closure);
 }
 
 // Wrapper implementation using the closure mechanism.
@@ -696,13 +786,13 @@ ValueProfData::serializeFrom(const InstrProfRecord &Record) {
 }
 
 void ValueProfRecord::deserializeTo(InstrProfRecord &Record,
-                                    InstrProfRecord::ValueMapType *VMap) {
+                                    InstrProfSymtab *SymTab) {
   Record.reserveSites(Kind, NumValueSites);
 
   InstrProfValueData *ValueData = getValueProfRecordValueData(this);
   for (uint64_t VSite = 0; VSite < NumValueSites; ++VSite) {
     uint8_t ValueDataCount = this->SiteCountArray[VSite];
-    Record.addValueData(Kind, VSite, ValueData, ValueDataCount, VMap);
+    Record.addValueData(Kind, VSite, ValueData, ValueDataCount, SymTab);
     ValueData += ValueDataCount;
   }
 }
@@ -736,13 +826,13 @@ void ValueProfRecord::swapBytes(support::endianness Old,
 }
 
 void ValueProfData::deserializeTo(InstrProfRecord &Record,
-                                  InstrProfRecord::ValueMapType *VMap) {
+                                  InstrProfSymtab *SymTab) {
   if (NumValueKinds == 0)
     return;
 
   ValueProfRecord *VR = getFirstValueProfRecord(this);
   for (uint32_t K = 0; K < NumValueKinds; K++) {
-    VR->deserializeTo(Record, VMap);
+    VR->deserializeTo(Record, SymTab);
     VR = getValueProfRecordNext(VR);
   }
 }
@@ -955,8 +1045,7 @@ bool needsComdatForCounter(const Function &F, const Module &M) {
   if (F.hasComdat())
     return true;
 
-  Triple TT(M.getTargetTriple());
-  if (!TT.isOSBinFormatELF() && !TT.isOSBinFormatWasm())
+  if (!Triple(M.getTargetTriple()).supportsCOMDAT())
     return false;
 
   // See createPGOFuncNameVar for more details. To avoid link errors, profile
@@ -989,12 +1078,10 @@ bool isIRPGOFlagSet(const Module *M) {
   if (!IRInstrVar->hasInitializer())
     return false;
 
-  const Constant *InitVal = IRInstrVar->getInitializer();
+  auto *InitVal = dyn_cast_or_null<ConstantInt>(IRInstrVar->getInitializer());
   if (!InitVal)
     return false;
-
-  return (dyn_cast<ConstantInt>(InitVal)->getZExtValue() &
-          VARIANT_MASK_IR_PROF) != 0;
+  return (InitVal->getZExtValue() & VARIANT_MASK_IR_PROF) != 0;
 }
 
 // Check if we can safely rename this Comdat function.
@@ -1021,24 +1108,173 @@ bool canRenameComdatFunc(const Function &F, bool CheckAddressTaken) {
 }
 
 // Parse the value profile options.
-void getMemOPSizeRangeFromOption(std::string MemOPSizeRange,
-                                 int64_t &RangeStart, int64_t &RangeLast) {
+void getMemOPSizeRangeFromOption(StringRef MemOPSizeRange, int64_t &RangeStart,
+                                 int64_t &RangeLast) {
   static const int64_t DefaultMemOPSizeRangeStart = 0;
   static const int64_t DefaultMemOPSizeRangeLast = 8;
   RangeStart = DefaultMemOPSizeRangeStart;
   RangeLast = DefaultMemOPSizeRangeLast;
 
   if (!MemOPSizeRange.empty()) {
-    auto Pos = MemOPSizeRange.find(":");
+    auto Pos = MemOPSizeRange.find(':');
     if (Pos != std::string::npos) {
       if (Pos > 0)
-        RangeStart = atoi(MemOPSizeRange.substr(0, Pos).c_str());
+        MemOPSizeRange.substr(0, Pos).getAsInteger(10, RangeStart);
       if (Pos < MemOPSizeRange.size() - 1)
-        RangeLast = atoi(MemOPSizeRange.substr(Pos + 1).c_str());
+        MemOPSizeRange.substr(Pos + 1).getAsInteger(10, RangeLast);
     } else
-      RangeLast = atoi(MemOPSizeRange.c_str());
+      MemOPSizeRange.getAsInteger(10, RangeLast);
   }
   assert(RangeLast >= RangeStart);
+}
+
+// Create a COMDAT variable INSTR_PROF_RAW_VERSION_VAR to make the runtime
+// aware this is an ir_level profile so it can set the version flag.
+void createIRLevelProfileFlagVar(Module &M, bool IsCS) {
+  const StringRef VarName(INSTR_PROF_QUOTE(INSTR_PROF_RAW_VERSION_VAR));
+  Type *IntTy64 = Type::getInt64Ty(M.getContext());
+  uint64_t ProfileVersion = (INSTR_PROF_RAW_VERSION | VARIANT_MASK_IR_PROF);
+  if (IsCS)
+    ProfileVersion |= VARIANT_MASK_CSIR_PROF;
+  auto IRLevelVersionVariable = new GlobalVariable(
+      M, IntTy64, true, GlobalValue::WeakAnyLinkage,
+      Constant::getIntegerValue(IntTy64, APInt(64, ProfileVersion)), VarName);
+  IRLevelVersionVariable->setVisibility(GlobalValue::DefaultVisibility);
+  Triple TT(M.getTargetTriple());
+  if (TT.supportsCOMDAT()) {
+    IRLevelVersionVariable->setLinkage(GlobalValue::ExternalLinkage);
+    IRLevelVersionVariable->setComdat(M.getOrInsertComdat(VarName));
+  }
+}
+
+// Create the variable for the profile file name.
+void createProfileFileNameVar(Module &M, StringRef InstrProfileOutput) {
+  if (InstrProfileOutput.empty())
+    return;
+  Constant *ProfileNameConst =
+      ConstantDataArray::getString(M.getContext(), InstrProfileOutput, true);
+  GlobalVariable *ProfileNameVar = new GlobalVariable(
+      M, ProfileNameConst->getType(), true, GlobalValue::WeakAnyLinkage,
+      ProfileNameConst, INSTR_PROF_QUOTE(INSTR_PROF_PROFILE_NAME_VAR));
+  Triple TT(M.getTargetTriple());
+  if (TT.supportsCOMDAT()) {
+    ProfileNameVar->setLinkage(GlobalValue::ExternalLinkage);
+    ProfileNameVar->setComdat(M.getOrInsertComdat(
+        StringRef(INSTR_PROF_QUOTE(INSTR_PROF_PROFILE_NAME_VAR))));
+  }
+}
+
+Error OverlapStats::accumulateCounts(const std::string &BaseFilename,
+                                     const std::string &TestFilename,
+                                     bool IsCS) {
+  auto getProfileSum = [IsCS](const std::string &Filename,
+                              CountSumOrPercent &Sum) -> Error {
+    auto ReaderOrErr = InstrProfReader::create(Filename);
+    if (Error E = ReaderOrErr.takeError()) {
+      return E;
+    }
+    auto Reader = std::move(ReaderOrErr.get());
+    Reader->accumulateCounts(Sum, IsCS);
+    return Error::success();
+  };
+  auto Ret = getProfileSum(BaseFilename, Base);
+  if (Ret)
+    return Ret;
+  Ret = getProfileSum(TestFilename, Test);
+  if (Ret)
+    return Ret;
+  this->BaseFilename = &BaseFilename;
+  this->TestFilename = &TestFilename;
+  Valid = true;
+  return Error::success();
+}
+
+void OverlapStats::addOneMismatch(const CountSumOrPercent &MismatchFunc) {
+  Mismatch.NumEntries += 1;
+  Mismatch.CountSum += MismatchFunc.CountSum / Test.CountSum;
+  for (unsigned I = 0; I < IPVK_Last - IPVK_First + 1; I++) {
+    if (Test.ValueCounts[I] >= 1.0f)
+      Mismatch.ValueCounts[I] +=
+          MismatchFunc.ValueCounts[I] / Test.ValueCounts[I];
+  }
+}
+
+void OverlapStats::addOneUnique(const CountSumOrPercent &UniqueFunc) {
+  Unique.NumEntries += 1;
+  Unique.CountSum += UniqueFunc.CountSum / Test.CountSum;
+  for (unsigned I = 0; I < IPVK_Last - IPVK_First + 1; I++) {
+    if (Test.ValueCounts[I] >= 1.0f)
+      Unique.ValueCounts[I] += UniqueFunc.ValueCounts[I] / Test.ValueCounts[I];
+  }
+}
+
+void OverlapStats::dump(raw_fd_ostream &OS) const {
+  if (!Valid)
+    return;
+
+  const char *EntryName =
+      (Level == ProgramLevel ? "functions" : "edge counters");
+  if (Level == ProgramLevel) {
+    OS << "Profile overlap infomation for base_profile: " << *BaseFilename
+       << " and test_profile: " << *TestFilename << "\nProgram level:\n";
+  } else {
+    OS << "Function level:\n"
+       << "  Function: " << FuncName << " (Hash=" << FuncHash << ")\n";
+  }
+
+  OS << "  # of " << EntryName << " overlap: " << Overlap.NumEntries << "\n";
+  if (Mismatch.NumEntries)
+    OS << "  # of " << EntryName << " mismatch: " << Mismatch.NumEntries
+       << "\n";
+  if (Unique.NumEntries)
+    OS << "  # of " << EntryName
+       << " only in test_profile: " << Unique.NumEntries << "\n";
+
+  OS << "  Edge profile overlap: " << format("%.3f%%", Overlap.CountSum * 100)
+     << "\n";
+  if (Mismatch.NumEntries)
+    OS << "  Mismatched count percentage (Edge): "
+       << format("%.3f%%", Mismatch.CountSum * 100) << "\n";
+  if (Unique.NumEntries)
+    OS << "  Percentage of Edge profile only in test_profile: "
+       << format("%.3f%%", Unique.CountSum * 100) << "\n";
+  OS << "  Edge profile base count sum: " << format("%.0f", Base.CountSum)
+     << "\n"
+     << "  Edge profile test count sum: " << format("%.0f", Test.CountSum)
+     << "\n";
+
+  for (unsigned I = 0; I < IPVK_Last - IPVK_First + 1; I++) {
+    if (Base.ValueCounts[I] < 1.0f && Test.ValueCounts[I] < 1.0f)
+      continue;
+    char ProfileKindName[20];
+    switch (I) {
+    case IPVK_IndirectCallTarget:
+      strncpy(ProfileKindName, "IndirectCall", 19);
+      break;
+    case IPVK_MemOPSize:
+      strncpy(ProfileKindName, "MemOP", 19);
+      break;
+    default:
+      snprintf(ProfileKindName, 19, "VP[%d]", I);
+      break;
+    }
+    OS << "  " << ProfileKindName
+       << " profile overlap: " << format("%.3f%%", Overlap.ValueCounts[I] * 100)
+       << "\n";
+    if (Mismatch.NumEntries)
+      OS << "  Mismatched count percentage (" << ProfileKindName
+         << "): " << format("%.3f%%", Mismatch.ValueCounts[I] * 100) << "\n";
+    if (Unique.NumEntries)
+      OS << "  Percentage of " << ProfileKindName
+         << " profile only in test_profile: "
+         << format("%.3f%%", Unique.ValueCounts[I] * 100) << "\n";
+    OS << "  " << ProfileKindName
+       << " profile base count sum: " << format("%.0f", Base.ValueCounts[I])
+       << "\n"
+       << "  " << ProfileKindName
+       << " profile test count sum: " << format("%.0f", Test.ValueCounts[I])
+       << "\n";
+  }
 }
 
 } // end namespace llvm

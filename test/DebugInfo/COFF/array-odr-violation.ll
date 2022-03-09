@@ -17,27 +17,24 @@
 ; FIXME: sizeof(a) in the user program is 1, but we claim it is 4 because
 ; sometimes the frontend lies to us. See array-types-advanced.ll for an example.
 ;
-; CHECK: Array ({{.*}}) {
-; CHECK:   TypeLeafKind: LF_ARRAY (0x1503)
-; CHECK:   ElementType: YYSTYPE ({{.*}})
-; CHECK:   IndexType: unsigned __int64 (0x23)
-; CHECK:   SizeOf: 4
-; CHECK:   Name:
-; CHECK: }
+; CHECK:	# Array (0x1004)
+; CHECK:	.short	0xe                     # Record length
+; CHECK:	.short	0x1503                  # Record kind: LF_ARRAY
+; CHECK:	.long	0x1003                  # ElementType: YYSTYPE
+; CHECK:	.long	0x23                    # IndexType: unsigned __int64
+; CHECK:	.short	0x4                     # SizeOf
+; CHECK:	.byte	0                       # Name
+; CHECK:	.byte	241
 
-; sizeof(YYSTYPE) == 4
-; CHECK: Union ({{.*}}) {
-; CHECK:   TypeLeafKind: LF_UNION (0x1506)
-; CHECK:   MemberCount: 1
-; CHECK:   Properties [ (0x600)
-; CHECK:     HasUniqueName (0x200)
-; CHECK:     Sealed (0x400)
-; CHECK:   ]
-; CHECK:   FieldList: <field list>
-; CHECK:   SizeOf: 4
-; CHECK:   Name: YYSTYPE
-; CHECK:   LinkageName: .?ATYYSTYPE@@
-; CHECK: }
+; CHECK:	# Union (0x1006)
+; CHECK:	.short	0x22                    # Record length
+; CHECK:	.short	0x1506                  # Record kind: LF_UNION
+; CHECK:	.short	0x1                     # MemberCount
+; CHECK:	.short	0x600                   # Properties ( HasUniqueName (0x200) | Sealed (0x400) )
+; CHECK:	.long	0x1005                  # FieldList: <field list>
+; CHECK:	.short	0x4                     # SizeOf
+; CHECK:	.asciz	"YYSTYPE"               # Name
+; CHECK:	.asciz	".?ATYYSTYPE@@"         # LinkageName
 
 ; ModuleID = 'llvm-link'
 source_filename = "llvm-link"
@@ -65,9 +62,9 @@ attributes #1 = { nounwind readnone }
 
 !llvm.dbg.cu = !{!2, !11}
 !llvm.ident = !{!13, !13}
-!llvm.module.flags = !{!14, !18, !19, !20}
+!llvm.module.flags = !{!18, !19, !20}
 
-!0 = !DIGlobalVariableExpression(var: !1)
+!0 = !DIGlobalVariableExpression(var: !1, expr: !DIExpression())
 !1 = distinct !DIGlobalVariable(name: "a", linkageName: "\01?a@@3TYYSTYPE@@A", scope: !2, file: !3, line: 2, type: !6, isLocal: false, isDefinition: true)
 !2 = distinct !DICompileUnit(language: DW_LANG_C_plus_plus, file: !3, producer: "clang version 5.0.0 ", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug, enums: !4, globals: !5)
 !3 = !DIFile(filename: "a.cpp", directory: "C:\5Csrc\5Cllvm-project\5Cbuild", checksumkind: CSK_MD5, checksum: "c0005139aa3df153c30d8c6953390a4b")
@@ -81,14 +78,10 @@ attributes #1 = { nounwind readnone }
 !11 = distinct !DICompileUnit(language: DW_LANG_C_plus_plus, file: !12, producer: "clang version 5.0.0 ", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug, enums: !4)
 !12 = !DIFile(filename: "b.cpp", directory: "C:\5Csrc\5Cllvm-project\5Cbuild", checksumkind: CSK_MD5, checksum: "9cfd390d8827beab36769147bb037abc")
 !13 = !{!"clang version 5.0.0 "}
-!14 = !{i32 6, !"Linker Options", !15}
-!15 = !{!16, !17}
-!16 = !{!"/DEFAULTLIB:libcmt.lib"}
-!17 = !{!"/DEFAULTLIB:oldnames.lib"}
 !18 = !{i32 2, !"CodeView", i32 1}
 !19 = !{i32 2, !"Debug Info Version", i32 3}
 !20 = !{i32 1, !"PIC Level", i32 2}
-!21 = distinct !DISubprogram(name: "fn1", linkageName: "\01?fn1@@YAXXZ", scope: !12, file: !12, line: 2, type: !22, isLocal: false, isDefinition: true, scopeLine: 2, flags: DIFlagPrototyped, isOptimized: false, unit: !11, variables: !4)
+!21 = distinct !DISubprogram(name: "fn1", linkageName: "\01?fn1@@YAXXZ", scope: !12, file: !12, line: 2, type: !22, isLocal: false, isDefinition: true, scopeLine: 2, flags: DIFlagPrototyped, isOptimized: false, unit: !11, retainedNodes: !4)
 !22 = !DISubroutineType(types: !23)
 !23 = !{null}
 !24 = !DILocalVariable(name: "a", scope: !21, file: !12, line: 2, type: !25)

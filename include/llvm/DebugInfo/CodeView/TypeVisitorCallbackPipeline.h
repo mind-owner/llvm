@@ -1,9 +1,8 @@
 //===- TypeVisitorCallbackPipeline.h ----------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,6 +41,14 @@ public:
   Error visitTypeBegin(CVType &Record) override {
     for (auto Visitor : Pipeline) {
       if (auto EC = Visitor->visitTypeBegin(Record))
+        return EC;
+    }
+    return Error::success();
+  }
+
+  Error visitTypeBegin(CVType &Record, TypeIndex Index) override {
+    for (auto Visitor : Pipeline) {
+      if (auto EC = Visitor->visitTypeBegin(Record, Index))
         return EC;
     }
     return Error::success();
@@ -86,7 +93,7 @@ public:
   }
 #define TYPE_RECORD_ALIAS(EnumName, EnumVal, Name, AliasName)
 #define MEMBER_RECORD_ALIAS(EnumName, EnumVal, Name, AliasName)
-#include "llvm/DebugInfo/CodeView/TypeRecords.def"
+#include "llvm/DebugInfo/CodeView/CodeViewTypes.def"
 
 private:
   template <typename T> Error visitKnownRecordImpl(CVType &CVR, T &Record) {

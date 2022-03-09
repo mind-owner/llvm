@@ -1,9 +1,8 @@
 //===- RawConstants.h -------------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,7 +11,6 @@
 
 #include "llvm/ADT/BitmaskEnum.h"
 #include "llvm/DebugInfo/CodeView/CodeView.h"
-
 #include <cstdint>
 
 namespace llvm {
@@ -32,6 +30,8 @@ enum PdbRaw_ImplVer : uint32_t {
   PdbImplVC110 = 20091201,
   PdbImplVC140 = 20140508,
 };
+
+enum class PdbRaw_SrcHeaderBlockVer : uint32_t { SrcVerOne = 19980827 };
 
 enum class PdbRaw_FeatureSig : uint32_t {
   VC110 = PdbImplVC110,
@@ -99,14 +99,18 @@ enum class DbgHeaderType : uint16_t {
 };
 
 enum class OMFSegDescFlags : uint16_t {
+  None = 0,
   Read = 1 << 0,              // Segment is readable.
   Write = 1 << 1,             // Segment is writable.
   Execute = 1 << 2,           // Segment is executable.
   AddressIs32Bit = 1 << 3,    // Descriptor describes a 32-bit linear address.
   IsSelector = 1 << 8,        // Frame represents a selector.
   IsAbsoluteAddress = 1 << 9, // Frame represents an absolute address.
-  IsGroup = 1 << 10           // If set, descriptor represents a group.
+  IsGroup = 1 << 10,          // If set, descriptor represents a group.
+  LLVM_MARK_AS_BITMASK_ENUM(/* LargestValue = */ IsGroup)
 };
+
+LLVM_ENABLE_BITMASK_ENUMS_IN_NAMESPACE();
 
 } // end namespace pdb
 } // end namespace llvm

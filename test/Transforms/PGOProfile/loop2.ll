@@ -3,7 +3,7 @@
 ; RUN: llvm-profdata merge %S/Inputs/loop2.proftext -o %t.profdata
 ; RUN: opt < %s -pgo-instr-use -pgo-test-profile-file=%t.profdata -S | FileCheck %s --check-prefix=USE
 ; RUN: opt < %s -passes=pgo-instr-use -pgo-test-profile-file=%t.profdata -S | FileCheck %s --check-prefix=USE
-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
 ; GEN: $__llvm_profile_raw_version = comdat any
@@ -13,7 +13,7 @@ target triple = "x86_64-unknown-linux-gnu"
 define i32 @test_nested_for(i32 %r, i32 %s) {
 entry:
 ; GEN: entry:
-; GEN-NOT: call void @llvm.instrprof.increment
+; GEN: call void @llvm.instrprof.increment(i8* getelementptr inbounds ([15 x i8], [15 x i8]* @__profn_test_nested_for, i32 0, i32 0), i64 53929068288, i32 3, i32 2)
   br label %for.cond.outer
 
 for.cond.outer:
@@ -65,7 +65,8 @@ for.inc.outer:
 
 for.end.outer:
 ; GEN: for.end.outer:
-; GEN: call void @llvm.instrprof.increment(i8* getelementptr inbounds ([15 x i8], [15 x i8]* @__profn_test_nested_for, i32 0, i32 0), i64 53929068288, i32 3, i32 2)
+; GEN-NOT: call void @llvm.instrprof.increment
+; GEN: ret i32
   ret i32 %sum.0
 }
 

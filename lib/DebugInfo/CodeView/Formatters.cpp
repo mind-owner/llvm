@@ -1,13 +1,17 @@
-//===- Formatters.cpp -------------------------------------------*- C++ -*-===//
+//===- Formatters.cpp -----------------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/CodeView/Formatters.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/DebugInfo/CodeView/GUID.h"
+#include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <cassert>
 
 using namespace llvm;
 using namespace llvm::codeview;
@@ -19,7 +23,7 @@ GuidAdapter::GuidAdapter(StringRef Guid)
 GuidAdapter::GuidAdapter(ArrayRef<uint8_t> Guid)
     : FormatAdapter(std::move(Guid)) {}
 
-void GuidAdapter::format(llvm::raw_ostream &Stream, StringRef Style) {
+void GuidAdapter::format(raw_ostream &Stream, StringRef Style) {
   static const char *Lookup = "0123456789ABCDEF";
 
   assert(Item.size() == 16 && "Expected 16-byte GUID");
@@ -34,4 +38,10 @@ void GuidAdapter::format(llvm::raw_ostream &Stream, StringRef Style) {
       Stream << "-";
   }
   Stream << "}";
+}
+
+raw_ostream &llvm::codeview::operator<<(raw_ostream &OS, const GUID &Guid) {
+  codeview::detail::GuidAdapter A(Guid.Guid);
+  A.format(OS, "");
+  return OS;
 }

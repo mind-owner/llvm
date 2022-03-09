@@ -1,9 +1,8 @@
 //===-- llvm/CodeGen/LowLevelType.cpp -------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -21,10 +20,10 @@ using namespace llvm;
 LLT llvm::getLLTForType(Type &Ty, const DataLayout &DL) {
   if (auto VTy = dyn_cast<VectorType>(&Ty)) {
     auto NumElements = VTy->getNumElements();
-    auto ScalarSizeInBits = VTy->getElementType()->getPrimitiveSizeInBits();
+    LLT ScalarTy = getLLTForType(*VTy->getElementType(), DL);
     if (NumElements == 1)
-      return LLT::scalar(ScalarSizeInBits);
-    return LLT::vector(NumElements, ScalarSizeInBits);
+      return ScalarTy;
+    return LLT::vector(NumElements, ScalarTy);
   } else if (auto PTy = dyn_cast<PointerType>(&Ty)) {
     return LLT::pointer(PTy->getAddressSpace(), DL.getTypeSizeInBits(&Ty));
   } else if (Ty.isSized()) {

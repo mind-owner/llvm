@@ -1,9 +1,8 @@
 //===- ConstantPools.cpp - ConstantPool class -----------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -57,6 +56,10 @@ const MCExpr *ConstantPool::addEntry(const MCExpr *Value, MCContext &Context,
 
 bool ConstantPool::empty() { return Entries.empty(); }
 
+void ConstantPool::clearCache() {
+  CachedEntries.clear();
+}
+
 //
 // AssemblerConstantPools implementation
 //
@@ -93,9 +96,14 @@ void AssemblerConstantPools::emitAll(MCStreamer &Streamer) {
 
 void AssemblerConstantPools::emitForCurrentSection(MCStreamer &Streamer) {
   MCSection *Section = Streamer.getCurrentSectionOnly();
-  if (ConstantPool *CP = getConstantPool(Section)) {
+  if (ConstantPool *CP = getConstantPool(Section))
     emitConstantPool(Streamer, Section, *CP);
-  }
+}
+
+void AssemblerConstantPools::clearCacheForCurrentSection(MCStreamer &Streamer) {
+  MCSection *Section = Streamer.getCurrentSectionOnly();
+  if (ConstantPool *CP = getConstantPool(Section))
+    CP->clearCache();
 }
 
 const MCExpr *AssemblerConstantPools::addEntry(MCStreamer &Streamer,

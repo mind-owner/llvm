@@ -1,9 +1,8 @@
 //===- BinaryStreamArray.h - Array backed by an arbitrary stream *- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -81,11 +80,11 @@ template <typename T> struct VarStreamArrayExtractor {
 ///       MyExtractor E(SomeContext);
 ///       VarStreamArray<MyType, MyExtractor> MyTypeArray3(E);
 ///
+
 template <typename ValueType, typename Extractor> class VarStreamArrayIterator;
 
 template <typename ValueType,
           typename Extractor = VarStreamArrayExtractor<ValueType>>
-
 class VarStreamArray {
   friend class VarStreamArrayIterator<ValueType, Extractor>;
 
@@ -93,28 +92,58 @@ public:
   typedef VarStreamArrayIterator<ValueType, Extractor> Iterator;
 
   VarStreamArray() = default;
+
   explicit VarStreamArray(const Extractor &E) : E(E) {}
 
-  explicit VarStreamArray(BinaryStreamRef Stream) : Stream(Stream) {}
-  VarStreamArray(BinaryStreamRef Stream, const Extractor &E)
-      : Stream(Stream), E(E) {}
+  explicit VarStreamArray(BinaryStreamRef Stream, uint32_t Skew = 0)
+      : Stream(Stream), Skew(Skew) {}
 
-  VarStreamArray(const VarStreamArray<ValueType, Extractor> &Other)
-      : Stream(Other.Stream), E(Other.E) {}
+  VarStreamArray(BinaryStreamRef Stream, const Extractor &E, uint32_t Skew = 0)
+      : Stream(Stream), E(E), Skew(Skew) {}
 
   Iterator begin(bool *HadError = nullptr) const {
-    return Iterator(*this, E, HadError);
+    return Iterator(*this, E, Skew, nullptr);
   }
 
+  bool valid() const { return Stream.valid(); }
+
+  uint32_t skew() const { return Skew; }
   Iterator end() const { return Iterator(E); }
 
+  bool empty() const { return Stream.getLength() == 0; }
+
+  VarStreamArray<ValueType, Extractor> substream(uint32_t Begin,
+                                                 uint32_t End) const {
+    assert(Begin >= Skew);
+    // We should never cut off the beginning of the stream since it might be
+    // skewed, meaning the initial bytes are important.
+    BinaryStreamRef NewStream = Stream.slice(0, End);
+    return {NewStream, E, Begin};
+  }
+
+  /// given an offset into the array's underlying stream, return an
+  /// iterator to the record at that offset.  This is considered unsafe
+  /// since the behavior is undefined if \p Offset does not refer to the
+  /// beginning of a valid record.
+  Iterator at(uint32_t Offset) const {
+    return Iterator(*this, E, Offset, nullptr);
+  }
+
   const Extractor &getExtractor() const { return E; }
+  Extractor &getExtractor() { return E; }
 
   BinaryStreamRef getUnderlyingStream() const { return Stream; }
+  void setUnderlyingStream(BinaryStreamRef S, uint32_t Skew = 0) {
+    Stream = S;
+    this->Skew = Skew;
+  }
+
+  void drop_front() { Skew += begin()->length(); }
 
 private:
   BinaryStreamRef Stream;
   Extractor E;
+  uint32_t Skew;
 };
 
 template <typename ValueType, typename Extractor>
@@ -126,8 +155,9 @@ class VarStreamArrayIterator
 
 public:
   VarStreamArrayIterator(const ArrayType &Array, const Extractor &E,
-                         bool *HadError = nullptr)
-      : IterRef(Array.Stream), Array(&Array), HadError(HadError), Extract(E) {
+                         uint32_t Offset, bool *HadError)
+      : IterRef(Array.Stream.drop_front(Offset)), Extract(E),
+        Array(&Array), AbsOffset(Offset), HadError(HadError) {
     if (IterRef.getLength() == 0)
       moveToEnd();
     else {
@@ -138,6 +168,7 @@ public:
       }
     }
   }
+
   VarStreamArrayIterator() = default;
   explicit VarStreamArrayIterator(const Extractor &E) : Extract(E) {}
   ~VarStreamArrayIterator() = default;
@@ -162,10 +193,16 @@ public:
     return ThisValue;
   }
 
+  ValueType &operator*() {
+    assert(Array && !HasError);
+    return ThisValue;
+  }
+
   IterType &operator+=(unsigned N) {
     for (unsigned I = 0; I < N; ++I) {
       // We are done with the current record, discard it so that we are
       // positioned at the next record.
+      AbsOffset += ThisLen;
       IterRef = IterRef.drop_front(ThisLen);
       if (IterRef.getLength() == 0) {
         // There is nothing after the current record, we must make this an end
@@ -186,6 +223,9 @@ public:
     return *this;
   }
 
+  uint32_t offset() const { return AbsOffset; }
+  uint32_t getRecordLength() const { return ThisLen; }
+
 private:
   void moveToEnd() {
     Array = nullptr;
@@ -200,11 +240,12 @@ private:
 
   ValueType ThisValue;
   BinaryStreamRef IterRef;
+  Extractor Extract;
   const ArrayType *Array{nullptr};
   uint32_t ThisLen{0};
+  uint32_t AbsOffset{0};
   bool HasError{false};
   bool *HadError{nullptr};
-  Extractor Extract;
 };
 
 template <typename T> class FixedStreamArrayIterator;
@@ -218,6 +259,8 @@ template <typename T> class FixedStreamArray {
   friend class FixedStreamArrayIterator<T>;
 
 public:
+  typedef FixedStreamArrayIterator<T> Iterator;
+
   FixedStreamArray() = default;
   explicit FixedStreamArray(BinaryStreamRef Stream) : Stream(Stream) {
     assert(Stream.getLength() % sizeof(T) == 0);
@@ -243,7 +286,7 @@ public:
       // an exact multiple of the element size.
       consumeError(std::move(EC));
     }
-    assert(llvm::alignmentAdjustment(Data.data(), alignof(T)) == 0);
+    assert(isAddrAligned(Align::Of<T>(), Data.data()));
     return *reinterpret_cast<const T *>(Data.data());
   }
 
@@ -259,6 +302,12 @@ public:
     return FixedStreamArrayIterator<T>(*this, size());
   }
 
+  const T &front() const { return *begin(); }
+  const T &back() const {
+    FixedStreamArrayIterator<T> I = end();
+    return *(--I);
+  }
+
   BinaryStreamRef getUnderlyingStream() const { return Stream; }
 
 private:
@@ -268,7 +317,7 @@ private:
 template <typename T>
 class FixedStreamArrayIterator
     : public iterator_facade_base<FixedStreamArrayIterator<T>,
-                                  std::random_access_iterator_tag, T> {
+                                  std::random_access_iterator_tag, const T> {
 
 public:
   FixedStreamArrayIterator(const FixedStreamArray<T> &Array, uint32_t Index)
@@ -282,6 +331,7 @@ public:
   }
 
   const T &operator*() const { return Array[Index]; }
+  const T &operator*() { return Array[Index]; }
 
   bool operator==(const FixedStreamArrayIterator<T> &R) const {
     assert(Array == R.Array);
@@ -294,7 +344,7 @@ public:
   }
 
   FixedStreamArrayIterator<T> &operator-=(std::ptrdiff_t N) {
-    assert(Index >= N);
+    assert(std::ptrdiff_t(Index) >= N);
     Index -= N;
     return *this;
   }

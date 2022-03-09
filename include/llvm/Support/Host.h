@@ -1,9 +1,8 @@
 //===- llvm/Support/Host.h - Host machine characteristics --------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,30 +14,11 @@
 #define LLVM_SUPPORT_HOST_H
 
 #include "llvm/ADT/StringMap.h"
-#include "llvm/Support/MemoryBuffer.h"
-
-#if defined(__linux__) || defined(__GNU__) || defined(__HAIKU__)
-#include <endian.h>
-#elif defined(_AIX)
-#include <sys/machine.h>
-#else
-#if !defined(BYTE_ORDER) && !defined(LLVM_ON_WIN32)
-#include <machine/endian.h>
-#endif
-#endif
 
 #include <string>
 
 namespace llvm {
 namespace sys {
-
-#if defined(BYTE_ORDER) && defined(BIG_ENDIAN) && BYTE_ORDER == BIG_ENDIAN
-constexpr bool IsBigEndianHost = true;
-#else
-constexpr bool IsBigEndianHost = false;
-#endif
-
-  static const bool IsLittleEndianHost = !IsBigEndianHost;
 
   /// getDefaultTargetTriple() - Return the default target triple the compiler
   /// has been configured to produce code for.
@@ -79,9 +59,10 @@ constexpr bool IsBigEndianHost = false;
 
   namespace detail {
   /// Helper functions to extract HostCPUName from /proc/cpuinfo on linux.
-  StringRef getHostCPUNameForPowerPC(const StringRef &ProcCpuinfoContent);
-  StringRef getHostCPUNameForARM(const StringRef &ProcCpuinfoContent);
-  StringRef getHostCPUNameForS390x(const StringRef &ProcCpuinfoContent);
+  StringRef getHostCPUNameForPowerPC(StringRef ProcCpuinfoContent);
+  StringRef getHostCPUNameForARM(StringRef ProcCpuinfoContent);
+  StringRef getHostCPUNameForS390x(StringRef ProcCpuinfoContent);
+  StringRef getHostCPUNameForBPF();
   }
 }
 }

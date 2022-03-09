@@ -1,9 +1,8 @@
 //===-- PPCAsmPrinter.cpp - Print machine instrs to PowerPC assembly ------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,19 +15,23 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PPC.h"
-#include "PPCInstrInfo.h"
-#include "InstPrinter/PPCInstPrinter.h"
+#include "MCTargetDesc/PPCInstPrinter.h"
 #include "MCTargetDesc/PPCMCExpr.h"
 #include "MCTargetDesc/PPCMCTargetDesc.h"
+#include "MCTargetDesc/PPCPredicates.h"
+#include "PPC.h"
+#include "PPCInstrInfo.h"
 #include "PPCMachineFunctionInfo.h"
 #include "PPCSubtarget.h"
 #include "PPCTargetMachine.h"
 #include "PPCTargetStreamer.h"
+#include "TargetInfo/PowerPCTargetInfo.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/BinaryFormat/ELF.h"
+#include "llvm/BinaryFormat/MachO.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -48,18 +51,18 @@
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCSectionMachO.h"
+#include "llvm/MC/MCSectionXCOFF.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/MCSymbolELF.h"
+#include "llvm/MC/MCSymbolXCOFF.h"
 #include "llvm/MC/SectionKind.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/ELF.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/MachO.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/TargetRegistry.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include <algorithm>
 #include <cassert>
@@ -75,7 +78,7 @@ namespace {
 
 class PPCAsmPrinter : public AsmPrinter {
 protected:
-  MapVector<MCSymbol *, MCSymbol *> TOC;
+  MapVector<const MCSymbol *, MCSymbol *> TOC;
   const PPCSubtarget *Subtarget;
   StackMaps SM;
 
@@ -86,7 +89,7 @@ public:
 
   StringRef getPassName() const override { return "PowerPC Assembly Printer"; }
 
-  MCSymbol *lookUpOrCreateTOCEntry(MCSymbol *Sym);
+  MCSymbol *lookUpOrCreateTOCEntry(const MCSymbol *Sym);
 
   bool doInitialization(Module &M) override {
     if (!TOC.empty())
@@ -94,84 +97,109 @@ public:
     return AsmPrinter::doInitialization(M);
   }
 
-    void EmitInstruction(const MachineInstr *MI) override;
+  void EmitInstruction(const MachineInstr *MI) override;
 
-    void printOperand(const MachineInstr *MI, unsigned OpNo, raw_ostream &O);
+  /// This function is for PrintAsmOperand and PrintAsmMemoryOperand,
+  /// invoked by EmitMSInlineAsmStr and EmitGCCInlineAsmStr only.
+  /// The \p MI would be INLINEASM ONLY.
+  void printOperand(const MachineInstr *MI, unsigned OpNo, raw_ostream &O);
 
-    bool PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
-                         unsigned AsmVariant, const char *ExtraCode,
-                         raw_ostream &O) override;
-    bool PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
-                               unsigned AsmVariant, const char *ExtraCode,
-                               raw_ostream &O) override;
+  void PrintSymbolOperand(const MachineOperand &MO, raw_ostream &O) override;
+  bool PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
+                       const char *ExtraCode, raw_ostream &O) override;
+  bool PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
+                             const char *ExtraCode, raw_ostream &O) override;
 
-    void EmitEndOfAsmFile(Module &M) override;
+  void EmitEndOfAsmFile(Module &M) override;
 
-    void LowerSTACKMAP(StackMaps &SM, const MachineInstr &MI);
-    void LowerPATCHPOINT(StackMaps &SM, const MachineInstr &MI);
-    void EmitTlsCall(const MachineInstr *MI, MCSymbolRefExpr::VariantKind VK);
-    bool runOnMachineFunction(MachineFunction &MF) override {
-      Subtarget = &MF.getSubtarget<PPCSubtarget>();
-      bool Changed = AsmPrinter::runOnMachineFunction(MF);
-      emitXRayTable();
-      return Changed;
-    }
-  };
+  void LowerSTACKMAP(StackMaps &SM, const MachineInstr &MI);
+  void LowerPATCHPOINT(StackMaps &SM, const MachineInstr &MI);
+  void EmitTlsCall(const MachineInstr *MI, MCSymbolRefExpr::VariantKind VK);
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    Subtarget = &MF.getSubtarget<PPCSubtarget>();
+    bool Changed = AsmPrinter::runOnMachineFunction(MF);
+    emitXRayTable();
+    return Changed;
+  }
+};
 
-  /// PPCLinuxAsmPrinter - PowerPC assembly printer, customized for Linux
-  class PPCLinuxAsmPrinter : public PPCAsmPrinter {
-  public:
-    explicit PPCLinuxAsmPrinter(TargetMachine &TM,
-                                std::unique_ptr<MCStreamer> Streamer)
-        : PPCAsmPrinter(TM, std::move(Streamer)) {}
+/// PPCLinuxAsmPrinter - PowerPC assembly printer, customized for Linux
+class PPCLinuxAsmPrinter : public PPCAsmPrinter {
+public:
+  explicit PPCLinuxAsmPrinter(TargetMachine &TM,
+                              std::unique_ptr<MCStreamer> Streamer)
+      : PPCAsmPrinter(TM, std::move(Streamer)) {}
 
-    StringRef getPassName() const override {
-      return "Linux PPC Assembly Printer";
-    }
+  StringRef getPassName() const override {
+    return "Linux PPC Assembly Printer";
+  }
 
-    bool doFinalization(Module &M) override;
-    void EmitStartOfAsmFile(Module &M) override;
+  bool doFinalization(Module &M) override;
+  void EmitStartOfAsmFile(Module &M) override;
 
-    void EmitFunctionEntryLabel() override;
+  void EmitFunctionEntryLabel() override;
 
-    void EmitFunctionBodyStart() override;
-    void EmitFunctionBodyEnd() override;
-    void EmitInstruction(const MachineInstr *MI) override;
-  };
+  void EmitFunctionBodyStart() override;
+  void EmitFunctionBodyEnd() override;
+  void EmitInstruction(const MachineInstr *MI) override;
+};
 
-  /// PPCDarwinAsmPrinter - PowerPC assembly printer, customized for Darwin/Mac
-  /// OS X
-  class PPCDarwinAsmPrinter : public PPCAsmPrinter {
-  public:
-    explicit PPCDarwinAsmPrinter(TargetMachine &TM,
-                                 std::unique_ptr<MCStreamer> Streamer)
-        : PPCAsmPrinter(TM, std::move(Streamer)) {}
+/// PPCDarwinAsmPrinter - PowerPC assembly printer, customized for Darwin/Mac
+/// OS X
+class PPCDarwinAsmPrinter : public PPCAsmPrinter {
+public:
+  explicit PPCDarwinAsmPrinter(TargetMachine &TM,
+                               std::unique_ptr<MCStreamer> Streamer)
+      : PPCAsmPrinter(TM, std::move(Streamer)) {}
 
-    StringRef getPassName() const override {
-      return "Darwin PPC Assembly Printer";
-    }
+  StringRef getPassName() const override {
+    return "Darwin PPC Assembly Printer";
+  }
 
-    bool doFinalization(Module &M) override;
-    void EmitStartOfAsmFile(Module &M) override;
-  };
+  bool doFinalization(Module &M) override;
+  void EmitStartOfAsmFile(Module &M) override;
+};
+
+class PPCAIXAsmPrinter : public PPCAsmPrinter {
+public:
+  PPCAIXAsmPrinter(TargetMachine &TM, std::unique_ptr<MCStreamer> Streamer)
+      : PPCAsmPrinter(TM, std::move(Streamer)) {}
+
+  StringRef getPassName() const override { return "AIX PPC Assembly Printer"; }
+
+  void SetupMachineFunction(MachineFunction &MF) override;
+
+  void EmitGlobalVariable(const GlobalVariable *GV) override;
+
+  void EmitFunctionDescriptor() override;
+
+  void EmitEndOfAsmFile(Module &) override;
+};
 
 } // end anonymous namespace
 
-/// stripRegisterPrefix - This method strips the character prefix from a
-/// register name so that only the number is left.  Used by for linux asm.
-static const char *stripRegisterPrefix(const char *RegName) {
-  switch (RegName[0]) {
-    case 'r':
-    case 'f':
-    case 'q': // for QPX
-    case 'v':
-      if (RegName[1] == 's')
-        return RegName + 2;
-      return RegName + 1;
-    case 'c': if (RegName[1] == 'r') return RegName + 2;
+void PPCAsmPrinter::PrintSymbolOperand(const MachineOperand &MO,
+                                       raw_ostream &O) {
+  // Computing the address of a global symbol, not calling it.
+  const GlobalValue *GV = MO.getGlobal();
+  MCSymbol *SymToPrint;
+
+  // External or weakly linked global variables need non-lazily-resolved stubs
+  if (Subtarget->hasLazyResolverStub(GV)) {
+    SymToPrint = getSymbolWithGlobalValueBase(GV, "$non_lazy_ptr");
+    MachineModuleInfoImpl::StubValueTy &StubSym =
+        MMI->getObjFileInfo<MachineModuleInfoMachO>().getGVStubEntry(
+            SymToPrint);
+    if (!StubSym.getPointer())
+      StubSym = MachineModuleInfoImpl::StubValueTy(getSymbol(GV),
+                                                   !GV->hasInternalLinkage());
+  } else {
+    SymToPrint = getSymbol(GV);
   }
 
-  return RegName;
+  SymToPrint->print(O, MAI);
+
+  printOffset(MO.getOffset(), O);
 }
 
 void PPCAsmPrinter::printOperand(const MachineInstr *MI, unsigned OpNo,
@@ -181,27 +209,13 @@ void PPCAsmPrinter::printOperand(const MachineInstr *MI, unsigned OpNo,
 
   switch (MO.getType()) {
   case MachineOperand::MO_Register: {
-    unsigned Reg = MO.getReg();
-
-    // There are VSX instructions that use VSX register numbering (vs0 - vs63)
-    // as well as those that use VMX register numbering (v0 - v31 which
-    // correspond to vs32 - vs63). If we have an instruction that uses VSX
-    // numbering, we need to convert the VMX registers to VSX registers.
-    // Namely, we print 32-63 when the instruction operates on one of the
-    // VMX registers.
-    // (Please synchronize with PPCInstPrinter::printOperand)
-    if (MI->getDesc().TSFlags & PPCII::UseVSXReg) {
-      if (PPCInstrInfo::isVRRegister(Reg))
-        Reg = PPC::VSX32 + (Reg - PPC::V0);
-      else if (PPCInstrInfo::isVFRegister(Reg))
-        Reg = PPC::VSX32 + (Reg - PPC::VF0);
-    }
-    const char *RegName = PPCInstPrinter::getRegisterName(Reg);
+    // The MI is INLINEASM ONLY and UseVSXReg is always false.
+    const char *RegName = PPCInstPrinter::getRegisterName(MO.getReg());
 
     // Linux assembler (Others?) does not take register mnemonics.
     // FIXME - What about special registers used in mfspr/mtspr?
     if (!Subtarget->isDarwin())
-      RegName = stripRegisterPrefix(RegName);
+      RegName = PPCRegisterInfo::stripRegisterPrefix(RegName);
     O << RegName;
     return;
   }
@@ -220,26 +234,7 @@ void PPCAsmPrinter::printOperand(const MachineInstr *MI, unsigned OpNo,
     GetBlockAddressSymbol(MO.getBlockAddress())->print(O, MAI);
     return;
   case MachineOperand::MO_GlobalAddress: {
-    // Computing the address of a global symbol, not calling it.
-    const GlobalValue *GV = MO.getGlobal();
-    MCSymbol *SymToPrint;
-
-    // External or weakly linked global variables need non-lazily-resolved stubs
-    if (Subtarget->hasLazyResolverStub(GV)) {
-      SymToPrint = getSymbolWithGlobalValueBase(GV, "$non_lazy_ptr");
-      MachineModuleInfoImpl::StubValueTy &StubSym =
-          MMI->getObjFileInfo<MachineModuleInfoMachO>().getGVStubEntry(
-              SymToPrint);
-      if (!StubSym.getPointer())
-        StubSym = MachineModuleInfoImpl::StubValueTy(getSymbol(GV),
-                                                     !GV->hasInternalLinkage());
-    } else {
-      SymToPrint = getSymbol(GV);
-    }
-
-    SymToPrint->print(O, MAI);
-
-    printOffset(MO.getOffset(), O);
+    PrintSymbolOperand(MO, O);
     return;
   }
 
@@ -252,7 +247,6 @@ void PPCAsmPrinter::printOperand(const MachineInstr *MI, unsigned OpNo,
 /// PrintAsmOperand - Print out an operand for an inline asm expression.
 ///
 bool PPCAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
-                                    unsigned AsmVariant,
                                     const char *ExtraCode, raw_ostream &O) {
   // Does this asm operand have a single letter operand modifier?
   if (ExtraCode && ExtraCode[0]) {
@@ -261,9 +255,7 @@ bool PPCAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
     switch (ExtraCode[0]) {
     default:
       // See if this is a generic print operand
-      return AsmPrinter::PrintAsmOperand(MI, OpNo, AsmVariant, ExtraCode, O);
-    case 'c': // Don't print "$" before a global var name or constant.
-      break; // PPC never has a prefix.
+      return AsmPrinter::PrintAsmOperand(MI, OpNo, ExtraCode, O);
     case 'L': // Write second word of DImode reference.
       // Verify that this operand has two consecutive registers.
       if (!MI->getOperand(OpNo).isReg() ||
@@ -278,6 +270,21 @@ bool PPCAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
       if (MI->getOperand(OpNo).isImm())
         O << "i";
       return false;
+    case 'x':
+      if(!MI->getOperand(OpNo).isReg())
+        return true;
+      // This operand uses VSX numbering.
+      // If the operand is a VMX register, convert it to a VSX register.
+      Register Reg = MI->getOperand(OpNo).getReg();
+      if (PPCInstrInfo::isVRRegister(Reg))
+        Reg = PPC::VSX32 + (Reg - PPC::V0);
+      else if (PPCInstrInfo::isVFRegister(Reg))
+        Reg = PPC::VSX32 + (Reg - PPC::VF0);
+      const char *RegName;
+      RegName = PPCInstPrinter::getRegisterName(Reg);
+      RegName = PPCRegisterInfo::stripRegisterPrefix(RegName);
+      O << RegName;
+      return false;
     }
   }
 
@@ -290,7 +297,6 @@ bool PPCAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
 // assembler operand.
 
 bool PPCAsmPrinter::PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
-                                          unsigned AsmVariant,
                                           const char *ExtraCode,
                                           raw_ostream &O) {
   if (ExtraCode && ExtraCode[0]) {
@@ -302,7 +308,7 @@ bool PPCAsmPrinter::PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
       {
         const char *RegName = "r0";
         if (!Subtarget->isDarwin())
-          RegName = stripRegisterPrefix(RegName);
+          RegName = PPCRegisterInfo::stripRegisterPrefix(RegName);
         O << RegName << ", ";
         printOperand(MI, OpNo, O);
         return false;
@@ -332,7 +338,7 @@ bool PPCAsmPrinter::PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
 /// lookUpOrCreateTOCEntry -- Given a symbol, look up whether a TOC entry
 /// exists for it.  If not, create one.  Then return a symbol that references
 /// the TOC entry.
-MCSymbol *PPCAsmPrinter::lookUpOrCreateTOCEntry(MCSymbol *Sym) {
+MCSymbol *PPCAsmPrinter::lookUpOrCreateTOCEntry(const MCSymbol *Sym) {
   MCSymbol *&TOCEntry = TOC[Sym];
   if (!TOCEntry)
     TOCEntry = createTempSymbol("C");
@@ -340,7 +346,7 @@ MCSymbol *PPCAsmPrinter::lookUpOrCreateTOCEntry(MCSymbol *Sym) {
 }
 
 void PPCAsmPrinter::EmitEndOfAsmFile(Module &M) {
-  SM.serializeToStackMapSection();
+  emitStackMaps(SM);
 }
 
 void PPCAsmPrinter::LowerSTACKMAP(StackMaps &SM, const MachineInstr &MI) {
@@ -382,7 +388,7 @@ void PPCAsmPrinter::LowerPATCHPOINT(StackMaps &SM, const MachineInstr &MI) {
     if (CallTarget) {
       assert((CallTarget & 0xFFFFFFFFFFFF) == CallTarget &&
              "High 16 bits of call target should be zero.");
-      unsigned ScratchReg = MI.getOperand(Opers.getNextScratchIdx()).getReg();
+      Register ScratchReg = MI.getOperand(Opers.getNextScratchIdx()).getReg();
       EncodedBytes = 0;
       // Materialize the jump address:
       EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::LI8)
@@ -473,6 +479,7 @@ void PPCAsmPrinter::EmitTlsCall(const MachineInstr *MI,
   StringRef Name = "__tls_get_addr";
   MCSymbol *TlsGetAddr = OutContext.getOrCreateSymbol(Name);
   MCSymbolRefExpr::VariantKind Kind = MCSymbolRefExpr::VK_None;
+  const Module *M = MF->getFunction().getParent();
 
   assert(MI->getOperand(0).isReg() &&
          ((Subtarget->isPPC64() && MI->getOperand(0).getReg() == PPC::X3) ||
@@ -486,8 +493,14 @@ void PPCAsmPrinter::EmitTlsCall(const MachineInstr *MI,
   if (!Subtarget->isPPC64() && !Subtarget->isDarwin() &&
       isPositionIndependent())
     Kind = MCSymbolRefExpr::VK_PLT;
-  const MCSymbolRefExpr *TlsRef =
+  const MCExpr *TlsRef =
     MCSymbolRefExpr::create(TlsGetAddr, Kind, OutContext);
+
+  // Add 32768 offset to the symbol so we follow up the latest GOT/PLT ABI.
+  if (Kind == MCSymbolRefExpr::VK_PLT && Subtarget->isSecurePlt() &&
+      M->getPICLevel() == PICLevel::BigPIC)
+    TlsRef = MCBinaryExpr::createAdd(
+        TlsRef, MCConstantExpr::create(32768, OutContext), OutContext);
   const MachineOperand &MO = MI->getOperand(2);
   const GlobalValue *GValue = MO.getGlobal();
   MCSymbol *MOSymbol = getSymbol(GValue);
@@ -499,16 +512,61 @@ void PPCAsmPrinter::EmitTlsCall(const MachineInstr *MI,
                  .addExpr(SymVar));
 }
 
+/// Map a machine operand for a TOC pseudo-machine instruction to its
+/// corresponding MCSymbol.
+static MCSymbol *getMCSymbolForTOCPseudoMO(const MachineOperand &MO,
+                                           AsmPrinter &AP) {
+  switch (MO.getType()) {
+  case MachineOperand::MO_GlobalAddress:
+    return AP.getSymbol(MO.getGlobal());
+  case MachineOperand::MO_ConstantPoolIndex:
+    return AP.GetCPISymbol(MO.getIndex());
+  case MachineOperand::MO_JumpTableIndex:
+    return AP.GetJTISymbol(MO.getIndex());
+  case MachineOperand::MO_BlockAddress:
+    return AP.GetBlockAddressSymbol(MO.getBlockAddress());
+  default:
+    llvm_unreachable("Unexpected operand type to get symbol.");
+  }
+}
+
 /// EmitInstruction -- Print out a single PowerPC MI in Darwin syntax to
 /// the current output stream.
 ///
 void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
   MCInst TmpInst;
-  bool isPPC64 = Subtarget->isPPC64();
-  bool isDarwin = TM.getTargetTriple().isOSDarwin();
-  const Module *M = MF->getFunction()->getParent();
+  const bool IsDarwin = TM.getTargetTriple().isOSDarwin();
+  const bool IsPPC64 = Subtarget->isPPC64();
+  const bool IsAIX = Subtarget->isAIXABI();
+  const Module *M = MF->getFunction().getParent();
   PICLevel::Level PL = M->getPICLevel();
 
+#ifndef NDEBUG
+  // Validate that SPE and FPU are mutually exclusive in codegen
+  if (!MI->isInlineAsm()) {
+    for (const MachineOperand &MO: MI->operands()) {
+      if (MO.isReg()) {
+        Register Reg = MO.getReg();
+        if (Subtarget->hasSPE()) {
+          if (PPC::F4RCRegClass.contains(Reg) ||
+              PPC::F8RCRegClass.contains(Reg) ||
+              PPC::QBRCRegClass.contains(Reg) ||
+              PPC::QFRCRegClass.contains(Reg) ||
+              PPC::QSRCRegClass.contains(Reg) ||
+              PPC::VFRCRegClass.contains(Reg) ||
+              PPC::VRRCRegClass.contains(Reg) ||
+              PPC::VSFRCRegClass.contains(Reg) ||
+              PPC::VSSRCRegClass.contains(Reg)
+              )
+            llvm_unreachable("SPE targets cannot have FPRegs!");
+        } else {
+          if (PPC::SPERCRegClass.contains(Reg))
+            llvm_unreachable("SPE register found in FPU-targeted code!");
+        }
+      }
+    }
+  }
+#endif
   // Lower multi-instruction pseudo operations.
   switch (MI->getOpcode()) {
   default: break;
@@ -520,7 +578,7 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     return LowerPATCHPOINT(SM, *MI);
 
   case PPC::MoveGOTtoLR: {
-    // Transform %LR = MoveGOTtoLR
+    // Transform %lr = MoveGOTtoLR
     // Into this: bl _GLOBAL_OFFSET_TABLE_@local-4
     // _GLOBAL_OFFSET_TABLE_@local-4 (instruction preceding
     // _GLOBAL_OFFSET_TABLE_) has exactly one instruction:
@@ -541,7 +599,7 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
   }
   case PPC::MovePCtoLR:
   case PPC::MovePCtoLR8: {
-    // Transform %LR = MovePCtoLR
+    // Transform %lr = MovePCtoLR
     // Into this, where the label is the PIC base:
     //     bl L1$pb
     // L1$pb:
@@ -559,75 +617,115 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     return;
   }
   case PPC::UpdateGBR: {
-    // Transform %Rd = UpdateGBR(%Rt, %Ri)
-    // Into: lwz %Rt, .L0$poff - .L0$pb(%Ri)
-    //       add %Rd, %Rt, %Ri
+    // Transform %rd = UpdateGBR(%rt, %ri)
+    // Into: lwz %rt, .L0$poff - .L0$pb(%ri)
+    //       add %rd, %rt, %ri
+    // or into (if secure plt mode is on):
+    //       addis r30, r30, {.LTOC,_GLOBAL_OFFSET_TABLE} - .L0$pb@ha
+    //       addi r30, r30, {.LTOC,_GLOBAL_OFFSET_TABLE} - .L0$pb@l
     // Get the offset from the GOT Base Register to the GOT
-    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, isDarwin);
-    MCSymbol *PICOffset =
-      MF->getInfo<PPCFunctionInfo>()->getPICOffsetSymbol();
-    TmpInst.setOpcode(PPC::LWZ);
-    const MCExpr *Exp =
-      MCSymbolRefExpr::create(PICOffset, MCSymbolRefExpr::VK_None, OutContext);
-    const MCExpr *PB =
-      MCSymbolRefExpr::create(MF->getPICBaseSymbol(),
-                              MCSymbolRefExpr::VK_None,
-                              OutContext);
-    const MCOperand TR = TmpInst.getOperand(1);
-    const MCOperand PICR = TmpInst.getOperand(0);
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
+    if (Subtarget->isSecurePlt() && isPositionIndependent() ) {
+      unsigned PICR = TmpInst.getOperand(0).getReg();
+      MCSymbol *BaseSymbol = OutContext.getOrCreateSymbol(
+          M->getPICLevel() == PICLevel::SmallPIC ? "_GLOBAL_OFFSET_TABLE_"
+                                                 : ".LTOC");
+      const MCExpr *PB =
+          MCSymbolRefExpr::create(MF->getPICBaseSymbol(), OutContext);
 
-    // Step 1: lwz %Rt, .L$poff - .L$pb(%Ri)
-    TmpInst.getOperand(1) =
-        MCOperand::createExpr(MCBinaryExpr::createSub(Exp, PB, OutContext));
-    TmpInst.getOperand(0) = TR;
-    TmpInst.getOperand(2) = PICR;
-    EmitToStreamer(*OutStreamer, TmpInst);
+      const MCExpr *DeltaExpr = MCBinaryExpr::createSub(
+          MCSymbolRefExpr::create(BaseSymbol, OutContext), PB, OutContext);
 
-    TmpInst.setOpcode(PPC::ADD4);
-    TmpInst.getOperand(0) = PICR;
-    TmpInst.getOperand(1) = TR;
-    TmpInst.getOperand(2) = PICR;
-    EmitToStreamer(*OutStreamer, TmpInst);
-    return;
+      const MCExpr *DeltaHi = PPCMCExpr::createHa(DeltaExpr, false, OutContext);
+      EmitToStreamer(
+          *OutStreamer,
+          MCInstBuilder(PPC::ADDIS).addReg(PICR).addReg(PICR).addExpr(DeltaHi));
+
+      const MCExpr *DeltaLo = PPCMCExpr::createLo(DeltaExpr, false, OutContext);
+      EmitToStreamer(
+          *OutStreamer,
+          MCInstBuilder(PPC::ADDI).addReg(PICR).addReg(PICR).addExpr(DeltaLo));
+      return;
+    } else {
+      MCSymbol *PICOffset =
+        MF->getInfo<PPCFunctionInfo>()->getPICOffsetSymbol();
+      TmpInst.setOpcode(PPC::LWZ);
+      const MCExpr *Exp =
+        MCSymbolRefExpr::create(PICOffset, MCSymbolRefExpr::VK_None, OutContext);
+      const MCExpr *PB =
+        MCSymbolRefExpr::create(MF->getPICBaseSymbol(),
+                                MCSymbolRefExpr::VK_None,
+                                OutContext);
+      const MCOperand TR = TmpInst.getOperand(1);
+      const MCOperand PICR = TmpInst.getOperand(0);
+
+      // Step 1: lwz %rt, .L$poff - .L$pb(%ri)
+      TmpInst.getOperand(1) =
+          MCOperand::createExpr(MCBinaryExpr::createSub(Exp, PB, OutContext));
+      TmpInst.getOperand(0) = TR;
+      TmpInst.getOperand(2) = PICR;
+      EmitToStreamer(*OutStreamer, TmpInst);
+
+      TmpInst.setOpcode(PPC::ADD4);
+      TmpInst.getOperand(0) = PICR;
+      TmpInst.getOperand(1) = TR;
+      TmpInst.getOperand(2) = PICR;
+      EmitToStreamer(*OutStreamer, TmpInst);
+      return;
+    }
   }
   case PPC::LWZtoc: {
-    // Transform %R3 = LWZtoc <ga:@min1>, %R2
-    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, isDarwin);
+    assert(!IsDarwin && "TOC is an ELF/XCOFF construct.");
 
-    // Change the opcode to LWZ, and the global address operand to be a
-    // reference to the GOT entry we will synthesize later.
+    // Transform %rN = LWZtoc @op1, %r2
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
+
+    // Change the opcode to LWZ.
     TmpInst.setOpcode(PPC::LWZ);
+
     const MachineOperand &MO = MI->getOperand(1);
+    assert((MO.isGlobal() || MO.isCPI() || MO.isJTI() || MO.isBlockAddress()) &&
+           "Invalid operand for LWZtoc.");
 
-    // Map symbol -> label of TOC entry
-    assert(MO.isGlobal() || MO.isCPI() || MO.isJTI() || MO.isBlockAddress());
-    MCSymbol *MOSymbol = nullptr;
-    if (MO.isGlobal())
-      MOSymbol = getSymbol(MO.getGlobal());
-    else if (MO.isCPI())
-      MOSymbol = GetCPISymbol(MO.getIndex());
-    else if (MO.isJTI())
-      MOSymbol = GetJTISymbol(MO.getIndex());
-    else if (MO.isBlockAddress())
-      MOSymbol = GetBlockAddressSymbol(MO.getBlockAddress());
+    // Map the operand to its corresponding MCSymbol.
+    const MCSymbol *const MOSymbol = getMCSymbolForTOCPseudoMO(MO, *this);
 
-    if (PL == PICLevel::SmallPIC) {
+    // Create a reference to the GOT entry for the symbol. The GOT entry will be
+    // synthesized later.
+    if (PL == PICLevel::SmallPIC && !IsAIX) {
       const MCExpr *Exp =
         MCSymbolRefExpr::create(MOSymbol, MCSymbolRefExpr::VK_GOT,
                                 OutContext);
       TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
-    } else {
-      MCSymbol *TOCEntry = lookUpOrCreateTOCEntry(MOSymbol);
-
-      const MCExpr *Exp =
-        MCSymbolRefExpr::create(TOCEntry, MCSymbolRefExpr::VK_None,
-                                OutContext);
-      const MCExpr *PB =
-        MCSymbolRefExpr::create(OutContext.getOrCreateSymbol(Twine(".LTOC")),
-                                                             OutContext);
-      Exp = MCBinaryExpr::createSub(Exp, PB, OutContext);
-      TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
+      EmitToStreamer(*OutStreamer, TmpInst);
+      return;
     }
+
+    // Otherwise, use the TOC. 'TOCEntry' is a label used to reference the
+    // storage allocated in the TOC which contains the address of
+    // 'MOSymbol'. Said TOC entry will be synthesized later.
+    MCSymbol *TOCEntry = lookUpOrCreateTOCEntry(MOSymbol);
+    const MCExpr *Exp =
+        MCSymbolRefExpr::create(TOCEntry, MCSymbolRefExpr::VK_None, OutContext);
+
+    // AIX uses the label directly as the lwz displacement operand for
+    // references into the toc section. The displacement value will be generated
+    // relative to the toc-base.
+    if (IsAIX) {
+      assert(
+          TM.getCodeModel() == CodeModel::Small &&
+          "This pseudo should only be selected for 32-bit small code model.");
+      TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
+      EmitToStreamer(*OutStreamer, TmpInst);
+      return;
+    }
+
+    // Create an explicit subtract expression between the local symbol and
+    // '.LTOC' to manifest the toc-relative offset.
+    const MCExpr *PB = MCSymbolRefExpr::create(
+        OutContext.getOrCreateSymbol(Twine(".LTOC")), OutContext);
+    Exp = MCBinaryExpr::createSub(Exp, PB, OutContext);
+    TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
     EmitToStreamer(*OutStreamer, TmpInst);
     return;
   }
@@ -635,72 +733,121 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
   case PPC::LDtocCPT:
   case PPC::LDtocBA:
   case PPC::LDtoc: {
-    // Transform %X3 = LDtoc <ga:@min1>, %X2
-    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, isDarwin);
+    assert(!IsDarwin && "TOC is an ELF/XCOFF construct");
 
-    // Change the opcode to LD, and the global address operand to be a
-    // reference to the TOC entry we will synthesize later.
+    // Transform %x3 = LDtoc @min1, %x2
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
+
+    // Change the opcode to LD.
     TmpInst.setOpcode(PPC::LD);
+
     const MachineOperand &MO = MI->getOperand(1);
+    assert((MO.isGlobal() || MO.isCPI() || MO.isJTI() || MO.isBlockAddress()) &&
+           "Invalid operand!");
 
-    // Map symbol -> label of TOC entry
-    assert(MO.isGlobal() || MO.isCPI() || MO.isJTI() || MO.isBlockAddress());
-    MCSymbol *MOSymbol = nullptr;
-    if (MO.isGlobal())
-      MOSymbol = getSymbol(MO.getGlobal());
-    else if (MO.isCPI())
-      MOSymbol = GetCPISymbol(MO.getIndex());
-    else if (MO.isJTI())
-      MOSymbol = GetJTISymbol(MO.getIndex());
-    else if (MO.isBlockAddress())
-      MOSymbol = GetBlockAddressSymbol(MO.getBlockAddress());
+    // Map the machine operand to its corresponding MCSymbol, then map the
+    // global address operand to be a reference to the TOC entry we will
+    // synthesize later.
+    MCSymbol *TOCEntry =
+        lookUpOrCreateTOCEntry(getMCSymbolForTOCPseudoMO(MO, *this));
 
-    MCSymbol *TOCEntry = lookUpOrCreateTOCEntry(MOSymbol);
-
+    const MCSymbolRefExpr::VariantKind VK =
+        IsAIX ? MCSymbolRefExpr::VK_None : MCSymbolRefExpr::VK_PPC_TOC;
     const MCExpr *Exp =
-      MCSymbolRefExpr::create(TOCEntry, MCSymbolRefExpr::VK_PPC_TOC,
-                              OutContext);
+        MCSymbolRefExpr::create(TOCEntry, VK, OutContext);
     TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
     EmitToStreamer(*OutStreamer, TmpInst);
     return;
   }
-
   case PPC::ADDIStocHA: {
-    // Transform %Xd = ADDIStocHA %X2, <ga:@sym>
-    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, isDarwin);
+    assert((IsAIX && !IsPPC64 && TM.getCodeModel() == CodeModel::Large) &&
+           "This pseudo should only be selected for 32-bit large code model on"
+           " AIX.");
 
-    // Change the opcode to ADDIS8.  If the global address is external, has
-    // common linkage, is a non-local function address, or is a jump table
-    // address, then generate a TOC entry and reference that.  Otherwise
-    // reference the symbol directly.
-    TmpInst.setOpcode(PPC::ADDIS8);
+    // Transform %rd = ADDIStocHA %rA, @sym(%r2)
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
+
+    // Change the opcode to ADDIS.
+    TmpInst.setOpcode(PPC::ADDIS);
+
     const MachineOperand &MO = MI->getOperand(2);
-    assert((MO.isGlobal() || MO.isCPI() || MO.isJTI() ||
-            MO.isBlockAddress()) &&
-           "Invalid operand for ADDIStocHA!");
-    MCSymbol *MOSymbol = nullptr;
-    bool GlobalToc = false;
+    assert((MO.isGlobal() || MO.isCPI() || MO.isJTI() || MO.isBlockAddress()) &&
+           "Invalid operand for ADDIStocHA.");
 
-    if (MO.isGlobal()) {
-      const GlobalValue *GV = MO.getGlobal();
-      MOSymbol = getSymbol(GV);
-      unsigned char GVFlags = Subtarget->classifyGlobalReference(GV);
-      GlobalToc = (GVFlags & PPCII::MO_NLP_FLAG);
-    } else if (MO.isCPI()) {
-      MOSymbol = GetCPISymbol(MO.getIndex());
-    } else if (MO.isJTI()) {
-      MOSymbol = GetJTISymbol(MO.getIndex());
-    } else if (MO.isBlockAddress()) {
-      MOSymbol = GetBlockAddressSymbol(MO.getBlockAddress());
-    }
+    // Map the machine operand to its corresponding MCSymbol.
+    MCSymbol *MOSymbol = getMCSymbolForTOCPseudoMO(MO, *this);
 
+    // Always use TOC on AIX. Map the global address operand to be a reference
+    // to the TOC entry we will synthesize later. 'TOCEntry' is a label used to
+    // reference the storage allocated in the TOC which contains the address of
+    // 'MOSymbol'.
+    MCSymbol *TOCEntry = lookUpOrCreateTOCEntry(MOSymbol);
+    const MCExpr *Exp = MCSymbolRefExpr::create(TOCEntry,
+                                                MCSymbolRefExpr::VK_PPC_U,
+                                                OutContext);
+    TmpInst.getOperand(2) = MCOperand::createExpr(Exp);
+    EmitToStreamer(*OutStreamer, TmpInst);
+    return;
+  }
+  case PPC::LWZtocL: {
+    assert(IsAIX && !IsPPC64 && TM.getCodeModel() == CodeModel::Large &&
+           "This pseudo should only be selected for 32-bit large code model on"
+           " AIX.");
+
+    // Transform %rd = LWZtocL @sym, %rs.
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
+
+    // Change the opcode to lwz.
+    TmpInst.setOpcode(PPC::LWZ);
+
+    const MachineOperand &MO = MI->getOperand(1);
+    assert((MO.isGlobal() || MO.isCPI() || MO.isJTI() || MO.isBlockAddress()) &&
+           "Invalid operand for LWZtocL.");
+
+    // Map the machine operand to its corresponding MCSymbol.
+    MCSymbol *MOSymbol = getMCSymbolForTOCPseudoMO(MO, *this);
+
+    // Always use TOC on AIX. Map the global address operand to be a reference
+    // to the TOC entry we will synthesize later. 'TOCEntry' is a label used to
+    // reference the storage allocated in the TOC which contains the address of
+    // 'MOSymbol'.
+    MCSymbol *TOCEntry = lookUpOrCreateTOCEntry(MOSymbol);
+    const MCExpr *Exp = MCSymbolRefExpr::create(TOCEntry,
+                                                MCSymbolRefExpr::VK_PPC_L,
+                                                OutContext);
+    TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
+    EmitToStreamer(*OutStreamer, TmpInst);
+    return;
+  }
+  case PPC::ADDIStocHA8: {
+    assert(!IsDarwin && "TOC is an ELF/XCOFF construct");
+
+    // Transform %xd = ADDIStocHA8 %x2, @sym
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
+
+    // Change the opcode to ADDIS8. If the global address is the address of
+    // an external symbol, is a jump table address, is a block address, or is a
+    // constant pool index with large code model enabled, then generate a TOC
+    // entry and reference that. Otherwise, reference the symbol directly.
+    TmpInst.setOpcode(PPC::ADDIS8);
+
+    const MachineOperand &MO = MI->getOperand(2);
+    assert((MO.isGlobal() || MO.isCPI() || MO.isJTI() || MO.isBlockAddress()) &&
+           "Invalid operand for ADDIStocHA8!");
+
+    const MCSymbol *MOSymbol = getMCSymbolForTOCPseudoMO(MO, *this);
+
+    const bool GlobalToc =
+        MO.isGlobal() && Subtarget->isGVIndirectSymbol(MO.getGlobal());
     if (GlobalToc || MO.isJTI() || MO.isBlockAddress() ||
-        TM.getCodeModel() == CodeModel::Large)
+        (MO.isCPI() && TM.getCodeModel() == CodeModel::Large))
       MOSymbol = lookUpOrCreateTOCEntry(MOSymbol);
 
+    const MCSymbolRefExpr::VariantKind VK =
+        IsAIX ? MCSymbolRefExpr::VK_PPC_U : MCSymbolRefExpr::VK_PPC_TOC_HA;
+
     const MCExpr *Exp =
-      MCSymbolRefExpr::create(MOSymbol, MCSymbolRefExpr::VK_PPC_TOC_HA,
-                              OutContext);
+        MCSymbolRefExpr::create(MOSymbol, VK, OutContext);
 
     if (!MO.isJTI() && MO.getOffset())
       Exp = MCBinaryExpr::createAdd(Exp,
@@ -713,89 +860,73 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     return;
   }
   case PPC::LDtocL: {
-    // Transform %Xd = LDtocL <ga:@sym>, %Xs
-    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, isDarwin);
+    assert(!IsDarwin && "TOC is an ELF/XCOFF construct");
 
-    // Change the opcode to LD.  If the global address is external, has
-    // common linkage, or is a jump table address, then reference the
-    // associated TOC entry.  Otherwise reference the symbol directly.
+    // Transform %xd = LDtocL @sym, %xs
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
+
+    // Change the opcode to LD. If the global address is the address of
+    // an external symbol, is a jump table address, is a block address, or is
+    // a constant pool index with large code model enabled, then generate a
+    // TOC entry and reference that. Otherwise, reference the symbol directly.
     TmpInst.setOpcode(PPC::LD);
+
     const MachineOperand &MO = MI->getOperand(1);
     assert((MO.isGlobal() || MO.isCPI() || MO.isJTI() ||
             MO.isBlockAddress()) &&
            "Invalid operand for LDtocL!");
-    MCSymbol *MOSymbol = nullptr;
 
-    if (MO.isJTI())
-      MOSymbol = lookUpOrCreateTOCEntry(GetJTISymbol(MO.getIndex()));
-    else if (MO.isBlockAddress()) {
-      MOSymbol = GetBlockAddressSymbol(MO.getBlockAddress());
-      MOSymbol = lookUpOrCreateTOCEntry(MOSymbol);
-    }
-    else if (MO.isCPI()) {
-      MOSymbol = GetCPISymbol(MO.getIndex());
-      if (TM.getCodeModel() == CodeModel::Large)
-        MOSymbol = lookUpOrCreateTOCEntry(MOSymbol);
-    }
-    else if (MO.isGlobal()) {
-      const GlobalValue *GV = MO.getGlobal();
-      MOSymbol = getSymbol(GV);
-      DEBUG(
-        unsigned char GVFlags = Subtarget->classifyGlobalReference(GV);
-        assert((GVFlags & PPCII::MO_NLP_FLAG) &&
-               "LDtocL used on symbol that could be accessed directly is "
-               "invalid. Must match ADDIStocHA."));
-      MOSymbol = lookUpOrCreateTOCEntry(MOSymbol);
-    }
+    LLVM_DEBUG(assert(
+        (!MO.isGlobal() || Subtarget->isGVIndirectSymbol(MO.getGlobal())) &&
+        "LDtocL used on symbol that could be accessed directly is "
+        "invalid. Must match ADDIStocHA8."));
 
+    const MCSymbol *MOSymbol = getMCSymbolForTOCPseudoMO(MO, *this);
+
+    if (!MO.isCPI() || TM.getCodeModel() == CodeModel::Large)
+      MOSymbol = lookUpOrCreateTOCEntry(MOSymbol);
+
+    const MCSymbolRefExpr::VariantKind VK =
+        IsAIX ? MCSymbolRefExpr::VK_PPC_L : MCSymbolRefExpr::VK_PPC_TOC_LO;
     const MCExpr *Exp =
-      MCSymbolRefExpr::create(MOSymbol, MCSymbolRefExpr::VK_PPC_TOC_LO,
-                              OutContext);
+        MCSymbolRefExpr::create(MOSymbol, VK, OutContext);
     TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
     EmitToStreamer(*OutStreamer, TmpInst);
     return;
   }
   case PPC::ADDItocL: {
-    // Transform %Xd = ADDItocL %Xs, <ga:@sym>
-    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, isDarwin);
+    // Transform %xd = ADDItocL %xs, @sym
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
 
-    // Change the opcode to ADDI8.  If the global address is external, then
-    // generate a TOC entry and reference that.  Otherwise reference the
+    // Change the opcode to ADDI8. If the global address is external, then
+    // generate a TOC entry and reference that. Otherwise, reference the
     // symbol directly.
     TmpInst.setOpcode(PPC::ADDI8);
-    const MachineOperand &MO = MI->getOperand(2);
-    assert((MO.isGlobal() || MO.isCPI()) && "Invalid operand for ADDItocL");
-    MCSymbol *MOSymbol = nullptr;
 
-    if (MO.isGlobal()) {
-      const GlobalValue *GV = MO.getGlobal();
-      DEBUG(
-        unsigned char GVFlags = Subtarget->classifyGlobalReference(GV);
-        assert (
-            !(GVFlags & PPCII::MO_NLP_FLAG) &&
-            "Interposable definitions must use indirect access."));
-      MOSymbol = getSymbol(GV);
-    } else if (MO.isCPI()) {
-      MOSymbol = GetCPISymbol(MO.getIndex());
-    }
+    const MachineOperand &MO = MI->getOperand(2);
+    assert((MO.isGlobal() || MO.isCPI()) && "Invalid operand for ADDItocL.");
+
+    LLVM_DEBUG(assert(
+        !(MO.isGlobal() && Subtarget->isGVIndirectSymbol(MO.getGlobal())) &&
+        "Interposable definitions must use indirect access."));
 
     const MCExpr *Exp =
-      MCSymbolRefExpr::create(MOSymbol, MCSymbolRefExpr::VK_PPC_TOC_LO,
-                              OutContext);
+        MCSymbolRefExpr::create(getMCSymbolForTOCPseudoMO(MO, *this),
+                                MCSymbolRefExpr::VK_PPC_TOC_LO, OutContext);
     TmpInst.getOperand(2) = MCOperand::createExpr(Exp);
     EmitToStreamer(*OutStreamer, TmpInst);
     return;
   }
   case PPC::ADDISgotTprelHA: {
-    // Transform: %Xd = ADDISgotTprelHA %X2, <ga:@sym>
-    // Into:      %Xd = ADDIS8 %X2, sym@got@tlsgd@ha
-    assert(Subtarget->isPPC64() && "Not supported for 32-bit PowerPC");
+    // Transform: %xd = ADDISgotTprelHA %x2, @sym
+    // Into:      %xd = ADDIS8 %x2, sym@got@tlsgd@ha
+    assert(IsPPC64 && "Not supported for 32-bit PowerPC");
     const MachineOperand &MO = MI->getOperand(2);
     const GlobalValue *GValue = MO.getGlobal();
     MCSymbol *MOSymbol = getSymbol(GValue);
     const MCExpr *SymGotTprel =
-      MCSymbolRefExpr::create(MOSymbol, MCSymbolRefExpr::VK_PPC_GOT_TPREL_HA,
-                              OutContext);
+        MCSymbolRefExpr::create(MOSymbol, MCSymbolRefExpr::VK_PPC_GOT_TPREL_HA,
+                                OutContext);
     EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::ADDIS8)
                                  .addReg(MI->getOperand(0).getReg())
                                  .addReg(MI->getOperand(1).getReg())
@@ -804,17 +935,18 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
   }
   case PPC::LDgotTprelL:
   case PPC::LDgotTprelL32: {
-    // Transform %Xd = LDgotTprelL <ga:@sym>, %Xs
-    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, isDarwin);
+    // Transform %xd = LDgotTprelL @sym, %xs
+    LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
 
     // Change the opcode to LD.
-    TmpInst.setOpcode(isPPC64 ? PPC::LD : PPC::LWZ);
+    TmpInst.setOpcode(IsPPC64 ? PPC::LD : PPC::LWZ);
     const MachineOperand &MO = MI->getOperand(1);
     const GlobalValue *GValue = MO.getGlobal();
     MCSymbol *MOSymbol = getSymbol(GValue);
-    const MCExpr *Exp =
-      MCSymbolRefExpr::create(MOSymbol, MCSymbolRefExpr::VK_PPC_GOT_TPREL_LO,
-                              OutContext);
+    const MCExpr *Exp = MCSymbolRefExpr::create(
+        MOSymbol, IsPPC64 ? MCSymbolRefExpr::VK_PPC_GOT_TPREL_LO
+                          : MCSymbolRefExpr::VK_PPC_GOT_TPREL,
+        OutContext);
     TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
     EmitToStreamer(*OutStreamer, TmpInst);
     return;
@@ -865,9 +997,9 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     return;
   }
   case PPC::ADDIStlsgdHA: {
-    // Transform: %Xd = ADDIStlsgdHA %X2, <ga:@sym>
-    // Into:      %Xd = ADDIS8 %X2, sym@got@tlsgd@ha
-    assert(Subtarget->isPPC64() && "Not supported for 32-bit PowerPC");
+    // Transform: %xd = ADDIStlsgdHA %x2, @sym
+    // Into:      %xd = ADDIS8 %x2, sym@got@tlsgd@ha
+    assert(IsPPC64 && "Not supported for 32-bit PowerPC");
     const MachineOperand &MO = MI->getOperand(2);
     const GlobalValue *GValue = MO.getGlobal();
     MCSymbol *MOSymbol = getSymbol(GValue);
@@ -881,38 +1013,38 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     return;
   }
   case PPC::ADDItlsgdL:
-    // Transform: %Xd = ADDItlsgdL %Xs, <ga:@sym>
-    // Into:      %Xd = ADDI8 %Xs, sym@got@tlsgd@l
+    // Transform: %xd = ADDItlsgdL %xs, @sym
+    // Into:      %xd = ADDI8 %xs, sym@got@tlsgd@l
   case PPC::ADDItlsgdL32: {
-    // Transform: %Rd = ADDItlsgdL32 %Rs, <ga:@sym>
-    // Into:      %Rd = ADDI %Rs, sym@got@tlsgd
+    // Transform: %rd = ADDItlsgdL32 %rs, @sym
+    // Into:      %rd = ADDI %rs, sym@got@tlsgd
     const MachineOperand &MO = MI->getOperand(2);
     const GlobalValue *GValue = MO.getGlobal();
     MCSymbol *MOSymbol = getSymbol(GValue);
     const MCExpr *SymGotTlsGD = MCSymbolRefExpr::create(
-        MOSymbol, Subtarget->isPPC64() ? MCSymbolRefExpr::VK_PPC_GOT_TLSGD_LO
-                                       : MCSymbolRefExpr::VK_PPC_GOT_TLSGD,
+        MOSymbol, IsPPC64 ? MCSymbolRefExpr::VK_PPC_GOT_TLSGD_LO
+                          : MCSymbolRefExpr::VK_PPC_GOT_TLSGD,
         OutContext);
     EmitToStreamer(*OutStreamer,
-                   MCInstBuilder(Subtarget->isPPC64() ? PPC::ADDI8 : PPC::ADDI)
+                   MCInstBuilder(IsPPC64 ? PPC::ADDI8 : PPC::ADDI)
                    .addReg(MI->getOperand(0).getReg())
                    .addReg(MI->getOperand(1).getReg())
                    .addExpr(SymGotTlsGD));
     return;
   }
   case PPC::GETtlsADDR:
-    // Transform: %X3 = GETtlsADDR %X3, <ga:@sym>
+    // Transform: %x3 = GETtlsADDR %x3, @sym
     // Into: BL8_NOP_TLS __tls_get_addr(sym at tlsgd)
   case PPC::GETtlsADDR32: {
-    // Transform: %R3 = GETtlsADDR32 %R3, <ga:@sym>
+    // Transform: %r3 = GETtlsADDR32 %r3, @sym
     // Into: BL_TLS __tls_get_addr(sym at tlsgd)@PLT
     EmitTlsCall(MI, MCSymbolRefExpr::VK_PPC_TLSGD);
     return;
   }
   case PPC::ADDIStlsldHA: {
-    // Transform: %Xd = ADDIStlsldHA %X2, <ga:@sym>
-    // Into:      %Xd = ADDIS8 %X2, sym@got@tlsld@ha
-    assert(Subtarget->isPPC64() && "Not supported for 32-bit PowerPC");
+    // Transform: %xd = ADDIStlsldHA %x2, @sym
+    // Into:      %xd = ADDIS8 %x2, sym@got@tlsld@ha
+    assert(IsPPC64 && "Not supported for 32-bit PowerPC");
     const MachineOperand &MO = MI->getOperand(2);
     const GlobalValue *GValue = MO.getGlobal();
     MCSymbol *MOSymbol = getSymbol(GValue);
@@ -926,40 +1058,40 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     return;
   }
   case PPC::ADDItlsldL:
-    // Transform: %Xd = ADDItlsldL %Xs, <ga:@sym>
-    // Into:      %Xd = ADDI8 %Xs, sym@got@tlsld@l
+    // Transform: %xd = ADDItlsldL %xs, @sym
+    // Into:      %xd = ADDI8 %xs, sym@got@tlsld@l
   case PPC::ADDItlsldL32: {
-    // Transform: %Rd = ADDItlsldL32 %Rs, <ga:@sym>
-    // Into:      %Rd = ADDI %Rs, sym@got@tlsld
+    // Transform: %rd = ADDItlsldL32 %rs, @sym
+    // Into:      %rd = ADDI %rs, sym@got@tlsld
     const MachineOperand &MO = MI->getOperand(2);
     const GlobalValue *GValue = MO.getGlobal();
     MCSymbol *MOSymbol = getSymbol(GValue);
     const MCExpr *SymGotTlsLD = MCSymbolRefExpr::create(
-        MOSymbol, Subtarget->isPPC64() ? MCSymbolRefExpr::VK_PPC_GOT_TLSLD_LO
-                                       : MCSymbolRefExpr::VK_PPC_GOT_TLSLD,
+        MOSymbol, IsPPC64 ? MCSymbolRefExpr::VK_PPC_GOT_TLSLD_LO
+                          : MCSymbolRefExpr::VK_PPC_GOT_TLSLD,
         OutContext);
     EmitToStreamer(*OutStreamer,
-                   MCInstBuilder(Subtarget->isPPC64() ? PPC::ADDI8 : PPC::ADDI)
+                   MCInstBuilder(IsPPC64 ? PPC::ADDI8 : PPC::ADDI)
                        .addReg(MI->getOperand(0).getReg())
                        .addReg(MI->getOperand(1).getReg())
                        .addExpr(SymGotTlsLD));
     return;
   }
   case PPC::GETtlsldADDR:
-    // Transform: %X3 = GETtlsldADDR %X3, <ga:@sym>
+    // Transform: %x3 = GETtlsldADDR %x3, @sym
     // Into: BL8_NOP_TLS __tls_get_addr(sym at tlsld)
   case PPC::GETtlsldADDR32: {
-    // Transform: %R3 = GETtlsldADDR32 %R3, <ga:@sym>
+    // Transform: %r3 = GETtlsldADDR32 %r3, @sym
     // Into: BL_TLS __tls_get_addr(sym at tlsld)@PLT
     EmitTlsCall(MI, MCSymbolRefExpr::VK_PPC_TLSLD);
     return;
   }
   case PPC::ADDISdtprelHA:
-    // Transform: %Xd = ADDISdtprelHA %Xs, <ga:@sym>
-    // Into:      %Xd = ADDIS8 %Xs, sym@dtprel@ha
+    // Transform: %xd = ADDISdtprelHA %xs, @sym
+    // Into:      %xd = ADDIS8 %xs, sym@dtprel@ha
   case PPC::ADDISdtprelHA32: {
-    // Transform: %Rd = ADDISdtprelHA32 %Rs, <ga:@sym>
-    // Into:      %Rd = ADDIS %Rs, sym@dtprel@ha
+    // Transform: %rd = ADDISdtprelHA32 %rs, @sym
+    // Into:      %rd = ADDIS %rs, sym@dtprel@ha
     const MachineOperand &MO = MI->getOperand(2);
     const GlobalValue *GValue = MO.getGlobal();
     MCSymbol *MOSymbol = getSymbol(GValue);
@@ -968,18 +1100,18 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
                               OutContext);
     EmitToStreamer(
         *OutStreamer,
-        MCInstBuilder(Subtarget->isPPC64() ? PPC::ADDIS8 : PPC::ADDIS)
+        MCInstBuilder(IsPPC64 ? PPC::ADDIS8 : PPC::ADDIS)
             .addReg(MI->getOperand(0).getReg())
             .addReg(MI->getOperand(1).getReg())
             .addExpr(SymDtprel));
     return;
   }
   case PPC::ADDIdtprelL:
-    // Transform: %Xd = ADDIdtprelL %Xs, <ga:@sym>
-    // Into:      %Xd = ADDI8 %Xs, sym@dtprel@l
+    // Transform: %xd = ADDIdtprelL %xs, @sym
+    // Into:      %xd = ADDI8 %xs, sym@dtprel@l
   case PPC::ADDIdtprelL32: {
-    // Transform: %Rd = ADDIdtprelL32 %Rs, <ga:@sym>
-    // Into:      %Rd = ADDI %Rs, sym@dtprel@l
+    // Transform: %rd = ADDIdtprelL32 %rs, @sym
+    // Into:      %rd = ADDI %rs, sym@dtprel@l
     const MachineOperand &MO = MI->getOperand(2);
     const GlobalValue *GValue = MO.getGlobal();
     MCSymbol *MOSymbol = getSymbol(GValue);
@@ -987,7 +1119,7 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
       MCSymbolRefExpr::create(MOSymbol, MCSymbolRefExpr::VK_PPC_DTPREL_LO,
                               OutContext);
     EmitToStreamer(*OutStreamer,
-                   MCInstBuilder(Subtarget->isPPC64() ? PPC::ADDI8 : PPC::ADDI)
+                   MCInstBuilder(IsPPC64 ? PPC::ADDI8 : PPC::ADDI)
                        .addReg(MI->getOperand(0).getReg())
                        .addReg(MI->getOperand(1).getReg())
                        .addExpr(SymDtprel));
@@ -996,8 +1128,8 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
   case PPC::MFOCRF:
   case PPC::MFOCRF8:
     if (!Subtarget->hasMFOCRF()) {
-      // Transform: %R3 = MFOCRF %CR7
-      // Into:      %R3 = MFCR   ;; cr7
+      // Transform: %r3 = MFOCRF %cr7
+      // Into:      %r3 = MFCR   ;; cr7
       unsigned NewOpcode =
         MI->getOpcode() == PPC::MFOCRF ? PPC::MFCR : PPC::MFCR8;
       OutStreamer->AddComment(PPCInstPrinter::
@@ -1010,8 +1142,8 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
   case PPC::MTOCRF:
   case PPC::MTOCRF8:
     if (!Subtarget->hasMFOCRF()) {
-      // Transform: %CR7 = MTOCRF %R3
-      // Into:      MTCRF mask, %R3 ;; cr7
+      // Transform: %cr7 = MTOCRF %r3
+      // Into:      MTCRF mask, %r3 ;; cr7
       unsigned NewOpcode =
         MI->getOpcode() == PPC::MTOCRF ? PPC::MTCRF : PPC::MTCRF8;
       unsigned Mask = 0x80 >> OutContext.getRegisterInfo()
@@ -1034,7 +1166,7 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     // suite shows a handful of test cases that fail this check for
     // Darwin.  Those need to be investigated before this sanity test
     // can be enabled for those subtargets.
-    if (!Subtarget->isDarwin()) {
+    if (!IsDarwin) {
       unsigned OpNum = (MI->getOpcode() == PPC::STD) ? 2 : 1;
       const MachineOperand &MO = MI->getOperand(OpNum);
       if (MO.isGlobal() && MO.getGlobal()->getAlignment() < 4)
@@ -1045,7 +1177,7 @@ void PPCAsmPrinter::EmitInstruction(const MachineInstr *MI) {
   }
   }
 
-  LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, isDarwin);
+  LowerPPCMachineInstrToMCInst(MI, TmpInst, *this, IsDarwin);
   EmitToStreamer(*OutStreamer, TmpInst);
 }
 
@@ -1089,7 +1221,61 @@ void PPCLinuxAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     recordSled(BeginOfSled, *MI, SledKind::FUNCTION_ENTER);
     break;
   }
-  case TargetOpcode::PATCHABLE_FUNCTION_EXIT: {
+  case TargetOpcode::PATCHABLE_RET: {
+    unsigned RetOpcode = MI->getOperand(0).getImm();
+    MCInst RetInst;
+    RetInst.setOpcode(RetOpcode);
+    for (const auto &MO :
+         make_range(std::next(MI->operands_begin()), MI->operands_end())) {
+      MCOperand MCOp;
+      if (LowerPPCMachineOperandToMCOperand(MO, MCOp, *this, false))
+        RetInst.addOperand(MCOp);
+    }
+
+    bool IsConditional;
+    if (RetOpcode == PPC::BCCLR) {
+      IsConditional = true;
+    } else if (RetOpcode == PPC::TCRETURNdi8 || RetOpcode == PPC::TCRETURNri8 ||
+               RetOpcode == PPC::TCRETURNai8) {
+      break;
+    } else if (RetOpcode == PPC::BLR8 || RetOpcode == PPC::TAILB8) {
+      IsConditional = false;
+    } else {
+      EmitToStreamer(*OutStreamer, RetInst);
+      break;
+    }
+
+    MCSymbol *FallthroughLabel;
+    if (IsConditional) {
+      // Before:
+      //   bgtlr cr0
+      //
+      // After:
+      //   ble cr0, .end
+      // .p2align 3
+      // .begin:
+      //   blr    # lis 0, FuncId[16..32]
+      //   nop    # li  0, FuncId[0..15]
+      //   std 0, -8(1)
+      //   mflr 0
+      //   bl __xray_FunctionExit
+      //   mtlr 0
+      //   blr
+      // .end:
+      //
+      // Update compiler-rt/lib/xray/xray_powerpc64.cc accordingly when number
+      // of instructions change.
+      FallthroughLabel = OutContext.createTempSymbol();
+      EmitToStreamer(
+          *OutStreamer,
+          MCInstBuilder(PPC::BCC)
+              .addImm(PPC::InvertPredicate(
+                  static_cast<PPC::Predicate>(MI->getOperand(1).getImm())))
+              .addReg(MI->getOperand(2).getReg())
+              .addExpr(MCSymbolRefExpr::create(FallthroughLabel, OutContext)));
+      RetInst = MCInst();
+      RetInst.setOpcode(PPC::BLR8);
+    }
     // .p2align 3
     // .begin:
     //   b(lr)? # lis 0, FuncId[16..32]
@@ -1098,24 +1284,14 @@ void PPCLinuxAsmPrinter::EmitInstruction(const MachineInstr *MI) {
     //   mflr 0
     //   bl __xray_FunctionExit
     //   mtlr 0
-    // .end:
     //   b(lr)?
     //
     // Update compiler-rt/lib/xray/xray_powerpc64.cc accordingly when number
     // of instructions change.
-    const MachineInstr *Next = [&] {
-      MachineBasicBlock::const_iterator It(MI);
-      assert(It != MI->getParent()->end());
-      ++It;
-      assert(It->isReturn());
-      return &*It;
-    }();
     OutStreamer->EmitCodeAlignment(8);
     MCSymbol *BeginOfSled = OutContext.createTempSymbol();
     OutStreamer->EmitLabel(BeginOfSled);
-    MCInst TmpInst;
-    LowerPPCMachineInstrToMCInst(Next, TmpInst, *this, false);
-    EmitToStreamer(*OutStreamer, TmpInst);
+    EmitToStreamer(*OutStreamer, RetInst);
     EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::NOP));
     EmitToStreamer(
         *OutStreamer,
@@ -1127,15 +1303,18 @@ void PPCLinuxAsmPrinter::EmitInstruction(const MachineInstr *MI) {
                            OutContext.getOrCreateSymbol("__xray_FunctionExit"),
                            OutContext)));
     EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::MTLR8).addReg(PPC::X0));
+    EmitToStreamer(*OutStreamer, RetInst);
+    if (IsConditional)
+      OutStreamer->EmitLabel(FallthroughLabel);
     recordSled(BeginOfSled, *MI, SledKind::FUNCTION_EXIT);
     break;
   }
+  case TargetOpcode::PATCHABLE_FUNCTION_EXIT:
+    llvm_unreachable("PATCHABLE_FUNCTION_EXIT should never be emitted");
   case TargetOpcode::PATCHABLE_TAIL_CALL:
-  case TargetOpcode::PATCHABLE_RET:
-    // PPC's tail call instruction, e.g. PPC::TCRETURNdi8, doesn't really
-    // lower to a PPC::B instruction. The PPC::B instruction is generated
-    // before it, and handled by the normal case.
-    llvm_unreachable("Tail call is handled in the normal case. See comments"
+    // TODO: Define a trampoline `__xray_FunctionTailExit` and differentiate a
+    // normal function exit from a tail exit.
+    llvm_unreachable("Tail call is handled in the normal case. See comments "
                      "around this assert.");
   }
 }
@@ -1180,12 +1359,12 @@ void PPCLinuxAsmPrinter::EmitFunctionEntryLabel() {
   // linux/ppc32 - Normal entry label.
   if (!Subtarget->isPPC64() &&
       (!isPositionIndependent() ||
-       MF->getFunction()->getParent()->getPICLevel() == PICLevel::SmallPIC))
+       MF->getFunction().getParent()->getPICLevel() == PICLevel::SmallPIC))
     return AsmPrinter::EmitFunctionEntryLabel();
 
   if (!Subtarget->isPPC64()) {
     const PPCFunctionInfo *PPCFI = MF->getInfo<PPCFunctionInfo>();
-    if (PPCFI->usesPICBase()) {
+    if (PPCFI->usesPICBase() && !Subtarget->isSecurePlt()) {
       MCSymbol *RelocSymbol = PPCFI->getPICOffsetSymbol();
       MCSymbol *PICBase = MF->getPICBaseSymbol();
       OutStreamer->EmitLabel(RelocSymbol);
@@ -1207,7 +1386,7 @@ void PPCLinuxAsmPrinter::EmitFunctionEntryLabel() {
   if (Subtarget->isELFv2ABI()) {
     // In the Large code model, we allow arbitrary displacements between
     // the text section and its associated TOC section.  We place the
-    // full 8-byte offset to the TOC in memory immediatedly preceding
+    // full 8-byte offset to the TOC in memory immediately preceding
     // the function global entry point.
     if (TM.getCodeModel() == CodeModel::Large
         && !MF->getRegInfo().use_empty(PPC::X2)) {
@@ -1268,15 +1447,16 @@ bool PPCLinuxAsmPrinter::doFinalization(Module &M) {
               ".got2", ELF::SHT_PROGBITS, ELF::SHF_WRITE | ELF::SHF_ALLOC);
     OutStreamer->SwitchSection(Section);
 
-    for (MapVector<MCSymbol*, MCSymbol*>::iterator I = TOC.begin(),
-         E = TOC.end(); I != E; ++I) {
-      OutStreamer->EmitLabel(I->second);
-      MCSymbol *S = I->first;
+    for (const auto &TOCMapPair : TOC) {
+      const MCSymbol *const TOCEntryTarget = TOCMapPair.first;
+      MCSymbol *const TOCEntryLabel = TOCMapPair.second;
+
+      OutStreamer->EmitLabel(TOCEntryLabel);
       if (isPPC64) {
-        TS.emitTCEntry(*S);
+        TS.emitTCEntry(*TOCEntryTarget);
       } else {
         OutStreamer->EmitValueToAlignment(4);
-        OutStreamer->EmitSymbolValue(S, 4);
+        OutStreamer->EmitSymbolValue(TOCEntryTarget, 4);
       }
     }
   }
@@ -1410,6 +1590,7 @@ void PPCDarwinAsmPrinter::EmitStartOfAsmFile(Module &M) {
     "ppc750",
     "ppc970",
     "ppcA2",
+    "ppce500",
     "ppce500mc",
     "ppce5500",
     "power3",
@@ -1501,7 +1682,7 @@ bool PPCDarwinAsmPrinter::doFinalization(Module &M) {
     if (!Stubs.empty()) {
       // Switch with ".non_lazy_symbol_pointer" directive.
       OutStreamer->SwitchSection(TLOFMacho.getNonLazySymbolPointerSection());
-      EmitAlignment(isPPC64 ? 3 : 2);
+      EmitAlignment(isPPC64 ? Align(8) : Align(4));
 
       for (unsigned i = 0, e = Stubs.size(); i != e; ++i) {
         // L_foo$stub:
@@ -1542,6 +1723,106 @@ bool PPCDarwinAsmPrinter::doFinalization(Module &M) {
   return AsmPrinter::doFinalization(M);
 }
 
+void PPCAIXAsmPrinter::SetupMachineFunction(MachineFunction &MF) {
+  // Get the function descriptor symbol.
+  CurrentFnDescSym = getSymbol(&MF.getFunction());
+  // Set the containing csect.
+  MCSectionXCOFF *FnDescSec = OutStreamer->getContext().getXCOFFSection(
+      CurrentFnDescSym->getName(), XCOFF::XMC_DS, XCOFF::XTY_SD,
+      XCOFF::C_HIDEXT, SectionKind::getData());
+  cast<MCSymbolXCOFF>(CurrentFnDescSym)->setContainingCsect(FnDescSec);
+
+  return AsmPrinter::SetupMachineFunction(MF);
+}
+
+void PPCAIXAsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
+  // Early error checking limiting what is supported.
+  if (GV->isThreadLocal())
+    report_fatal_error("Thread local not yet supported on AIX.");
+
+  if (GV->hasSection())
+    report_fatal_error("Custom section for Data not yet supported.");
+
+  if (GV->hasComdat())
+    report_fatal_error("COMDAT not yet supported by AIX.");
+
+  SectionKind GVKind = getObjFileLowering().getKindForGlobal(GV, TM);
+  if (!GVKind.isCommon() && !GVKind.isBSSLocal() && !GVKind.isData())
+    report_fatal_error("Encountered a global variable kind that is "
+                       "not supported yet.");
+
+  // Create the containing csect and switch to it.
+  MCSectionXCOFF *CSect = cast<MCSectionXCOFF>(
+      getObjFileLowering().SectionForGlobal(GV, GVKind, TM));
+  OutStreamer->SwitchSection(CSect);
+
+  // Create the symbol, set its storage class, and emit it.
+  MCSymbolXCOFF *GVSym = cast<MCSymbolXCOFF>(getSymbol(GV));
+  GVSym->setStorageClass(
+      TargetLoweringObjectFileXCOFF::getStorageClassForGlobal(GV));
+  GVSym->setContainingCsect(CSect);
+
+  const DataLayout &DL = GV->getParent()->getDataLayout();
+
+  // Handle common symbols.
+  if (GVKind.isCommon() || GVKind.isBSSLocal()) {
+    unsigned Align =
+      GV->getAlignment() ? GV->getAlignment() : DL.getPreferredAlignment(GV);
+    uint64_t Size = DL.getTypeAllocSize(GV->getType()->getElementType());
+
+    if (GVKind.isBSSLocal())
+      OutStreamer->EmitXCOFFLocalCommonSymbol(GVSym, Size, Align);
+    else
+      OutStreamer->EmitCommonSymbol(GVSym, Size, Align);
+    return;
+  }
+
+  MCSymbol *EmittedInitSym = GVSym;
+  EmitLinkage(GV, EmittedInitSym);
+  EmitAlignment(getGVAlignment(GV, DL), GV);
+  OutStreamer->EmitLabel(EmittedInitSym);
+  EmitGlobalConstant(GV->getParent()->getDataLayout(), GV->getInitializer());
+}
+
+void PPCAIXAsmPrinter::EmitFunctionDescriptor() {
+  const DataLayout &DL = getDataLayout();
+  const unsigned PointerSize = DL.getPointerSizeInBits() == 64 ? 8 : 4;
+
+  MCSectionSubPair Current = OutStreamer->getCurrentSection();
+  // Emit function descriptor.
+  OutStreamer->SwitchSection(
+      cast<MCSymbolXCOFF>(CurrentFnDescSym)->getContainingCsect());
+  OutStreamer->EmitLabel(CurrentFnDescSym);
+  // Emit function entry point address.
+  OutStreamer->EmitValue(MCSymbolRefExpr::create(CurrentFnSym, OutContext),
+                         PointerSize);
+  // Emit TOC base address.
+  MCSymbol *TOCBaseSym = OutContext.getOrCreateSymbol(StringRef("TOC[TC0]"));
+  OutStreamer->EmitValue(MCSymbolRefExpr::create(TOCBaseSym, OutContext),
+                         PointerSize);
+  // Emit a null environment pointer.
+  OutStreamer->EmitIntValue(0, PointerSize);
+
+  OutStreamer->SwitchSection(Current.first, Current.second);
+}
+
+void PPCAIXAsmPrinter::EmitEndOfAsmFile(Module &M) {
+  // If there are no functions in this module, we will never need to reference
+  // the TOC base.
+  if (M.empty())
+    return;
+
+  // Emit TOC base.
+  MCSymbol *TOCBaseSym = OutContext.getOrCreateSymbol(StringRef("TOC[TC0]"));
+  MCSectionXCOFF *TOCBaseSection = OutStreamer->getContext().getXCOFFSection(
+      StringRef("TOC"), XCOFF::XMC_TC0, XCOFF::XTY_SD, XCOFF::C_HIDEXT,
+      SectionKind::getData());
+  cast<MCSymbolXCOFF>(TOCBaseSym)->setContainingCsect(TOCBaseSection);
+  // Switch to section to emit TOC base.
+  OutStreamer->SwitchSection(TOCBaseSection);
+}
+
+
 /// createPPCAsmPrinterPass - Returns a pass that prints the PPC assembly code
 /// for a MachineFunction to the given output stream, in a format that the
 /// Darwin assembler can deal with.
@@ -1551,6 +1832,9 @@ createPPCAsmPrinterPass(TargetMachine &tm,
                         std::unique_ptr<MCStreamer> &&Streamer) {
   if (tm.getTargetTriple().isMacOSX())
     return new PPCDarwinAsmPrinter(tm, std::move(Streamer));
+  if (tm.getTargetTriple().isOSAIX())
+    return new PPCAIXAsmPrinter(tm, std::move(Streamer));
+
   return new PPCLinuxAsmPrinter(tm, std::move(Streamer));
 }
 

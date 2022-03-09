@@ -1,9 +1,8 @@
 //===---- llvm/Analysis/ScalarEvolutionExpander.h - SCEV Exprs --*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -27,8 +26,15 @@ namespace llvm {
   class TargetTransformInfo;
 
   /// Return true if the given expression is safe to expand in the sense that
-  /// all materialized values are safe to speculate.
+  /// all materialized values are safe to speculate anywhere their operands are
+  /// defined.
   bool isSafeToExpand(const SCEV *S, ScalarEvolution &SE);
+
+  /// Return true if the given expression is safe to expand in the sense that
+  /// all materialized values are defined and safe to speculate at the specified
+  /// location and their operands are defined at this location.
+  bool isSafeToExpandAt(const SCEV *S, const Instruction *InsertionPoint,
+                        ScalarEvolution &SE);
 
   /// This class uses information about analyze scalars to rewrite expressions
   /// in canonical form.
@@ -40,7 +46,7 @@ namespace llvm {
     ScalarEvolution &SE;
     const DataLayout &DL;
 
-    // New instructions receive a name to identifies them with the current pass.
+    // New instructions receive a name to identify them with the current pass.
     const char* IVName;
 
     // InsertedExpressions caches Values for reuse, so must track RAUW.
@@ -71,9 +77,13 @@ namespace llvm {
     /// Phis that complete an IV chain. Reuse
     DenseSet<AssertingVH<PHINode>> ChainedPhis;
 
-    /// When true, expressions are expanded in "canonical" form. In particular,
-    /// addrecs are expanded as arithmetic based on a canonical induction
-    /// variable. When false, expression are expanded in a more literal form.
+    /// When true, SCEVExpander tries to expand expressions in "canonical" form.
+    /// When false, expressions are expanded in a more literal form.
+    ///
+    /// In "canonical" form addrecs are expanded as arithmetic based on a
+    /// canonical induction variable. Note that CanonicalMode doesn't guarantee
+    /// that all expressions are expanded in "canonical" form. For some
+    /// expressions literal mode can be preferred.
     bool CanonicalMode;
 
     /// When invoked from LSR, the expander is in "strength reduction" mode. The
@@ -189,7 +199,7 @@ namespace llvm {
     /// replace congruent phis with their most canonical representative. Return
     /// the number of phis eliminated.
     unsigned replaceCongruentIVs(Loop *L, const DominatorTree *DT,
-                                 SmallVectorImpl<WeakVH> &DeadInsts,
+                                 SmallVectorImpl<WeakTrackingVH> &DeadInsts,
                                  const TargetTransformInfo *TTI = nullptr);
 
     /// Insert code to directly compute the specified SCEV expression into the
@@ -269,8 +279,16 @@ namespace llvm {
 
     /// Clear the current insertion point. This is useful if the instruction
     /// that had been serving as the insertion point may have been deleted.
-    void clearInsertPoint() {
-      Builder.ClearInsertionPoint();
+    void clearInsertPoint() { Builder.ClearInsertionPoint(); }
+
+    /// Set location information used by debugging information.
+    void SetCurrentDebugLocation(DebugLoc L) {
+      Builder.SetCurrentDebugLocation(std::move(L));
+    }
+
+    /// Get location information used by debugging information.
+    const DebugLoc &getCurrentDebugLocation() const {
+      return Builder.getCurrentDebugLocation();
     }
 
     /// Return true if the specified instruction was inserted by the code
@@ -309,12 +327,14 @@ namespace llvm {
                                    SmallPtrSetImpl<const SCEV *> &Processed);
 
     /// Insert the specified binary operator, doing a small amount of work to
-    /// avoid inserting an obviously redundant operation.
-    Value *InsertBinop(Instruction::BinaryOps Opcode, Value *LHS, Value *RHS);
+    /// avoid inserting an obviously redundant operation, and hoisting to an
+    /// outer loop when the opportunity is there and it is safe.
+    Value *InsertBinop(Instruction::BinaryOps Opcode, Value *LHS, Value *RHS,
+                       SCEV::NoWrapFlags Flags, bool IsSafeToHoist);
 
     /// Arrange for there to be a cast of V to Ty at IP, reusing an existing
     /// cast if a suitable one exists, moving an existing cast if a suitable one
-    /// exists but isn't in the right place, or or creating a new one.
+    /// exists but isn't in the right place, or creating a new one.
     Value *ReuseOrCreateCast(Value *V, Type *Ty,
                              Instruction::CastOps Op,
                              BasicBlock::iterator IP);
@@ -328,6 +348,7 @@ namespace llvm {
     Value *expandAddToGEP(const SCEV *const *op_begin,
                           const SCEV *const *op_end,
                           PointerType *PTy, Type *Ty, Value *V);
+    Value *expandAddToGEP(const SCEV *Op, PointerType *PTy, Type *Ty, Value *V);
 
     /// Find a previous Value in ExprValueMap for expand.
     ScalarEvolution::ValueOffsetPair
@@ -359,6 +380,10 @@ namespace llvm {
     Value *visitSMaxExpr(const SCEVSMaxExpr *S);
 
     Value *visitUMaxExpr(const SCEVUMaxExpr *S);
+
+    Value *visitSMinExpr(const SCEVSMinExpr *S);
+
+    Value *visitUMinExpr(const SCEVUMinExpr *S);
 
     Value *visitUnknown(const SCEVUnknown *S) {
       return S->getValue();

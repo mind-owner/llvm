@@ -1,9 +1,8 @@
-//===-- llvm/CodeGen/MachineBasicBlock.h ------------------------*- C++ -*-===//
+//===- llvm/CodeGen/MachineBasicBlock.h -------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,41 +14,51 @@
 #define LLVM_CODEGEN_MACHINEBASICBLOCK_H
 
 #include "llvm/ADT/GraphTraits.h"
+#include "llvm/ADT/ilist.h"
+#include "llvm/ADT/ilist_node.h"
 #include "llvm/ADT/iterator_range.h"
-#include "llvm/CodeGen/MachineInstrBundleIterator.h"
+#include "llvm/ADT/simple_ilist.h"
 #include "llvm/CodeGen/MachineInstr.h"
-#include "llvm/Support/BranchProbability.h"
+#include "llvm/CodeGen/MachineInstrBundleIterator.h"
+#include "llvm/IR/DebugLoc.h"
 #include "llvm/MC/LaneBitmask.h"
 #include "llvm/MC/MCRegisterInfo.h"
-#include "llvm/Support/DataTypes.h"
+#include "llvm/Support/BranchProbability.h"
+#include "llvm/Support/Printable.h"
+#include <cassert>
+#include <cstdint>
 #include <functional>
+#include <iterator>
+#include <string>
+#include <vector>
 
 namespace llvm {
 
-class Pass;
 class BasicBlock;
 class MachineFunction;
 class MCSymbol;
-class MIPrinter;
+class ModuleSlotTracker;
+class Pass;
 class SlotIndexes;
 class StringRef;
 class raw_ostream;
-class MachineBranchProbabilityInfo;
+class TargetRegisterClass;
+class TargetRegisterInfo;
 
 template <> struct ilist_traits<MachineInstr> {
 private:
   friend class MachineBasicBlock; // Set by the owning MachineBasicBlock.
+
   MachineBasicBlock *Parent;
 
-  typedef simple_ilist<MachineInstr, ilist_sentinel_tracking<true>>::iterator
-      instr_iterator;
+  using instr_iterator =
+      simple_ilist<MachineInstr, ilist_sentinel_tracking<true>>::iterator;
 
 public:
   void addNodeToList(MachineInstr *N);
   void removeNodeFromList(MachineInstr *N);
-  void transferNodesFromList(ilist_traits &OldList, instr_iterator First,
+  void transferNodesFromList(ilist_traits &FromList, instr_iterator First,
                              instr_iterator Last);
-
   void deleteNode(MachineInstr *MI);
 };
 
@@ -69,7 +78,8 @@ public:
   };
 
 private:
-  typedef ilist<MachineInstr, ilist_sentinel_tracking<true>> Instructions;
+  using Instructions = ilist<MachineInstr, ilist_sentinel_tracking<true>>;
+
   Instructions Insts;
   const BasicBlock *BB;
   int Number;
@@ -83,17 +93,19 @@ private:
   /// same order as Successors, or it is empty if we don't use it (disable
   /// optimization).
   std::vector<BranchProbability> Probs;
-  typedef std::vector<BranchProbability>::iterator probability_iterator;
-  typedef std::vector<BranchProbability>::const_iterator
-      const_probability_iterator;
+  using probability_iterator = std::vector<BranchProbability>::iterator;
+  using const_probability_iterator =
+      std::vector<BranchProbability>::const_iterator;
+
+  Optional<uint64_t> IrrLoopHeaderWeight;
 
   /// Keep track of the physical registers that are livein of the basicblock.
-  typedef std::vector<RegisterMaskPair> LiveInVector;
+  using LiveInVector = std::vector<RegisterMaskPair>;
   LiveInVector LiveIns;
 
-  /// Alignment of the basic block. Zero if the basic block does not need to be
-  /// aligned. The alignment is specified as log2(bytes).
-  unsigned Alignment = 0;
+  /// Alignment of the basic block. One if the basic block does not need to be
+  /// aligned.
+  Align Alignment;
 
   /// Indicate that this basic block is entered via an exception handler.
   bool IsEHPad = false;
@@ -102,18 +114,27 @@ private:
   /// branch.
   bool AddressTaken = false;
 
+  /// Indicate that this basic block needs its symbol be emitted regardless of
+  /// whether the flow just falls-through to it.
+  bool LabelMustBeEmitted = false;
+
+  /// Indicate that this basic block is the entry block of an EH scope, i.e.,
+  /// the block that used to have a catchpad or cleanuppad instruction in the
+  /// LLVM IR.
+  bool IsEHScopeEntry = false;
+
   /// Indicate that this basic block is the entry block of an EH funclet.
   bool IsEHFuncletEntry = false;
 
   /// Indicate that this basic block is the entry block of a cleanup funclet.
   bool IsCleanupFuncletEntry = false;
 
-  /// \brief since getSymbol is a relatively heavy-weight operation, the symbol
+  /// since getSymbol is a relatively heavy-weight operation, the symbol
   /// is only computed once and is cached.
   mutable MCSymbol *CachedMCSymbol = nullptr;
 
   // Intrusive list support
-  MachineBasicBlock() {}
+  MachineBasicBlock() = default;
 
   explicit MachineBasicBlock(MachineFunction &MF, const BasicBlock *BB);
 
@@ -141,20 +162,27 @@ public:
   /// branch.
   void setHasAddressTaken() { AddressTaken = true; }
 
+  /// Test whether this block must have its label emitted.
+  bool hasLabelMustBeEmitted() const { return LabelMustBeEmitted; }
+
+  /// Set this block to reflect that, regardless how we flow to it, we need
+  /// its label be emitted.
+  void setLabelMustBeEmitted() { LabelMustBeEmitted = true; }
+
   /// Return the MachineFunction containing this basic block.
   const MachineFunction *getParent() const { return xParent; }
   MachineFunction *getParent() { return xParent; }
 
-  typedef Instructions::iterator                                 instr_iterator;
-  typedef Instructions::const_iterator                     const_instr_iterator;
-  typedef Instructions::reverse_iterator reverse_instr_iterator;
-  typedef Instructions::const_reverse_iterator const_reverse_instr_iterator;
+  using instr_iterator = Instructions::iterator;
+  using const_instr_iterator = Instructions::const_iterator;
+  using reverse_instr_iterator = Instructions::reverse_iterator;
+  using const_reverse_instr_iterator = Instructions::const_reverse_iterator;
 
-  typedef MachineInstrBundleIterator<MachineInstr> iterator;
-  typedef MachineInstrBundleIterator<const MachineInstr> const_iterator;
-  typedef MachineInstrBundleIterator<MachineInstr, true> reverse_iterator;
-  typedef MachineInstrBundleIterator<const MachineInstr, true>
-      const_reverse_iterator;
+  using iterator = MachineInstrBundleIterator<MachineInstr>;
+  using const_iterator = MachineInstrBundleIterator<const MachineInstr>;
+  using reverse_iterator = MachineInstrBundleIterator<MachineInstr, true>;
+  using const_reverse_iterator =
+      MachineInstrBundleIterator<const MachineInstr, true>;
 
   unsigned size() const { return (unsigned)Insts.size(); }
   bool empty() const { return Insts.empty(); }
@@ -178,8 +206,8 @@ public:
   reverse_instr_iterator       instr_rend  ()       { return Insts.rend();   }
   const_reverse_instr_iterator instr_rend  () const { return Insts.rend();   }
 
-  typedef iterator_range<instr_iterator> instr_range;
-  typedef iterator_range<const_instr_iterator> const_instr_range;
+  using instr_range = iterator_range<instr_iterator>;
+  using const_instr_range = iterator_range<const_instr_iterator>;
   instr_range instrs() { return instr_range(instr_begin(), instr_end()); }
   const_instr_range instrs() const {
     return const_instr_range(instr_begin(), instr_end());
@@ -212,19 +240,27 @@ public:
     return make_range(getFirstTerminator(), end());
   }
 
+  /// Returns a range that iterates over the phis in the basic block.
+  inline iterator_range<iterator> phis() {
+    return make_range(begin(), getFirstNonPHI());
+  }
+  inline iterator_range<const_iterator> phis() const {
+    return const_cast<MachineBasicBlock *>(this)->phis();
+  }
+
   // Machine-CFG iterators
-  typedef std::vector<MachineBasicBlock *>::iterator       pred_iterator;
-  typedef std::vector<MachineBasicBlock *>::const_iterator const_pred_iterator;
-  typedef std::vector<MachineBasicBlock *>::iterator       succ_iterator;
-  typedef std::vector<MachineBasicBlock *>::const_iterator const_succ_iterator;
-  typedef std::vector<MachineBasicBlock *>::reverse_iterator
-                                                         pred_reverse_iterator;
-  typedef std::vector<MachineBasicBlock *>::const_reverse_iterator
-                                                   const_pred_reverse_iterator;
-  typedef std::vector<MachineBasicBlock *>::reverse_iterator
-                                                         succ_reverse_iterator;
-  typedef std::vector<MachineBasicBlock *>::const_reverse_iterator
-                                                   const_succ_reverse_iterator;
+  using pred_iterator = std::vector<MachineBasicBlock *>::iterator;
+  using const_pred_iterator = std::vector<MachineBasicBlock *>::const_iterator;
+  using succ_iterator = std::vector<MachineBasicBlock *>::iterator;
+  using const_succ_iterator = std::vector<MachineBasicBlock *>::const_iterator;
+  using pred_reverse_iterator =
+      std::vector<MachineBasicBlock *>::reverse_iterator;
+  using const_pred_reverse_iterator =
+      std::vector<MachineBasicBlock *>::const_reverse_iterator;
+  using succ_reverse_iterator =
+      std::vector<MachineBasicBlock *>::reverse_iterator;
+  using const_succ_reverse_iterator =
+      std::vector<MachineBasicBlock *>::const_reverse_iterator;
   pred_iterator        pred_begin()       { return Predecessors.begin(); }
   const_pred_iterator  pred_begin() const { return Predecessors.begin(); }
   pred_iterator        pred_end()         { return Predecessors.end();   }
@@ -276,7 +312,7 @@ public:
   /// Adds the specified register as a live in. Note that it is an error to add
   /// the same register to the same set more than once unless the intention is
   /// to call sortUniqueLiveIns after all registers are added.
-  void addLiveIn(MCPhysReg PhysReg,
+  void addLiveIn(MCRegister PhysReg,
                  LaneBitmask LaneMask = LaneBitmask::getAll()) {
     LiveIns.push_back(RegisterMaskPair(PhysReg, LaneMask));
   }
@@ -295,7 +331,7 @@ public:
   /// Add PhysReg as live in to this block, and ensure that there is a copy of
   /// PhysReg to a virtual register of class RC. Return the virtual register
   /// that is a copy of the live in PhysReg.
-  unsigned addLiveIn(MCPhysReg PhysReg, const TargetRegisterClass *RC);
+  unsigned addLiveIn(MCRegister PhysReg, const TargetRegisterClass *RC);
 
   /// Remove the specified register from the live in set.
   void removeLiveIn(MCPhysReg Reg,
@@ -307,7 +343,7 @@ public:
 
   // Iteration support for live in sets.  These sets are kept in sorted
   // order by their register number.
-  typedef LiveInVector::const_iterator livein_iterator;
+  using livein_iterator = LiveInVector::const_iterator;
 #ifndef NDEBUG
   /// Unlike livein_begin, this method does not check that the liveness
   /// information is accurate. Still for debug purposes it may be useful
@@ -325,6 +361,9 @@ public:
     return make_range(livein_begin(), livein_end());
   }
 
+  /// Remove entry from the livein set and return iterator to the next.
+  livein_iterator removeLiveIn(livein_iterator I);
+
   /// Get the clobber mask for the start of this basic block. Funclets use this
   /// to prevent register allocation across funclet transitions.
   const uint32_t *getBeginClobberMask(const TargetRegisterInfo *TRI) const;
@@ -333,13 +372,11 @@ public:
   /// \see getBeginClobberMask()
   const uint32_t *getEndClobberMask(const TargetRegisterInfo *TRI) const;
 
-  /// Return alignment of the basic block. The alignment is specified as
-  /// log2(bytes).
-  unsigned getAlignment() const { return Alignment; }
+  /// Return alignment of the basic block.
+  Align getAlignment() const { return Alignment; }
 
-  /// Set alignment of the basic block. The alignment is specified as
-  /// log2(bytes).
-  void setAlignment(unsigned Align) { Alignment = Align; }
+  /// Set alignment of the basic block.
+  void setAlignment(Align A) { Alignment = A; }
 
   /// Returns true if the block is a landing pad. That is this basic block is
   /// entered via an exception handler.
@@ -350,6 +387,14 @@ public:
   void setIsEHPad(bool V = true) { IsEHPad = V; }
 
   bool hasEHPadSuccessor() const;
+
+  /// Returns true if this is the entry block of an EH scope, i.e., the block
+  /// that used to have a catchpad or cleanuppad instruction in the LLVM IR.
+  bool isEHScopeEntry() const { return IsEHScopeEntry; }
+
+  /// Indicates if this is the entry block of an EH scope, i.e., the block that
+  /// that used to have a catchpad or cleanuppad instruction in the LLVM IR.
+  void setIsEHScopeEntry(bool V = true) { IsEHScopeEntry = V; }
 
   /// Returns true if this is the entry block of an EH funclet.
   bool isEHFuncletEntry() const { return IsEHFuncletEntry; }
@@ -362,6 +407,9 @@ public:
 
   /// Indicates if this is the entry block of a cleanup funclet.
   void setIsCleanupFuncletEntry(bool V = true) { IsCleanupFuncletEntry = V; }
+
+  /// Returns true if it is legal to hoist instructions into this block.
+  bool isLegalToHoistInto() const;
 
   // Code Layout methods.
 
@@ -430,6 +478,18 @@ public:
   /// Replace successor OLD with NEW and update probability info.
   void replaceSuccessor(MachineBasicBlock *Old, MachineBasicBlock *New);
 
+  /// Copy a successor (and any probability info) from original block to this
+  /// block's. Uses an iterator into the original blocks successors.
+  ///
+  /// This is useful when doing a partial clone of successors. Afterward, the
+  /// probabilities may need to be normalized.
+  void copySuccessor(MachineBasicBlock *Orig, succ_iterator I);
+
+  /// Split the old successor into old plus new and updates the probability
+  /// info.
+  void splitSuccessor(MachineBasicBlock *Old, MachineBasicBlock *New,
+                      bool NormalizeSuccProbs = false);
+
   /// Transfers all the successors from MBB to this machine basic block (i.e.,
   /// copies all the successors FromMBB and remove all the successors from
   /// FromMBB).
@@ -454,7 +514,6 @@ public:
   /// all, for example if this block ends with an unconditional branch to some
   /// other block.
   bool isLayoutSuccessor(const MachineBasicBlock *MBB) const;
-
 
   /// Return the fallthrough block if the block can implicitly
   /// transfer control to the block after it by falling off the end of
@@ -518,6 +577,12 @@ public:
     return !empty() && back().isReturn();
   }
 
+  /// Convenience function that returns true if the bock ends in a EH scope
+  /// return instruction.
+  bool isEHScopeReturnBlock() const {
+    return !empty() && back().isEHScopeReturn();
+  }
+
   /// Split the critical edge from this block to the given successor block, and
   /// return the newly created block, or null if splitting is not possible.
   ///
@@ -528,7 +593,7 @@ public:
   /// Check if the edge between this block and the given successor \p
   /// Succ, can be split. If this returns true a subsequent call to
   /// SplitCriticalEdge is guaranteed to return a valid basic block if
-  /// no changes occured in the meantime.
+  /// no changes occurred in the meantime.
   bool canSplitCriticalEdge(const MachineBasicBlock *Succ) const;
 
   void pop_front() { Insts.pop_front(); }
@@ -567,6 +632,18 @@ public:
     assert(!MI->isBundledWithPred() && !MI->isBundledWithSucc() &&
            "Cannot insert instruction with bundle flags");
     return Insts.insertAfter(I.getInstrIterator(), MI);
+  }
+
+  /// If I is bundled then insert MI into the instruction list after the end of
+  /// the bundle, otherwise insert MI immediately after I.
+  instr_iterator insertAfterBundle(instr_iterator I, MachineInstr *MI) {
+    assert((I == instr_end() || I->getParent() == this) &&
+           "iterator points outside of basic block");
+    assert(!MI->isBundledWithPred() && !MI->isBundledWithSucc() &&
+           "Cannot insert instruction with bundle flags");
+    while (I->isBundledWithSucc())
+      ++I;
+    return Insts.insertAfter(I, MI);
   }
 
   /// Remove an instruction from the instruction list and delete it.
@@ -656,6 +733,10 @@ public:
   /// CFG so that it branches to 'New' instead.
   void ReplaceUsesOfBlockWith(MachineBasicBlock *Old, MachineBasicBlock *New);
 
+  /// Update all phi nodes in this basic block to refer to basic block \p New
+  /// instead of basic block \p Old.
+  void replacePhiUsesWith(MachineBasicBlock *Old, MachineBasicBlock *New);
+
   /// Various pieces of code can cause excess edges in the CFG to be inserted.
   /// If we have proven that MBB can only branch to DestA and DestB, remove any
   /// other MBB successors from the CFG. DestA and DestB can be null. Besides
@@ -667,10 +748,17 @@ public:
                             bool IsCond);
 
   /// Find the next valid DebugLoc starting at MBBI, skipping any DBG_VALUE
-  /// instructions.  Return UnknownLoc if there is none.
+  /// and DBG_LABEL instructions.  Return UnknownLoc if there is none.
   DebugLoc findDebugLoc(instr_iterator MBBI);
   DebugLoc findDebugLoc(iterator MBBI) {
     return findDebugLoc(MBBI.getInstrIterator());
+  }
+
+  /// Find the previous valid DebugLoc preceding MBBI, skipping and DBG_VALUE
+  /// instructions.  Return UnknownLoc if there is none.
+  DebugLoc findPrevDebugLoc(instr_iterator MBBI);
+  DebugLoc findPrevDebugLoc(iterator MBBI) {
+    return findPrevDebugLoc(MBBI.getInstrIterator());
   }
 
   /// Find and return the merged DebugLoc of the branch instructions of the
@@ -684,8 +772,8 @@ public:
     LQR_Unknown ///< Register liveness not decidable from local neighborhood.
   };
 
-  /// Return whether (physical) register \p Reg has been <def>ined and not
-  /// <kill>ed as of just before \p Before.
+  /// Return whether (physical) register \p Reg has been defined and not
+  /// killed as of just before \p Before.
   ///
   /// Search is localised to a neighborhood of \p Neighborhood instructions
   /// before (searching for defs or kills) and \p Neighborhood instructions
@@ -695,13 +783,14 @@ public:
   LivenessQueryResult computeRegisterLiveness(const TargetRegisterInfo *TRI,
                                               unsigned Reg,
                                               const_iterator Before,
-                                              unsigned Neighborhood=10) const;
+                                              unsigned Neighborhood = 10) const;
 
   // Debugging methods.
   void dump() const;
-  void print(raw_ostream &OS, const SlotIndexes* = nullptr) const;
+  void print(raw_ostream &OS, const SlotIndexes * = nullptr,
+             bool IsStandalone = true) const;
   void print(raw_ostream &OS, ModuleSlotTracker &MST,
-             const SlotIndexes* = nullptr) const;
+             const SlotIndexes * = nullptr, bool IsStandalone = true) const;
 
   // Printing method used by LoopInfo.
   void printAsOperand(raw_ostream &OS, bool PrintType = true) const;
@@ -714,6 +803,13 @@ public:
   /// Return the MCSymbol for this basic block.
   MCSymbol *getSymbol() const;
 
+  Optional<uint64_t> getIrrLoopHeaderWeight() const {
+    return IrrLoopHeaderWeight;
+  }
+
+  void setIrrLoopHeaderWeight(uint64_t Weight) {
+    IrrLoopHeaderWeight = Weight;
+  }
 
 private:
   /// Return probability iterator corresponding to the I successor iterator.
@@ -734,7 +830,7 @@ private:
 
   // Machine-CFG mutators
 
-  /// Remove Pred as a predecessor of this MachineBasicBlock. Don't do this
+  /// Add Pred as a predecessor of this MachineBasicBlock. Don't do this
   /// unless you know what you're doing, because it doesn't update Pred's
   /// successors list. Use Pred->addSuccessor instead.
   void addPredecessor(MachineBasicBlock *Pred);
@@ -747,9 +843,17 @@ private:
 
 raw_ostream& operator<<(raw_ostream &OS, const MachineBasicBlock &MBB);
 
+/// Prints a machine basic block reference.
+///
+/// The format is:
+///   %bb.5           - a machine basic block with MBB.getNumber() == 5.
+///
+/// Usage: OS << printMBBReference(MBB) << '\n';
+Printable printMBBReference(const MachineBasicBlock &MBB);
+
 // This is useful when building IndexedMaps keyed on basic block pointers.
-struct MBB2NumberFunctor :
-  public std::unary_function<const MachineBasicBlock*, unsigned> {
+struct MBB2NumberFunctor {
+  using argument_type = const MachineBasicBlock *;
   unsigned operator()(const MachineBasicBlock *MBB) const {
     return MBB->getNumber();
   }
@@ -764,8 +868,8 @@ struct MBB2NumberFunctor :
 //
 
 template <> struct GraphTraits<MachineBasicBlock *> {
-  typedef MachineBasicBlock *NodeRef;
-  typedef MachineBasicBlock::succ_iterator ChildIteratorType;
+  using NodeRef = MachineBasicBlock *;
+  using ChildIteratorType = MachineBasicBlock::succ_iterator;
 
   static NodeRef getEntryNode(MachineBasicBlock *BB) { return BB; }
   static ChildIteratorType child_begin(NodeRef N) { return N->succ_begin(); }
@@ -773,8 +877,8 @@ template <> struct GraphTraits<MachineBasicBlock *> {
 };
 
 template <> struct GraphTraits<const MachineBasicBlock *> {
-  typedef const MachineBasicBlock *NodeRef;
-  typedef MachineBasicBlock::const_succ_iterator ChildIteratorType;
+  using NodeRef = const MachineBasicBlock *;
+  using ChildIteratorType = MachineBasicBlock::const_succ_iterator;
 
   static NodeRef getEntryNode(const MachineBasicBlock *BB) { return BB; }
   static ChildIteratorType child_begin(NodeRef N) { return N->succ_begin(); }
@@ -787,27 +891,29 @@ template <> struct GraphTraits<const MachineBasicBlock *> {
 // to be when traversing the predecessor edges of a MBB
 // instead of the successor edges.
 //
-template <> struct GraphTraits<Inverse<MachineBasicBlock*> > {
-  typedef MachineBasicBlock *NodeRef;
-  typedef MachineBasicBlock::pred_iterator ChildIteratorType;
+template <> struct GraphTraits<Inverse<MachineBasicBlock*>> {
+  using NodeRef = MachineBasicBlock *;
+  using ChildIteratorType = MachineBasicBlock::pred_iterator;
+
   static NodeRef getEntryNode(Inverse<MachineBasicBlock *> G) {
     return G.Graph;
   }
+
   static ChildIteratorType child_begin(NodeRef N) { return N->pred_begin(); }
   static ChildIteratorType child_end(NodeRef N) { return N->pred_end(); }
 };
 
-template <> struct GraphTraits<Inverse<const MachineBasicBlock*> > {
-  typedef const MachineBasicBlock *NodeRef;
-  typedef MachineBasicBlock::const_pred_iterator ChildIteratorType;
+template <> struct GraphTraits<Inverse<const MachineBasicBlock*>> {
+  using NodeRef = const MachineBasicBlock *;
+  using ChildIteratorType = MachineBasicBlock::const_pred_iterator;
+
   static NodeRef getEntryNode(Inverse<const MachineBasicBlock *> G) {
     return G.Graph;
   }
+
   static ChildIteratorType child_begin(NodeRef N) { return N->pred_begin(); }
   static ChildIteratorType child_end(NodeRef N) { return N->pred_end(); }
 };
-
-
 
 /// MachineInstrSpan provides an interface to get an iteration range
 /// containing the instruction it was initialized with, along with all
@@ -816,12 +922,13 @@ template <> struct GraphTraits<Inverse<const MachineBasicBlock*> > {
 class MachineInstrSpan {
   MachineBasicBlock &MBB;
   MachineBasicBlock::iterator I, B, E;
+
 public:
-  MachineInstrSpan(MachineBasicBlock::iterator I)
-    : MBB(*I->getParent()),
-      I(I),
-      B(I == MBB.begin() ? MBB.end() : std::prev(I)),
-      E(std::next(I)) {}
+  MachineInstrSpan(MachineBasicBlock::iterator I, MachineBasicBlock *BB)
+      : MBB(*BB), I(I), B(I == MBB.begin() ? MBB.end() : std::prev(I)),
+        E(std::next(I)) {
+    assert(I == BB->end() || I->getParent() == BB);
+  }
 
   MachineBasicBlock::iterator begin() {
     return B == MBB.end() ? MBB.begin() : std::next(B);
@@ -838,7 +945,7 @@ public:
 /// const_instr_iterator} and the respective reverse iterators.
 template<typename IterT>
 inline IterT skipDebugInstructionsForward(IterT It, IterT End) {
-  while (It != End && It->isDebugValue())
+  while (It != End && It->isDebugInstr())
     It++;
   return It;
 }
@@ -849,11 +956,11 @@ inline IterT skipDebugInstructionsForward(IterT It, IterT End) {
 /// const_instr_iterator} and the respective reverse iterators.
 template<class IterT>
 inline IterT skipDebugInstructionsBackward(IterT It, IterT Begin) {
-  while (It != Begin && It->isDebugValue())
+  while (It != Begin && It->isDebugInstr())
     It--;
   return It;
 }
 
-} // End llvm namespace
+} // end namespace llvm
 
-#endif
+#endif // LLVM_CODEGEN_MACHINEBASICBLOCK_H

@@ -1,9 +1,8 @@
 //===- llvm/ADT/APFloat.h - Arbitrary Precision Floating Point ---*- C++ -*-==//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -140,14 +139,25 @@ enum lostFraction { // Example of truncated bits:
 // implementation classes. This struct should not define any non-static data
 // members.
 struct APFloatBase {
-  // TODO remove this and use APInt typedef directly.
   typedef APInt::WordType integerPart;
+  static const unsigned integerPartWidth = APInt::APINT_BITS_PER_WORD;
 
   /// A signed type to represent a floating point numbers unbiased exponent.
   typedef signed short ExponentType;
 
   /// \name Floating Point Semantics.
   /// @{
+  enum Semantics {
+    S_IEEEhalf,
+    S_IEEEsingle,
+    S_IEEEdouble,
+    S_x87DoubleExtended,
+    S_IEEEquad,
+    S_PPCDoubleDouble
+  };
+
+  static const llvm::fltSemantics &EnumToSemantics(Semantics S);
+  static Semantics SemanticsToEnum(const llvm::fltSemantics &Sem);
 
   static const fltSemantics &IEEEhalf() LLVM_READNONE;
   static const fltSemantics &IEEEsingle() LLVM_READNONE;
@@ -182,6 +192,11 @@ struct APFloatBase {
   /// IEEE-754R 7: Default exception handling.
   ///
   /// opUnderflow or opOverflow are always returned or-ed with opInexact.
+  ///
+  /// APFloat models this behavior specified by IEEE-754:
+  ///   "For operations producing results in floating-point format, the default
+  ///    result of an operation that signals the invalid operation exception
+  ///    shall be a quiet NaN."
   enum opStatus {
     opOK = 0x00,
     opInvalidOp = 0x01,
@@ -397,6 +412,12 @@ public:
   ///   consider inserting before falling back to scientific
   ///   notation.  0 means to always use scientific notation.
   ///
+  /// \param TruncateZero Indicate whether to remove the trailing zero in
+  ///   fraction part or not. Also setting this parameter to false forcing
+  ///   producing of output more similar to default printf behavior.
+  ///   Specifically the lower e is used as exponent delimiter and exponent
+  ///   always contains no less than two digits.
+  ///
   /// Number       Precision    MaxPadding      Result
   /// ------       ---------    ----------      ------
   /// 1.01E+4              5             2       10100
@@ -406,7 +427,7 @@ public:
   /// 1.01E-2              4             2       0.0101
   /// 1.01E-2              4             1       1.01E-2
   void toString(SmallVectorImpl<char> &Str, unsigned FormatPrecision = 0,
-                unsigned FormatMaxPadding = 3) const;
+                unsigned FormatMaxPadding = 3, bool TruncateZero = true) const;
 
   /// If this value has an exact multiplicative inverse, store it in inv and
   /// return true.
@@ -649,7 +670,7 @@ public:
   bool isInteger() const;
 
   void toString(SmallVectorImpl<char> &Str, unsigned FormatPrecision,
-                unsigned FormatMaxPadding) const;
+                unsigned FormatMaxPadding, bool TruncateZero = true) const;
 
   bool getExactInverse(APFloat *inv) const;
 
@@ -864,13 +885,13 @@ public:
   /// Factory for NaN values.
   ///
   /// \param Negative - True iff the NaN generated should be negative.
-  /// \param type - The unspecified fill bits for creating the NaN, 0 by
+  /// \param payload - The unspecified fill bits for creating the NaN, 0 by
   /// default.  The value is truncated as necessary.
   static APFloat getNaN(const fltSemantics &Sem, bool Negative = false,
-                        unsigned type = 0) {
-    if (type) {
-      APInt fill(64, type);
-      return getQNaN(Sem, Negative, &fill);
+                        uint64_t payload = 0) {
+    if (payload) {
+      APInt intPayload(64, payload);
+      return getQNaN(Sem, Negative, &intPayload);
     } else {
       return getQNaN(Sem, Negative, nullptr);
     }
@@ -1113,6 +1134,21 @@ public:
     llvm_unreachable("Unexpected semantics");
   }
 
+  /// We don't rely on operator== working on double values, as
+  /// it returns true for things that are clearly not equal, like -0.0 and 0.0.
+  /// As such, this method can be used to do an exact bit-for-bit comparison of
+  /// two floating point values.
+  ///
+  /// We leave the version with the double argument here because it's just so
+  /// convenient to write "2.0" and the like.  Without this function we'd
+  /// have to duplicate its logic everywhere it's called.
+  bool isExactlyValue(double V) const {
+    bool ignored;
+    APFloat Tmp(V);
+    Tmp.convert(getSemantics(), APFloat::rmNearestTiesToEven, &ignored);
+    return bitwiseIsEqual(Tmp);
+  }
+
   unsigned int convertToHexString(char *DST, unsigned int HexDigits,
                                   bool UpperCase, roundingMode RM) const {
     APFLOAT_DISPATCH_ON_SEMANTICS(
@@ -1144,9 +1180,9 @@ public:
   APFloat &operator=(APFloat &&RHS) = default;
 
   void toString(SmallVectorImpl<char> &Str, unsigned FormatPrecision = 0,
-                unsigned FormatMaxPadding = 3) const {
+                unsigned FormatMaxPadding = 3, bool TruncateZero = true) const {
     APFLOAT_DISPATCH_ON_SEMANTICS(
-        toString(Str, FormatPrecision, FormatMaxPadding));
+        toString(Str, FormatPrecision, FormatMaxPadding, TruncateZero));
   }
 
   void print(raw_ostream &) const;
@@ -1194,7 +1230,7 @@ inline APFloat abs(APFloat X) {
   return X;
 }
 
-/// \brief Returns the negated value of the argument.
+/// Returns the negated value of the argument.
 inline APFloat neg(APFloat X) {
   X.changeSign();
   return X;
@@ -1219,6 +1255,32 @@ inline APFloat maxnum(const APFloat &A, const APFloat &B) {
     return B;
   if (B.isNaN())
     return A;
+  return (A.compare(B) == APFloat::cmpLessThan) ? B : A;
+}
+
+/// Implements IEEE 754-2018 minimum semantics. Returns the smaller of 2
+/// arguments, propagating NaNs and treating -0 as less than +0.
+LLVM_READONLY
+inline APFloat minimum(const APFloat &A, const APFloat &B) {
+  if (A.isNaN())
+    return A;
+  if (B.isNaN())
+    return B;
+  if (A.isZero() && B.isZero() && (A.isNegative() != B.isNegative()))
+    return A.isNegative() ? A : B;
+  return (B.compare(A) == APFloat::cmpLessThan) ? B : A;
+}
+
+/// Implements IEEE 754-2018 maximum semantics. Returns the larger of 2
+/// arguments, propagating NaNs and treating -0 as less than +0.
+LLVM_READONLY
+inline APFloat maximum(const APFloat &A, const APFloat &B) {
+  if (A.isNaN())
+    return A;
+  if (B.isNaN())
+    return B;
+  if (A.isZero() && B.isZero() && (A.isNegative() != B.isNegative()))
+    return A.isNegative() ? B : A;
   return (A.compare(B) == APFloat::cmpLessThan) ? B : A;
 }
 

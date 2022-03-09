@@ -1,9 +1,8 @@
 //===- llvm/CodeGen/ScheduleDAG.h - Common Base Class -----------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -18,12 +17,12 @@
 
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/GraphTraits.h"
-#include "llvm/ADT/iterator.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/iterator.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Target/TargetLowering.h"
 #include <cassert>
 #include <cstddef>
 #include <iterator>
@@ -33,15 +32,15 @@
 namespace llvm {
 
 template<class Graph> class GraphWriter;
+class LLVMTargetMachine;
 class MachineFunction;
 class MachineRegisterInfo;
 class MCInstrDesc;
 struct MCSchedClassDesc;
-class ScheduleDAG;
 class SDNode;
 class SUnit;
+class ScheduleDAG;
 class TargetInstrInfo;
-class TargetMachine;
 class TargetRegisterClass;
 class TargetRegisterInfo;
 
@@ -52,14 +51,14 @@ class TargetRegisterInfo;
     /// These are the different kinds of scheduling dependencies.
     enum Kind {
       Data,        ///< Regular data dependence (aka true-dependence).
-      Anti,        ///< A register anti-dependedence (aka WAR).
+      Anti,        ///< A register anti-dependence (aka WAR).
       Output,      ///< A register output-dependence (aka WAW).
       Order        ///< Any other ordering dependency.
     };
 
     // Strong dependencies must be respected by the scheduler. Artificial
     // dependencies may be removed only if they are redundant with another
-    // strong depedence.
+    // strong dependence.
     //
     // Weak dependencies may be violated by the scheduling strategy, but only if
     // the strategy can prove it is correct to do so.
@@ -76,7 +75,7 @@ class TargetRegisterInfo;
     };
 
   private:
-    /// \brief A pointer to the depending/depended-on SUnit, and an enum
+    /// A pointer to the depending/depended-on SUnit, and an enum
     /// indicating the kind of the dependency.
     PointerIntPair<SUnit *, 2, Kind> Dep;
 
@@ -137,7 +136,7 @@ class TargetRegisterInfo;
       return !operator==(Other);
     }
 
-    /// \brief Returns the latency value for this edge, which roughly means the
+    /// Returns the latency value for this edge, which roughly means the
     /// minimum number of cycles that must elapse between the predecessor and
     /// the successor, given that they have this edge between them.
     unsigned getLatency() const {
@@ -163,7 +162,7 @@ class TargetRegisterInfo;
       return getKind() != Data;
     }
 
-    /// \brief Tests if this is an Order dependence between two memory accesses
+    /// Tests if this is an Order dependence between two memory accesses
     /// where both sides of the dependence access memory in non-volatile and
     /// fully modeled ways.
     bool isNormalMemory() const {
@@ -181,7 +180,7 @@ class TargetRegisterInfo;
       return (isNormalMemory() || isBarrier());
     }
 
-    /// \brief Tests if this is an Order dependence that is marked as
+    /// Tests if this is an Order dependence that is marked as
     /// "must alias", meaning that the SUnits at either end of the edge have a
     /// memory dependence on a known memory location.
     bool isMustAlias() const {
@@ -196,13 +195,13 @@ class TargetRegisterInfo;
       return getKind() == Order && Contents.OrdKind >= Weak;
     }
 
-    /// \brief Tests if this is an Order dependence that is marked as
+    /// Tests if this is an Order dependence that is marked as
     /// "artificial", meaning it isn't necessary for correctness.
     bool isArtificial() const {
       return getKind() == Order && Contents.OrdKind == Artificial;
     }
 
-    /// \brief Tests if this is an Order dependence that is marked as "cluster",
+    /// Tests if this is an Order dependence that is marked as "cluster",
     /// meaning it is artificial and wants to be adjacent.
     bool isCluster() const {
       return getKind() == Order && Contents.OrdKind == Cluster;
@@ -235,10 +234,9 @@ class TargetRegisterInfo;
              "SDep::Output edge cannot use the zero register!");
       Contents.Reg = Reg;
     }
-  };
 
-  template <>
-  struct isPodLike<SDep> { static const bool value = true; };
+    void dump(const TargetRegisterInfo *TRI = nullptr) const;
+  };
 
   /// Scheduling unit. This is a node in the scheduling DAG.
   class SUnit {
@@ -249,7 +247,7 @@ class TargetRegisterInfo;
     MachineInstr *Instr = nullptr; ///< Alternatively, a MachineInstr.
 
   public:
-    SUnit *OrigNode = nullptr; ///< If not this, the node from which this node 
+    SUnit *OrigNode = nullptr; ///< If not this, the node from which this node
                                /// was cloned. (SD scheduling only)
 
     const MCSchedClassDesc *SchedClass =
@@ -305,7 +303,7 @@ class TargetRegisterInfo;
         nullptr; ///< Is a special copy node if != nullptr.
     const TargetRegisterClass *CopySrcRC = nullptr;
 
-    /// \brief Constructs an SUnit for pre-regalloc scheduling to represent an
+    /// Constructs an SUnit for pre-regalloc scheduling to represent an
     /// SDNode and any nodes flagged to it.
     SUnit(SDNode *node, unsigned nodenum)
       : Node(node), NodeNum(nodenum), isVRegCycle(false), isCall(false),
@@ -316,7 +314,7 @@ class TargetRegisterInfo;
         isUnbuffered(false), hasReservedResource(false), isDepthCurrent(false),
         isHeightCurrent(false) {}
 
-    /// \brief Constructs an SUnit for post-regalloc scheduling to represent a
+    /// Constructs an SUnit for post-regalloc scheduling to represent a
     /// MachineInstr.
     SUnit(MachineInstr *instr, unsigned nodenum)
       : Instr(instr), NodeNum(nodenum), isVRegCycle(false), isCall(false),
@@ -327,7 +325,7 @@ class TargetRegisterInfo;
         isUnbuffered(false), hasReservedResource(false), isDepthCurrent(false),
         isHeightCurrent(false) {}
 
-    /// \brief Constructs a placeholder SUnit.
+    /// Constructs a placeholder SUnit.
     SUnit()
       : isVRegCycle(false), isCall(false), isCallOp(false), isTwoAddress(false),
         isCommutable(false), hasPhysRegUses(false), hasPhysRegDefs(false),
@@ -336,13 +334,13 @@ class TargetRegisterInfo;
         isCloned(false), isUnbuffered(false), hasReservedResource(false),
         isDepthCurrent(false), isHeightCurrent(false) {}
 
-    /// \brief Boundary nodes are placeholders for the boundary of the
+    /// Boundary nodes are placeholders for the boundary of the
     /// scheduling region.
     ///
     /// BoundaryNodes can have DAG edges, including Data edges, but they do not
     /// correspond to schedulable entities (e.g. instructions) and do not have a
     /// valid ID. Consequently, always check for boundary nodes before accessing
-    /// an assoicative data structure keyed on node ID.
+    /// an associative data structure keyed on node ID.
     bool isBoundaryNode() const { return NodeNum == BoundaryID; }
 
     /// Assigns the representative SDNode for this SUnit. This may be used
@@ -359,7 +357,7 @@ class TargetRegisterInfo;
       return Node;
     }
 
-    /// \brief Returns true if this SUnit refers to a machine instruction as
+    /// Returns true if this SUnit refers to a machine instruction as
     /// opposed to an SDNode.
     bool isInstr() const { return Instr; }
 
@@ -381,7 +379,7 @@ class TargetRegisterInfo;
     /// It also adds the current node as a successor of the specified node.
     bool addPred(const SDep &D, bool Required = true);
 
-    /// \brief Adds a barrier edge to SU by calling addPred(), with latency 0
+    /// Adds a barrier edge to SU by calling addPred(), with latency 0
     /// generally or latency 1 for a store followed by a load.
     bool addPredBarrier(SUnit *SU) {
       SDep Dep(SU, SDep::Barrier);
@@ -403,7 +401,7 @@ class TargetRegisterInfo;
       return Depth;
     }
 
-    /// \brief Returns the height of this node, which is the length of the
+    /// Returns the height of this node, which is the length of the
     /// maximum path down to any node which has no successors.
     unsigned getHeight() const {
       if (!isHeightCurrent)
@@ -411,21 +409,21 @@ class TargetRegisterInfo;
       return Height;
     }
 
-    /// \brief If NewDepth is greater than this node's depth value, sets it to
+    /// If NewDepth is greater than this node's depth value, sets it to
     /// be the new depth value. This also recursively marks successor nodes
     /// dirty.
     void setDepthToAtLeast(unsigned NewDepth);
 
-    /// \brief If NewDepth is greater than this node's depth value, set it to be
+    /// If NewHeight is greater than this node's height value, set it to be
     /// the new height value. This also recursively marks predecessor nodes
     /// dirty.
     void setHeightToAtLeast(unsigned NewHeight);
 
-    /// \brief Sets a flag in this node to indicate that its stored Depth value
+    /// Sets a flag in this node to indicate that its stored Depth value
     /// will require recomputation the next time getDepth() is called.
     void setDepthDirty();
 
-    /// \brief Sets a flag in this node to indicate that its stored Height value
+    /// Sets a flag in this node to indicate that its stored Height value
     /// will require recomputation the next time getHeight() is called.
     void setHeightDirty();
 
@@ -452,13 +450,11 @@ class TargetRegisterInfo;
       return NumSuccsLeft == 0;
     }
 
-    /// \brief Orders this node's predecessor edges such that the critical path
+    /// Orders this node's predecessor edges such that the critical path
     /// edge occurs first.
     void biasCriticalPath();
 
-    void dump(const ScheduleDAG *G) const;
-    void dumpAll(const ScheduleDAG *G) const;
-    void print(raw_ostream &O, const ScheduleDAG *G) const;
+    void dumpAttributes() const;
 
   private:
     void ComputeDepth();
@@ -491,7 +487,7 @@ class TargetRegisterInfo;
 
   //===--------------------------------------------------------------------===//
 
-  /// \brief This interface is used to plug different priorities computation
+  /// This interface is used to plug different priorities computation
   /// algorithms into the list scheduler. It implements the interface of a
   /// standard priority queue, where nodes are inserted in arbitrary order and
   /// returned in priority order.  The computation of the priority and the
@@ -558,7 +554,7 @@ class TargetRegisterInfo;
 
   class ScheduleDAG {
   public:
-    const TargetMachine &TM;            ///< Target processor
+    const LLVMTargetMachine &TM;        ///< Target processor
     const TargetInstrInfo *TII;         ///< Target instruction information
     const TargetRegisterInfo *TRI;      ///< Target processor register info
     MachineFunction &MF;                ///< Machine function
@@ -591,7 +587,9 @@ class TargetRegisterInfo;
     virtual void viewGraph(const Twine &Name, const Twine &Title);
     virtual void viewGraph();
 
-    virtual void dumpNode(const SUnit *SU) const = 0;
+    virtual void dumpNode(const SUnit &SU) const = 0;
+    virtual void dump() const = 0;
+    void dumpNodeName(const SUnit &SU) const;
 
     /// Returns a label for an SUnit node in a visualization of the ScheduleDAG.
     virtual std::string getGraphNodeLabel(const SUnit *SU) const = 0;
@@ -603,10 +601,13 @@ class TargetRegisterInfo;
     virtual void addCustomGraphFeatures(GraphWriter<ScheduleDAG*> &) const {}
 
 #ifndef NDEBUG
-    /// \brief Verifies that all SUnits were scheduled and that their state is
+    /// Verifies that all SUnits were scheduled and that their state is
     /// consistent. Returns the number of scheduled SUnits.
     unsigned VerifyScheduledDAG(bool isBottomUp);
 #endif
+
+  protected:
+    void dumpNodeAll(const SUnit &SU) const;
 
   private:
     /// Returns the MCInstrDesc of this SDNode or NULL.
@@ -690,6 +691,12 @@ class TargetRegisterInfo;
     std::vector<SUnit> &SUnits;
     SUnit *ExitSU;
 
+    // Have any new nodes been added?
+    bool Dirty = false;
+
+    // Outstanding added edges, that have not been applied to the ordering.
+    SmallVector<std::pair<SUnit *, SUnit *>, 16> Updates;
+
     /// Maps topological index to the node number.
     std::vector<int> Index2Node;
     /// Maps the node number to its topological index.
@@ -702,12 +709,17 @@ class TargetRegisterInfo;
     /// method.
     void DFS(const SUnit *SU, int UpperBound, bool& HasLoop);
 
-    /// \brief Reassigns topological indexes for the nodes in the DAG to
+    /// Reassigns topological indexes for the nodes in the DAG to
     /// preserve the topological ordering.
     void Shift(BitVector& Visited, int LowerBound, int UpperBound);
 
     /// Assigns the topological index to the node n.
     void Allocate(int n, int index);
+
+    /// Fix the ordering, by either recomputing from scratch or by applying
+    /// any outstanding updates. Uses a heuristic to estimate what will be
+    /// cheaper.
+    void FixOrder();
 
   public:
     ScheduleDAGTopologicalSort(std::vector<SUnit> &SUnits, SUnit *ExitSU);
@@ -729,14 +741,22 @@ class TargetRegisterInfo;
     /// Returns true if addPred(TargetSU, SU) creates a cycle.
     bool WillCreateCycle(SUnit *TargetSU, SUnit *SU);
 
-    /// \brief Updates the topological ordering to accommodate an edge to be
+    /// Updates the topological ordering to accommodate an edge to be
     /// added from SUnit \p X to SUnit \p Y.
     void AddPred(SUnit *Y, SUnit *X);
 
-    /// \brief Updates the topological ordering to accommodate an an edge to be
+    /// Queues an update to the topological ordering to accommodate an edge to
+    /// be added from SUnit \p X to SUnit \p Y.
+    void AddPredQueued(SUnit *Y, SUnit *X);
+
+    /// Updates the topological ordering to accommodate an an edge to be
     /// removed from the specified node \p N from the predecessors of the
     /// current node \p M.
     void RemovePred(SUnit *M, SUnit *N);
+
+    /// Mark the ordering as temporarily broken, after a new node has been
+    /// added.
+    void MarkDirty() { Dirty = true; }
 
     typedef std::vector<int>::iterator iterator;
     typedef std::vector<int>::const_iterator const_iterator;

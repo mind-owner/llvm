@@ -3,7 +3,7 @@
 ; RUN: llc -mtriple=thumb-eabi -arm-atomic-cfg-tidy=0 -mcpu=arm1156t2-s -mattr=+thumb2 %s -o - | FileCheck -check-prefix=T2 %s
 ; RUN: llc -mtriple=thumbv8-eabi -arm-atomic-cfg-tidy=0 %s -o - | FileCheck -check-prefix=V8 %s
 
-; FIXME: The -march=thumb test doesn't change if -disable-peephole is specified.
+; FIXME: The -mtriple=thumb test doesn't change if -disable-peephole is specified.
 
 %struct.Foo = type { i8* }
 
@@ -29,7 +29,6 @@ tailrecurse:                                      ; preds = %sw.bb, %entry
 
 ; THUMB:      movs r[[R0:[0-9]+]], #3
 ; THUMB-NEXT: ands r[[R0]], r
-; THUMB-NEXT: cmp r[[R0]], #0
 ; THUMB-NEXT: beq
 
 ; T2:      ands {{r[0-9]+}}, {{r[0-9]+}}, #3
@@ -48,9 +47,8 @@ tailrecurse.switch:                               ; preds = %tailrecurse
 ; V8-NEXT: beq
 ; V8-NEXT: %tailrecurse.switch
 ; V8: cmp
-; V8-NEXT: beq
-; V8-NEXT: %sw.epilog
-; V8-NEXT: bx lr
+; V8-NEXT: bne
+; V8-NEXT: %sw.bb
   switch i32 %and, label %sw.epilog [
     i32 1, label %sw.bb
     i32 3, label %sw.bb6
@@ -142,39 +140,39 @@ return:                                           ; preds = %bb2, %bb, %entry
 
 define i32 @test_tst_assessment(i32 %a, i32 %b) {
 ; ARM-LABEL: test_tst_assessment:
-; ARM:       @ BB#0:
+; ARM:       @ %bb.0:
 ; ARM-NEXT:    and r0, r0, #1
 ; ARM-NEXT:    tst r1, #1
 ; ARM-NEXT:    subne r0, r0, #1
 ; ARM-NEXT:    mov pc, lr
 ;
 ; THUMB-LABEL: test_tst_assessment:
-; THUMB:       @ BB#0:
+; THUMB:       @ %bb.0:
 ; THUMB-NEXT:    movs r2, r0
 ; THUMB-NEXT:    movs r0, #1
 ; THUMB-NEXT:    ands r0, r2
-; THUMB-NEXT:    subs r2, r0, #1
 ; THUMB-NEXT:    lsls r1, r1, #31
 ; THUMB-NEXT:    beq .LBB2_2
-; THUMB-NEXT:  @ BB#1:
-; THUMB-NEXT:    movs r0, r2
+; THUMB-NEXT:  @ %bb.1:
+; THUMB-NEXT:    subs r0, r0, #1
 ; THUMB-NEXT:  .LBB2_2:
 ; THUMB-NEXT:    bx lr
 ;
 ; T2-LABEL: test_tst_assessment:
-; T2:       @ BB#0:
-; T2-NEXT:    lsls r1, r1, #31
+; T2:       @ %bb.0:
 ; T2-NEXT:    and r0, r0, #1
+; T2-NEXT:    lsls r1, r1, #31
 ; T2-NEXT:    it ne
 ; T2-NEXT:    subne r0, #1
 ; T2-NEXT:    bx lr
 ;
 ; V8-LABEL: test_tst_assessment:
-; V8:       @ BB#0:
+; V8:       @ %bb.0:
+; V8-NEXT:    and r2, r0, #1
+; V8-NEXT:    subs r0, r2, #1
 ; V8-NEXT:    lsls r1, r1, #31
-; V8-NEXT:    and r0, r0, #1
-; V8-NEXT:    it ne
-; V8-NEXT:    subne r0, #1
+; V8-NEXT:    it eq
+; V8-NEXT:    moveq r0, r2
 ; V8-NEXT:    bx lr
   %and1 = and i32 %a, 1
   %sub = sub i32 %and1, 1

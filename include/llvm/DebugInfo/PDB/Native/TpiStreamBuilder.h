@@ -1,9 +1,8 @@
 //===- TpiStreamBuilder.h - PDB Tpi Stream Creation -------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -58,6 +57,8 @@ public:
 
   Error finalizeMsfLayout();
 
+  uint32_t getRecordCount() const { return TypeRecords.size(); }
+
   Error commit(const msf::MSFLayout &Layout, WritableBinaryStreamRef Buffer);
 
   uint32_t calculateSerializedLength();
@@ -72,10 +73,10 @@ private:
 
   size_t TypeRecordBytes = 0;
 
-  Optional<PdbRaw_TpiVer> VerHeader;
+  PdbRaw_TpiVer VerHeader = PdbRaw_TpiVer::PdbTpiV80;
   std::vector<ArrayRef<uint8_t>> TypeRecords;
   std::vector<uint32_t> TypeHashes;
-  std::vector<TypeIndexOffset> TypeIndexOffsets;
+  std::vector<codeview::TypeIndexOffset> TypeIndexOffsets;
   uint32_t HashStreamIndex = kInvalidStreamIndex;
   std::unique_ptr<BinaryByteStream> HashValueStream;
 

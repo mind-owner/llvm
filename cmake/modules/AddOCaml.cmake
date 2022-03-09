@@ -66,27 +66,36 @@ function(add_ocaml_library name)
     list(APPEND ocaml_flags "-custom")
   endif()
 
-  explicit_map_components_to_libraries(llvm_libs ${ARG_LLVM})
-  foreach( llvm_lib ${llvm_libs} )
-    list(APPEND ocaml_flags "-l${llvm_lib}" )
-  endforeach()
+  if(LLVM_LINK_LLVM_DYLIB)
+    list(APPEND ocaml_flags "-lLLVM")
+  else()
+    explicit_map_components_to_libraries(llvm_libs ${ARG_LLVM})
+    foreach( llvm_lib ${llvm_libs} )
+      list(APPEND ocaml_flags "-l${llvm_lib}" )
+    endforeach()
 
-  get_property(system_libs TARGET LLVMSupport PROPERTY LLVM_SYSTEM_LIBS)
-  foreach(system_lib ${system_libs})
-    if (system_lib MATCHES "^-")
-      # If it's an option, pass it without changes.
-      list(APPEND ocaml_flags "${system_lib}" )
-    else()
-      # Otherwise assume it's a library name we need to link with.
-      list(APPEND ocaml_flags "-l${system_lib}" )
-    endif()
-  endforeach()
+    get_property(system_libs TARGET LLVMSupport PROPERTY LLVM_SYSTEM_LIBS)
+    foreach(system_lib ${system_libs})
+      if (system_lib MATCHES "^-")
+        # If it's an option, pass it without changes.
+        list(APPEND ocaml_flags "${system_lib}" )
+      else()
+        # Otherwise assume it's a library name we need to link with.
+        list(APPEND ocaml_flags "-l${system_lib}" )
+      endif()
+    endforeach()
+  endif()
 
   string(REPLACE ";" " " ARG_CFLAGS "${ARG_CFLAGS}")
   set(c_flags "${ARG_CFLAGS} ${LLVM_DEFINITIONS}")
   foreach( include_dir ${LLVM_INCLUDE_DIR} ${LLVM_MAIN_INCLUDE_DIR} )
     set(c_flags "${c_flags} -I${include_dir}")
   endforeach()
+  # include -D/-UNDEBUG to match dump function visibility
+  # regex from HandleLLVMOptions.cmake
+  string(REGEX MATCH "(^| )[/-][UD] *NDEBUG($| )" flag_matches
+         "${CMAKE_C_FLAGS_${uppercase_CMAKE_BUILD_TYPE}} ${CMAKE_C_FLAGS}")
+  set(c_flags "${c_flags} ${flag_matches}")
 
   foreach( ocaml_file ${ARG_OCAML} )
     list(APPEND sources "${ocaml_file}.mli" "${ocaml_file}.ml")
@@ -199,7 +208,7 @@ function(add_ocaml_library name)
           PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
                       GROUP_READ GROUP_EXECUTE
                       WORLD_READ WORLD_EXECUTE
-          DESTINATION "${LLVM_OCAML_INSTALL_PATH}/llvm")
+          DESTINATION "${LLVM_OCAML_INSTALL_PATH}/stublibs")
 
   foreach( install_file ${install_files} ${install_shlibs} )
     get_filename_component(filename "${install_file}" NAME)
@@ -216,3 +225,4 @@ add_custom_target(ocaml_make_directory
   COMMAND "${CMAKE_COMMAND}" "-E" "make_directory" "${LLVM_LIBRARY_DIR}/ocaml/llvm")
 add_custom_target("ocaml_all")
 set_target_properties(ocaml_all PROPERTIES FOLDER "Misc")
+set_target_properties(ocaml_make_directory PROPERTIES FOLDER "Misc")

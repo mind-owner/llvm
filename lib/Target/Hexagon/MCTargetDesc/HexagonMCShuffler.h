@@ -1,9 +1,8 @@
-//=-- HexagonMCShuffler.h ---------------------------------------------------=//
+//===- HexagonMCShuffler.h --------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,40 +11,41 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef HEXAGONMCSHUFFLER_H
-#define HEXAGONMCSHUFFLER_H
+#ifndef LLVM_LIB_TARGET_HEXAGON_MCTARGETDESC_HEXAGONMCSHUFFLER_H
+#define LLVM_LIB_TARGET_HEXAGON_MCTARGETDESC_HEXAGONMCSHUFFLER_H
 
+#include "MCTargetDesc/HexagonMCInstrInfo.h"
 #include "MCTargetDesc/HexagonShuffler.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace llvm {
 
+class MCContext;
 class MCInst;
+class MCInstrInfo;
+class MCSubtargetInfo;
 
 // Insn bundle shuffler.
 class HexagonMCShuffler : public HexagonShuffler {
-  bool immext_present;
-  bool duplex_present;
-
 public:
-  HexagonMCShuffler(bool Fatal, MCInstrInfo const &MCII,
+  HexagonMCShuffler(MCContext &Context, bool Fatal, MCInstrInfo const &MCII,
                     MCSubtargetInfo const &STI, MCInst &MCB)
-      : HexagonShuffler(MCII, STI) {
+      : HexagonShuffler(Context, Fatal, MCII, STI) {
     init(MCB);
-  };
-  HexagonMCShuffler(MCInstrInfo const &MCII, MCSubtargetInfo const &STI,
-                    MCInst &MCB, MCInst const &AddMI,
-                    bool InsertAtFront)
-      : HexagonShuffler(MCII, STI) {
+  }
+
+  HexagonMCShuffler(MCContext &Context, bool Fatal, MCInstrInfo const &MCII,
+                    MCSubtargetInfo const &STI, MCInst &MCB,
+                    MCInst const &AddMI, bool InsertAtFront)
+      : HexagonShuffler(Context, Fatal, MCII, STI) {
     init(MCB, AddMI, InsertAtFront);
-  };
+  }
 
   // Copy reordered bundle to another.
   void copyTo(MCInst &MCB);
+
   // Reorder and copy result to another.
   bool reshuffleTo(MCInst &MCB);
-
-  bool immextPresent() const { return immext_present; };
-  bool duplexPresent() const { return duplex_present; };
 
 private:
   void init(MCInst &MCB);
@@ -53,13 +53,15 @@ private:
 };
 
 // Invocation of the shuffler.
-bool HexagonMCShuffle(bool Fatal, MCInstrInfo const &MCII,
-                      MCSubtargetInfo const &STI, MCInst &);
-bool HexagonMCShuffle(MCInstrInfo const &MCII, MCSubtargetInfo const &STI,
-                      MCInst &, MCInst const &, int);
-unsigned HexagonMCShuffle(MCInstrInfo const &MCII, MCSubtargetInfo const &STI,
-                          MCContext &Context, MCInst &,
-                          SmallVector<DuplexCandidate, 8>);
-}
+bool HexagonMCShuffle(MCContext &Context, bool Fatal, MCInstrInfo const &MCII,
+                      MCSubtargetInfo const &STI, MCInst &MCB);
+bool HexagonMCShuffle(MCContext &Context, MCInstrInfo const &MCII,
+                      MCSubtargetInfo const &STI, MCInst &MCB,
+                      MCInst const &AddMI, int fixupCount);
+bool HexagonMCShuffle(MCContext &Context, MCInstrInfo const &MCII,
+                      MCSubtargetInfo const &STI, MCInst &MCB,
+                      SmallVector<DuplexCandidate, 8> possibleDuplexes);
 
-#endif // HEXAGONMCSHUFFLER_H
+} // end namespace llvm
+
+#endif // LLVM_LIB_TARGET_HEXAGON_MCTARGETDESC_HEXAGONMCSHUFFLER_H

@@ -1,9 +1,8 @@
-//===-- llvm/Type.h - Classes for handling data types -----------*- C++ -*-===//
+//===- llvm/Type.h - Classes for handling data types ------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -20,19 +19,21 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/CBindingWrapping.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/DataTypes.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/TypeSize.h"
+#include <cassert>
+#include <cstdint>
+#include <iterator>
 
 namespace llvm {
 
-class PointerType;
-class IntegerType;
-class raw_ostream;
-class Module;
-class LLVMContext;
-class LLVMContextImpl;
-class StringRef;
 template<class GraphType> struct GraphTraits;
+class IntegerType;
+class LLVMContext;
+class PointerType;
+class raw_ostream;
+class StringRef;
 
 /// The instances of the Type class are immutable: once they are created,
 /// they are never changed.  Also note that only one instance of a particular
@@ -86,9 +87,9 @@ private:
 
 protected:
   friend class LLVMContextImpl;
+
   explicit Type(LLVMContext &C, TypeID tid)
-    : Context(C), ID(tid), SubclassData(0),
-      NumContainedTys(0), ContainedTys(nullptr) {}
+    : Context(C), ID(tid), SubclassData(0) {}
   ~Type() = default;
 
   unsigned getSubclassData() const { return SubclassData; }
@@ -100,14 +101,14 @@ protected:
   }
 
   /// Keeps track of how many Type*'s there are in the ContainedTys list.
-  unsigned NumContainedTys;
+  unsigned NumContainedTys = 0;
 
   /// A pointer to the array of Types contained by this Type. For example, this
   /// includes the arguments of a function type, the elements of a structure,
   /// the pointee of a pointer, the element type of an array, etc. This pointer
   /// may be 0 for types that don't contain other types (Integer, Double,
   /// Float).
-  Type * const *ContainedTys;
+  Type * const *ContainedTys = nullptr;
 
   static bool isSequentialType(TypeID TyID) {
     return TyID == ArrayTyID || TyID == VectorTyID;
@@ -122,6 +123,7 @@ public:
   /// inlined with the operands when printing an instruction.
   void print(raw_ostream &O, bool IsForDebug = false,
              bool NoDetails = false) const;
+
   void dump() const;
 
   /// Return the LLVMContext in which this type was uniqued.
@@ -200,6 +202,15 @@ public:
   /// Return true if this is an integer type or a vector of integer types.
   bool isIntOrIntVectorTy() const { return getScalarType()->isIntegerTy(); }
 
+  /// Return true if this is an integer type or a vector of integer types of
+  /// the given width.
+  bool isIntOrIntVectorTy(unsigned BitWidth) const {
+    return getScalarType()->isIntegerTy(BitWidth);
+  }
+
+  /// Return true if this is an integer type or a pointer type.
+  bool isIntOrPtrTy() const { return isIntegerTy() || isPointerTy(); }
+
   /// True if this is an instance of FunctionType.
   bool isFunctionTy() const { return getTypeID() == FunctionTyID; }
 
@@ -221,7 +232,7 @@ public:
   /// Return true if this type could be converted with a lossless BitCast to
   /// type 'Ty'. For example, i8* to i32*. BitCasts are valid for types of the
   /// same size only where no re-interpretation of the bits is done.
-  /// @brief Determine if this type could be losslessly bitcast to Ty
+  /// Determine if this type could be losslessly bitcast to Ty
   bool canLosslesslyBitCastTo(Type *Ty) const;
 
   /// Return true if this type is empty, that is, it has no elements or all of
@@ -271,12 +282,15 @@ public:
   /// This will return zero if the type does not have a size or is not a
   /// primitive type.
   ///
+  /// If this is a scalable vector type, the scalable property will be set and
+  /// the runtime size will be a positive integer multiple of the base size.
+  ///
   /// Note that this may not reflect the size of memory allocated for an
   /// instance of the type or the number of bytes that are written when an
   /// instance of the type is stored to memory. The DataLayout class provides
   /// additional query functions to provide this information.
   ///
-  unsigned getPrimitiveSizeInBits() const LLVM_READONLY;
+  TypeSize getPrimitiveSizeInBits() const LLVM_READONLY;
 
   /// If this is a vector type, return the getPrimitiveSizeInBits value for the
   /// element type. Otherwise return the getPrimitiveSizeInBits value for this
@@ -299,14 +313,16 @@ public:
   //===--------------------------------------------------------------------===//
   // Type Iteration support.
   //
-  typedef Type * const *subtype_iterator;
+  using subtype_iterator = Type * const *;
+
   subtype_iterator subtype_begin() const { return ContainedTys; }
   subtype_iterator subtype_end() const { return &ContainedTys[NumContainedTys];}
   ArrayRef<Type*> subtypes() const {
     return makeArrayRef(subtype_begin(), subtype_end());
   }
 
-  typedef std::reverse_iterator<subtype_iterator> subtype_reverse_iterator;
+  using subtype_reverse_iterator = std::reverse_iterator<subtype_iterator>;
+
   subtype_reverse_iterator subtype_rbegin() const {
     return subtype_reverse_iterator(subtype_end());
   }
@@ -348,12 +364,15 @@ public:
   }
 
   inline uint64_t getArrayNumElements() const;
+
   Type *getArrayElementType() const {
     assert(getTypeID() == ArrayTyID);
     return ContainedTys[0];
   }
 
+  inline bool getVectorIsScalable() const;
   inline unsigned getVectorNumElements() const;
+  inline ElementCount getVectorElementCount() const;
   Type *getVectorElementType() const {
     assert(getTypeID() == VectorTyID);
     return ContainedTys[0];
@@ -363,6 +382,14 @@ public:
     assert(getTypeID() == PointerTyID);
     return ContainedTys[0];
   }
+
+  /// Given an integer or vector type, change the lane bitwidth to NewBitwidth,
+  /// whilst keeping the old number of lanes.
+  inline Type *getWithNewBitWidth(unsigned NewBitWidth) const;
+
+  /// Given scalar/vector integer type, returns a type with elements twice as
+  /// wide as in the original type. For vectors, preserves element count.
+  inline Type *getExtendedType() const;
 
   /// Get the address space of this pointer or pointer vector type.
   inline unsigned getPointerAddressSpace() const;
@@ -396,6 +423,20 @@ public:
   static IntegerType *getInt32Ty(LLVMContext &C);
   static IntegerType *getInt64Ty(LLVMContext &C);
   static IntegerType *getInt128Ty(LLVMContext &C);
+  template <typename ScalarTy> static Type *getScalarTy(LLVMContext &C) {
+    int noOfBits = sizeof(ScalarTy) * CHAR_BIT;
+    if (std::is_integral<ScalarTy>::value) {
+      return (Type*) Type::getIntNTy(C, noOfBits);
+    } else if (std::is_floating_point<ScalarTy>::value) {
+      switch (noOfBits) {
+      case 32:
+        return Type::getFloatTy(C);
+      case 64:
+        return Type::getDoubleTy(C);
+      }
+    }
+    llvm_unreachable("Unsupported type in Type::getScalarTy");
+  }
 
   //===--------------------------------------------------------------------===//
   // Convenience methods for getting pointer types with one of the above builtin
@@ -427,7 +468,7 @@ private:
 };
 
 // Printing of types.
-static inline raw_ostream &operator<<(raw_ostream &OS, const Type &T) {
+inline raw_ostream &operator<<(raw_ostream &OS, const Type &T) {
   T.print(OS);
   return OS;
 }
@@ -437,28 +478,6 @@ template <> struct isa_impl<PointerType, Type> {
   static inline bool doit(const Type &Ty) {
     return Ty.getTypeID() == Type::PointerTyID;
   }
-};
-
-//===----------------------------------------------------------------------===//
-// Provide specializations of GraphTraits to be able to treat a type as a
-// graph of sub types.
-
-template <> struct GraphTraits<Type *> {
-  typedef Type *NodeRef;
-  typedef Type::subtype_iterator ChildIteratorType;
-
-  static NodeRef getEntryNode(Type *T) { return T; }
-  static ChildIteratorType child_begin(NodeRef N) { return N->subtype_begin(); }
-  static ChildIteratorType child_end(NodeRef N) { return N->subtype_end(); }
-};
-
-template <> struct GraphTraits<const Type*> {
-  typedef const Type *NodeRef;
-  typedef Type::subtype_iterator ChildIteratorType;
-
-  static NodeRef getEntryNode(NodeRef T) { return T; }
-  static ChildIteratorType child_begin(NodeRef N) { return N->subtype_begin(); }
-  static ChildIteratorType child_end(NodeRef N) { return N->subtype_end(); }
 };
 
 // Create wrappers for C Binding types (see CBindingWrapping.h).
@@ -474,6 +493,6 @@ inline LLVMTypeRef *wrap(Type **Tys) {
   return reinterpret_cast<LLVMTypeRef*>(const_cast<Type**>(Tys));
 }
 
-} // End llvm namespace
+} // end namespace llvm
 
-#endif
+#endif // LLVM_IR_TYPE_H

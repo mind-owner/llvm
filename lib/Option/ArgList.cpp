@@ -1,20 +1,31 @@
-//===--- ArgList.cpp - Argument List Management ---------------------------===//
+//===- ArgList.cpp - Argument List Management -----------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Option/ArgList.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/None.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Option/Arg.h"
+#include "llvm/Option/ArgList.h"
 #include "llvm/Option/Option.h"
+#include "llvm/Option/OptSpecifier.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <cassert>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace llvm;
 using namespace llvm::opt;
@@ -82,21 +93,6 @@ std::vector<std::string> ArgList::getAllArgValues(OptSpecifier Id) const {
   SmallVector<const char *, 16> Values;
   AddAllArgValues(Values, Id);
   return std::vector<std::string>(Values.begin(), Values.end());
-}
-
-void ArgList::AddLastArg(ArgStringList &Output, OptSpecifier Id) const {
-  if (Arg *A = getLastArg(Id)) {
-    A->claim();
-    A->render(*this, Output);
-  }
-}
-
-void ArgList::AddLastArg(ArgStringList &Output, OptSpecifier Id0,
-                         OptSpecifier Id1) const {
-  if (Arg *A = getLastArg(Id0, Id1)) {
-    A->claim();
-    A->render(*this, Output);
-  }
 }
 
 void ArgList::AddAllArgsExcept(ArgStringList &Output,
@@ -197,8 +193,6 @@ void ArgList::print(raw_ostream &O) const {
 LLVM_DUMP_METHOD void ArgList::dump() const { print(dbgs()); }
 #endif
 
-//
-
 void InputArgList::releaseMemory() {
   // An InputArgList always owns its arguments.
   for (Arg *A : *this)
@@ -234,8 +228,6 @@ const char *InputArgList::MakeArgStringRef(StringRef Str) const {
   return getArgString(MakeIndex(Str));
 }
 
-//
-
 DerivedArgList::DerivedArgList(const InputArgList &BaseArgs)
     : BaseArgs(BaseArgs) {}
 
@@ -249,7 +241,7 @@ void DerivedArgList::AddSynthesizedArg(Arg *A) {
 
 Arg *DerivedArgList::MakeFlagArg(const Arg *BaseArg, const Option Opt) const {
   SynthesizedArgs.push_back(
-      make_unique<Arg>(Opt, MakeArgString(Opt.getPrefix() + Opt.getName()),
+      std::make_unique<Arg>(Opt, MakeArgString(Opt.getPrefix() + Opt.getName()),
                        BaseArgs.MakeIndex(Opt.getName()), BaseArg));
   return SynthesizedArgs.back().get();
 }
@@ -258,7 +250,7 @@ Arg *DerivedArgList::MakePositionalArg(const Arg *BaseArg, const Option Opt,
                                        StringRef Value) const {
   unsigned Index = BaseArgs.MakeIndex(Value);
   SynthesizedArgs.push_back(
-      make_unique<Arg>(Opt, MakeArgString(Opt.getPrefix() + Opt.getName()),
+      std::make_unique<Arg>(Opt, MakeArgString(Opt.getPrefix() + Opt.getName()),
                        Index, BaseArgs.getArgString(Index), BaseArg));
   return SynthesizedArgs.back().get();
 }
@@ -267,7 +259,7 @@ Arg *DerivedArgList::MakeSeparateArg(const Arg *BaseArg, const Option Opt,
                                      StringRef Value) const {
   unsigned Index = BaseArgs.MakeIndex(Opt.getName(), Value);
   SynthesizedArgs.push_back(
-      make_unique<Arg>(Opt, MakeArgString(Opt.getPrefix() + Opt.getName()),
+      std::make_unique<Arg>(Opt, MakeArgString(Opt.getPrefix() + Opt.getName()),
                        Index, BaseArgs.getArgString(Index + 1), BaseArg));
   return SynthesizedArgs.back().get();
 }
@@ -275,7 +267,7 @@ Arg *DerivedArgList::MakeSeparateArg(const Arg *BaseArg, const Option Opt,
 Arg *DerivedArgList::MakeJoinedArg(const Arg *BaseArg, const Option Opt,
                                    StringRef Value) const {
   unsigned Index = BaseArgs.MakeIndex((Opt.getName() + Value).str());
-  SynthesizedArgs.push_back(make_unique<Arg>(
+  SynthesizedArgs.push_back(std::make_unique<Arg>(
       Opt, MakeArgString(Opt.getPrefix() + Opt.getName()), Index,
       BaseArgs.getArgString(Index) + Opt.getName().size(), BaseArg));
   return SynthesizedArgs.back().get();
